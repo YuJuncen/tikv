@@ -170,6 +170,7 @@ impl TxnEntry {
             _ => unreachable!(),
         }
     }
+
     /// This method will generate this kv pair's key
     pub fn to_key(&self) -> Result<Key> {
         match self {

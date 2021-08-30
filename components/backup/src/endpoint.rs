@@ -638,6 +638,8 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
 
         // TODO: make it async.
         self.pool.borrow_mut().spawn(move || {
+            use thread_priority::*;
+            set_current_thread_priority(ThreadPriority::Min).unwrap();
             tikv_alloc::add_thread_memory_accessor();
             let _with_io_type = WithIOType::new(IOType::Export);
             defer!({
