@@ -146,6 +146,24 @@ pub enum TxnEntry {
 }
 
 impl TxnEntry {
+    #[inline]
+    pub fn with_kvpair<T>(self, f : impl FnOnce(&[u8], &[u8]) -> T) -> Result<T> {
+        if let TxnEntry::Commit { default, write, .. } = self {
+           if !default.0.is_empty() {
+                let k = Key::from_encoded(default.0).truncate_ts()?;
+                let k = k.into_raw()?;
+                return Ok(f(&k, &default.1));
+           } 
+           let k = Key::from_encoded(write.0).truncate_ts()?;
+           let k = k.into_raw()?;
+           let v = WriteRef::parse(&write.1)
+               .map_err(MvccError::from)?;
+           let vr = v.short_value.unwrap_or(&[]);
+           return Ok(f(&k, vr))
+        }
+        unreachable!()
+    }
+
     /// This method will return a kv pair whose
     /// content and encode are same as a kv pair
     /// reture by ```StoreScanner::next```

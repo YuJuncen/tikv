@@ -53,11 +53,10 @@ impl Writer {
     fn update_with(&mut self, entry: TxnEntry, need_checksum: bool) -> Result<()> {
         self.total_kvs += 1;
         if need_checksum {
-            let (k, v) = entry
-                .into_kvpair()
-                .map_err(|err| Error::Other(box_err!("Decode error: {:?}", err)))?;
-            self.total_bytes += (k.len() + v.len()) as u64;
-            self.checksum = checksum_crc64_xor(self.checksum, self.digest.clone(), &k, &v);
+            entry.with_kvpair(|k, v| {
+                self.total_bytes += (k.len() + v.len()) as u64;
+                self.checksum = checksum_crc64_xor(self.checksum, self.digest.clone(), &k, &v);
+            })?;
         }
         Ok(())
     }
