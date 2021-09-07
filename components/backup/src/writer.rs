@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::plain_writer::PlainWriter;
 use engine_rocks::raw::DB;
 use engine_rocks::{RocksEngine, RocksSstWriter, RocksSstWriterBuilder};
 use engine_traits::{CfName, CF_DEFAULT, CF_WRITE};
@@ -121,6 +122,7 @@ pub struct BackupWriterBuilder {
     compression_type: Option<SstCompressionType>,
     compression_level: i32,
     sst_max_size: u64,
+    common_prefix: Vec<u8>,
 }
 
 impl BackupWriterBuilder {
@@ -141,7 +143,13 @@ impl BackupWriterBuilder {
             compression_type,
             compression_level,
             sst_max_size,
+            common_prefix: vec![],
         }
+    }
+
+    pub fn set_common_prefix(&mut self, prefix: Vec<u8>) -> &mut Self {
+        self.common_prefix = prefix;
+        self
     }
 
     pub fn build(&self, start_key: Vec<u8>) -> Result<BackupWriter> {
@@ -153,6 +161,7 @@ impl BackupWriterBuilder {
             &name,
             self.compression_type,
             self.compression_level,
+            &self.common_prefix,
             self.limiter.clone(),
             self.sst_max_size,
         )
@@ -162,8 +171,8 @@ impl BackupWriterBuilder {
 /// A writer writes txn entries into SST files.
 pub struct BackupWriter {
     name: String,
-    default: Writer,
-    write: Writer,
+    default: PlainWriter,
+    write: PlainWriter,
     limiter: Limiter,
     sst_max_size: u64,
 }
@@ -175,28 +184,15 @@ impl BackupWriter {
         name: &str,
         compression_type: Option<SstCompressionType>,
         compression_level: i32,
+        common_prefix: &[u8],
         limiter: Limiter,
         sst_max_size: u64,
     ) -> Result<BackupWriter> {
-        let default = RocksSstWriterBuilder::new()
-            .set_in_memory(true)
-            .set_cf(CF_DEFAULT)
-            .set_db(RocksEngine::from_ref(&db))
-            .set_compression_type(compression_type)
-            .set_compression_level(compression_level)
-            .build(name)?;
-        let write = RocksSstWriterBuilder::new()
-            .set_in_memory(true)
-            .set_cf(CF_WRITE)
-            .set_db(RocksEngine::from_ref(&db))
-            .set_compression_type(compression_type)
-            .set_compression_level(compression_level)
-            .build(name)?;
         let name = name.to_owned();
         Ok(BackupWriter {
             name,
-            default: Writer::new(default),
-            write: Writer::new(write),
+            default: PlainWriter::with_common_prefix(common_prefix, compression_level as _),
+            write: PlainWriter::with_common_prefix(common_prefix, compression_level as _),
             limiter,
             sst_max_size,
         })

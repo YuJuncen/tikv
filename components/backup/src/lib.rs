@@ -8,6 +8,7 @@ extern crate tikv_alloc;
 mod endpoint;
 mod errors;
 mod metrics;
+mod plain_writer;
 mod service;
 mod writer;
 

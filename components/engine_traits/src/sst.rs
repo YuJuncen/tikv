@@ -79,6 +79,8 @@ where
 
     fn set_compression_level(self, level: i32) -> Self;
 
+    fn set_block_size(self, size: usize) -> Self;
+
     /// Builder a SstWriter.
     fn build(self, path: &str) -> Result<E::SstWriter>;
 }

@@ -115,6 +115,10 @@ impl SstWriterBuilder<PanicEngine> for PanicSstWriterBuilder {
     fn build(self, path: &str) -> Result<PanicSstWriter> {
         panic!()
     }
+
+    fn set_block_size(self, size: usize) -> Self {
+        panic!()
+    }
 }
 
 pub struct PanicExternalSstFileInfo;

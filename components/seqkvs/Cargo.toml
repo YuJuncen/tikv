@@ -1,0 +1,11 @@
+[package]
+name = "seqkvs"
+version = "0.1.0"
+edition = "2018"
+publish = false
+
+[dependencies]
+byteorder = "1.4"
+tikv_alloc = { path = "../tikv_alloc", default-features = false }
+bytes = "1.0"
+lz4 = "1.23.1"

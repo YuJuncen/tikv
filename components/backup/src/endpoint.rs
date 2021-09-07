@@ -3,10 +3,10 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::f64::INFINITY;
-use std::fmt;
 use std::sync::atomic::*;
 use std::sync::*;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fmt, mem};
 
 use concurrency_manager::ConcurrencyManager;
 use engine_rocks::raw::DB;
@@ -596,6 +596,14 @@ impl ControlThreadPool {
     }
 }
 
+fn extract_common_prefix(xs: &[u8], ys: &[u8]) -> Vec<u8> {
+    xs.iter()
+        .zip(ys.iter())
+        .take_while(|(c1, c2)| c1 == c2)
+        .map(|(c, _)| *c)
+        .collect()
+}
+
 impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
     pub fn new(
         store_id: u64,
@@ -676,7 +684,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     (batch, progress.is_raw_kv, progress.cf)
                 };
 
-                for brange in batch {
+                for mut brange in batch {
                     if request.cancel.load(Ordering::SeqCst) {
                         warn!("backup task has canceled"; "range" => ?brange);
                         return;
@@ -709,7 +717,12 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             brange.end_key.map_or_else(Vec::new, |k| k.into_encoded()),
                         )
                     } else {
-                        let writer_builder = BackupWriterBuilder::new(
+                        let start = mem::take(&mut brange.start_key)
+                            .map_or_else(Vec::new, |k| k.into_raw().unwrap());
+                        let end = mem::take(&mut brange.end_key)
+                            .map_or_else(Vec::new, |k| k.into_raw().unwrap());
+                        let common_prefix = extract_common_prefix(&start, &end);
+                        let mut writer_builder = BackupWriterBuilder::new(
                             store_id,
                             storage.limiter.clone(),
                             brange.region.clone(),
@@ -718,6 +731,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             request.compression_level,
                             sst_max_size,
                         );
+                        writer_builder.set_common_prefix(common_prefix);
                         (
                             brange.backup(
                                 writer_builder,
@@ -727,12 +741,8 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                                 start_ts,
                                 &storage,
                             ),
-                            brange
-                                .start_key
-                                .map_or_else(Vec::new, |k| k.into_raw().unwrap()),
-                            brange
-                                .end_key
-                                .map_or_else(Vec::new, |k| k.into_raw().unwrap()),
+                            start,
+                            end,
                         )
                     };
 

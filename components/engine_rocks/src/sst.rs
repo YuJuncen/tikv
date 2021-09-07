@@ -12,6 +12,7 @@ use engine_traits::{Iterable, Result, SstExt, SstReader};
 use engine_traits::{Iterator, SeekKey};
 use fail::fail_point;
 use rocksdb::rocksdb::supported_compression;
+use rocksdb::BlockBasedOptions;
 use rocksdb::DBCompressionType;
 use rocksdb::DBIterator;
 use rocksdb::ExternalSstFileInfo as RawExternalSstFileInfo;
@@ -156,6 +157,7 @@ pub struct RocksSstWriterBuilder {
     in_memory: bool,
     compression_type: Option<DBCompressionType>,
     compression_level: i32,
+    block_size: Option<usize>,
 }
 
 impl SstWriterBuilder<RocksEngine> for RocksSstWriterBuilder {
@@ -166,6 +168,7 @@ impl SstWriterBuilder<RocksEngine> for RocksSstWriterBuilder {
             db: None,
             compression_type: None,
             compression_level: 0,
+            block_size: None,
         }
     }
 
@@ -191,6 +194,11 @@ impl SstWriterBuilder<RocksEngine> for RocksSstWriterBuilder {
 
     fn set_compression_level(mut self, level: i32) -> Self {
         self.compression_level = level;
+        self
+    }
+
+    fn set_block_size(mut self, size: usize) -> Self {
+        self.block_size = Some(size);
         self
     }
 
@@ -240,6 +248,11 @@ impl SstWriterBuilder<RocksEngine> for RocksSstWriterBuilder {
         // being used, we must set them empty or disabled.
         io_options.compression_per_level(&[]);
         io_options.bottommost_compression(DBCompressionType::Disable);
+        if let Some(block_size) = self.block_size {
+            let mut block_opts = BlockBasedOptions::new();
+            block_opts.set_block_size(block_size);
+            io_options.set_block_based_table_factory(&block_opts);
+        }
         let mut writer = SstFileWriter::new(EnvOptions::new(), io_options);
         fail_point!("on_open_sst_writer");
         writer.open(path)?;
