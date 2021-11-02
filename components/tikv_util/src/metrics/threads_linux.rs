@@ -26,6 +26,7 @@ struct Metrics {
     cpu_totals: GaugeVec,
     io_totals: GaugeVec,
     threads_state: IntGaugeVec,
+    thread_processor_id: IntGaugeVec,
     voluntary_ctxt_switches: IntGaugeVec,
     nonvoluntary_ctxt_switches: IntGaugeVec,
 }
@@ -46,6 +47,11 @@ impl Metrics {
         let threads_state = IntGaugeVec::new(
             Opts::new("threads_state", "Number of threads in each state.").namespace(ns.clone()),
             &["state"],
+        )
+        .unwrap();
+        let thread_processor_id = IntGaugeVec::new(
+            Opts::new("thread_processor_id", "Current CPU ID of the thread").namespace(ns.clone()),
+            &["name", "tid"],
         )
         .unwrap();
         let io_totals = GaugeVec::new(
@@ -79,6 +85,7 @@ impl Metrics {
             cpu_totals,
             io_totals,
             threads_state,
+            thread_processor_id,
             voluntary_ctxt_switches,
             nonvoluntary_ctxt_switches,
         }
@@ -88,6 +95,7 @@ impl Metrics {
         let mut descs: Vec<Desc> = vec![];
         descs.extend(self.cpu_totals.desc().into_iter().cloned());
         descs.extend(self.threads_state.desc().into_iter().cloned());
+        descs.extend(self.thread_processor_id.desc().into_iter().cloned());
         descs.extend(self.io_totals.desc().into_iter().cloned());
         descs.extend(self.voluntary_ctxt_switches.desc().into_iter().cloned());
         descs.extend(self.nonvoluntary_ctxt_switches.desc().into_iter().cloned());
@@ -97,6 +105,7 @@ impl Metrics {
     fn reset(&mut self) {
         self.cpu_totals.reset();
         self.threads_state.reset();
+        self.thread_processor_id.reset();
         self.io_totals.reset();
         self.voluntary_ctxt_switches.reset();
         self.nonvoluntary_ctxt_switches.reset();
@@ -160,6 +169,13 @@ impl Collector for ThreadsCollector {
                     .unwrap();
                 state.inc();
 
+                // Current processor ID
+                metrics
+                    .thread_processor_id
+                    .get_metric_with_label_values(&[&name, &format!("{}", tid)])
+                    .unwrap()
+                    .set(stat.processor);
+
                 if let Ok(io) = pid::io_task(self.pid, tid) {
                     let read_bytes = io.read_bytes;
                     let write_bytes = io.write_bytes;
@@ -198,6 +214,7 @@ impl Collector for ThreadsCollector {
         }
         let mut mfs = metrics.cpu_totals.collect();
         mfs.extend(metrics.threads_state.collect());
+        mfs.extend(metrics.thread_processor_id.collect());
         mfs.extend(metrics.io_totals.collect());
         mfs.extend(metrics.voluntary_ctxt_switches.collect());
         mfs.extend(metrics.nonvoluntary_ctxt_switches.collect());
