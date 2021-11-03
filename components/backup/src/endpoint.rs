@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::f64::INFINITY;
 use std::fmt;
 use std::sync::atomic::*;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use concurrency_manager::ConcurrencyManager;
@@ -37,7 +37,6 @@ use tikv_util::worker::Runnable;
 use tikv_util::{box_err, debug, error, error_unknown, impl_display_as_debug, info, warn};
 use tokio::io::Result as TokioResult;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use txn_types::{Key, Lock, TimeStamp};
@@ -542,12 +541,12 @@ impl<R: RegionInfoProvider> Progress<R> {
     /// Forward the progress by `ranges` BackupRanges
     ///
     /// The size of the returned BackupRanges should <= `ranges`
-    async fn forward(&mut self, limit: usize) -> Vec<BackupRange> {
+    fn forward(&mut self, limit: usize) -> Vec<BackupRange> {
         if self.finished {
             return Vec::new();
         }
         let store_id = self.store_id;
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel();
         let start_key_ = self
             .next_start
             .clone()
@@ -600,7 +599,7 @@ impl<R: RegionInfoProvider> Progress<R> {
         }
 
         info!("region scan send.");
-        let branges: Vec<_> = UnboundedReceiverStream::new(rx).collect().await;
+        let branges: Vec<_> = rx.iter().collect();
         info!("regions built.");
         if let Some(b) = branges.last() {
             // The region's end key is empty means it is the last
@@ -753,7 +752,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     // blocked by each other.
                     let mut progress = prs.as_ref().lock().unwrap();
                 info!("progress lock get"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
-                    let batch = progress.forward(batch_size).await;
+                    let batch = progress.forward(batch_size);
                 info!("batch forward done"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                     if batch.is_empty() {
                         return;
