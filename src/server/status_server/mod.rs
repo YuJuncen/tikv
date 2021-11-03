@@ -283,61 +283,11 @@ where
         let seconds: u64 = match query_pairs.get("seconds") {
             Some(val) => match val.parse() {
                 Ok(val) => val,
-                Err(err) => return Ok(make_response(StatusCode::BAD_REQUEST, err.to_string())),
-            },
-            None => 60,
-        };
-
-        let interval = Duration::from_secs(interval);
-        let period = GLOBAL_TIMER_HANDLE
-            .interval(Instant::now() + interval, interval)
-            .compat()
-            .map_ok(|_| ())
-            .map_err(|_| TIMER_CANCELED.to_owned())
-            .into_stream();
-        let (tx, rx) = oneshot::channel();
-        let callback = move || tx.send(()).unwrap_or_default();
-        let res = Handle::current().spawn(activate_heap_profile(period, callback));
-        if rx.await.is_ok() {
-            let msg = "activate heap profile success";
-            Ok(make_response(StatusCode::OK, msg))
-        } else {
-            let errmsg = format!("{:?}", res.await);
-            Ok(make_response(StatusCode::INTERNAL_SERVER_ERROR, errmsg))
-        }
-    }
-
-    fn deactivate_heap_prof(_req: Request<Body>) -> hyper::Result<Response<Body>> {
-        let body = if deactivate_heap_profile() {
-            "deactivate heap profile success"
-        } else {
-            "no heap profile is running"
-        };
-        Ok(make_response(StatusCode::OK, body))
-    }
-
-    #[allow(dead_code)]
-    async fn dump_heap_prof_to_resp(req: Request<Body>) -> hyper::Result<Response<Body>> {
-        let query = req.uri().query().unwrap_or("");
-        let query_pairs: HashMap<_, _> = url::form_urlencoded::parse(query.as_bytes()).collect();
-
-        let use_jeprof = query_pairs.get("jeprof").map(|x| x.as_ref()) == Some("true");
-
-        let result = if let Some(name) = query_pairs.get("name") {
-            if use_jeprof {
-                jeprof_heap_profile(name)
-            } else {
-                read_file(name)
-            }
-        } else {
-            let mut seconds = 10;
-            if let Some(s) = query_pairs.get("seconds") {
-                match s.parse() {
-                    Ok(val) => seconds = val,
-                    Err(_) => {
-                        let errmsg = "request should have seconds argument".to_owned();
-                        return Ok(make_response(StatusCode::BAD_REQUEST, errmsg));
-                    }
+                Err(_) => {
+                    return Ok(StatusServer::err_response(
+                        StatusCode::BAD_REQUEST,
+                        "request should have seconds argument",
+                    ));
                 }
             },
             None => 10,
@@ -854,16 +804,9 @@ where
                         match (method, path.as_ref()) {
                             (Method::GET, "/metrics") => Ok(Response::new(dump().into())),
                             (Method::GET, "/status") => Ok(Response::default()),
-                            (Method::GET, "/debug/pprof/heap_list") => Self::list_heap_prof(req),
-                            (Method::GET, "/debug/pprof/heap_activate") => {
-                                Self::activate_heap_prof(req).await
+                            (Method::GET, "/debug/pprof/heap") => {
+                                Self::dump_prof_to_resp(req).await
                             }
-                            (Method::GET, "/debug/pprof/heap_deactivate") => {
-                                Self::deactivate_heap_prof(req)
-                            }
-                            // (Method::GET, "/debug/pprof/heap") => {
-                            //     Self::dump_heap_prof_to_resp(req).await
-                            // }
                             (Method::GET, "/config") => {
                                 Self::get_config(req, &cfg_controller).await
                             }

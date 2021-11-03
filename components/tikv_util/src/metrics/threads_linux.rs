@@ -174,7 +174,7 @@ impl Collector for ThreadsCollector {
                     .thread_processor_id
                     .get_metric_with_label_values(&[&name, &format!("{}", tid)])
                     .unwrap()
-                    .set(stat.processor);
+                    .set(stat.processor as _);
 
                 if let Ok(io) = pid::io_task(self.pid, tid) {
                     let read_bytes = io.read_bytes;

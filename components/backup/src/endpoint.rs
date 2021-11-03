@@ -599,7 +599,9 @@ impl<R: RegionInfoProvider> Progress<R> {
             error!(?e; "backup seek region failed");
         }
 
+        info!("region scan send.");
         let branges: Vec<_> = UnboundedReceiverStream::new(rx).collect().await;
+        info!("regions built.");
         if let Some(b) = branges.last() {
             // The region's end key is empty means it is the last
             // region, we need to set the `finished` flag here in case
@@ -720,6 +722,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         &self,
         prs: Arc<Mutex<Progress<R>>>,
         request: Request,
+        backend: Arc<dyn ExternalStorage>,
         tx: UnboundedSender<BackupResponse>,
     ) {
         let start_ts = request.start_ts;
@@ -732,58 +735,39 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         let batch_size = self.config_manager.0.read().unwrap().batch_size;
         let sst_max_size = self.config_manager.0.read().unwrap().sst_max_size.0;
         let limit = self.softlimit.limit();
-        let config = BackendConfig {
-            hdfs_config: HdfsConfig {
-                hadoop_home: self.config_manager.0.read().unwrap().hadoop.home.clone(),
-                linux_user: self
-                    .config_manager
-                    .0
-                    .read()
-                    .unwrap()
-                    .hadoop
-                    .linux_user
-                    .clone(),
-            },
-        };
+        let worker_id = rand::random::<usize>();
 
-        self.pool.borrow_mut().spawn(async move {
+        self.pool.borrow().spawn(async move {
             let _with_io_type = WithIOType::new(IOType::Export);
-
-            // Check if we can open external storage.
-            let backend = match create_storage(&request.backend, config) {
-                Ok(backend) => backend,
-                Err(err) => {
-                    error_unknown!(?err; "backup create storage failed");
-                    let mut response = BackupResponse::default();
-                    response.set_error(crate::Error::Io(err).into());
-                    if let Err(err) = tx.unbounded_send(response) {
-                        error_unknown!(?err; "backup failed to send response");
-                    }
-                    return;
-                }
-            };
 
             let storage = LimitedStorage {
                 limiter: request.limiter,
                 storage: Arc::new(backend),
             };
 
+            info!("start to backup worker"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
             loop {
                 let (batch, is_raw_kv, cf) = {
                     // Release lock as soon as possible.
                     // It is critical to speed up backup, otherwise workers are
                     // blocked by each other.
-                    let mut progress = prs.lock().await;
+                    let mut progress = prs.as_ref().lock().await;
+                info!("progress lock get"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                     let batch = progress.forward(batch_size).await;
+                info!("batch forward done"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                     if batch.is_empty() {
                         return;
                     }
-                    (batch, progress.is_raw_kv, progress.cf)
+                    let result = (batch, progress.is_raw_kv, progress.cf);
+                    drop(progress);
+                    result
                 };
 
+                info!("start to backup range"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                 for brange in batch {
                     let engine = engine.clone();
                     let guard = limit.guard().await;
+                    info!("start to backup region"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                     if let Err(e) = guard {
                         warn!("failed to retrieve limit guard, omitting."; "err" => %e);
                     }
@@ -925,8 +909,36 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         )));
         let concurrency = self.config_manager.0.read().unwrap().num_threads;
         self.pool.borrow_mut().adjust_with(concurrency);
+        let config = BackendConfig {
+            hdfs_config: HdfsConfig {
+                hadoop_home: self.config_manager.0.read().unwrap().hadoop.home.clone(),
+                linux_user: self
+                    .config_manager
+                    .0
+                    .read()
+                    .unwrap()
+                    .hadoop
+                    .linux_user
+                    .clone(),
+            },
+        };
+        // Check if we can open external storage.
+        let backend = match create_storage(&request.backend, config) {
+            Ok(backend) => backend,
+            Err(err) => {
+                error_unknown!(?err; "backup create storage failed");
+                let mut response = BackupResponse::default();
+                response.set_error(crate::Error::Io(err).into());
+                if let Err(err) = resp.unbounded_send(response) {
+                    error_unknown!(?err; "backup failed to send response");
+                }
+                return;
+            }
+        };
+        let backend = Arc::<dyn ExternalStorage>::from(backend);
+
         for _ in 0..concurrency {
-            self.spawn_backup_worker(prs.clone(), request.clone(), resp.clone());
+            self.spawn_backup_worker(prs.clone(), request.clone(), backend.clone(), resp.clone());
         }
     }
 }
