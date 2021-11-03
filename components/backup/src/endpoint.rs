@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::f64::INFINITY;
 use std::fmt;
 use std::sync::atomic::*;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use concurrency_manager::ConcurrencyManager;
@@ -37,7 +37,7 @@ use tikv_util::worker::Runnable;
 use tikv_util::{box_err, debug, error, error_unknown, impl_display_as_debug, info, warn};
 use tokio::io::Result as TokioResult;
 use tokio::runtime::Runtime;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use txn_types::{Key, Lock, TimeStamp};
@@ -751,7 +751,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     // Release lock as soon as possible.
                     // It is critical to speed up backup, otherwise workers are
                     // blocked by each other.
-                    let mut progress = prs.as_ref().lock().await;
+                    let mut progress = prs.as_ref().lock().unwrap();
                 info!("progress lock get"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                     let batch = progress.forward(batch_size).await;
                 info!("batch forward done"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
