@@ -153,7 +153,7 @@ impl<Statistics: CpuStatistics> SoftLimitByCpu<Statistics> {
         idle.saturating_sub(self.keep_remain).max(1)
     }
 
-    pub fn has_running(&mut self, by: impl FnMut(&str) -> bool) -> bool {
+    pub fn has_running(&mut self, mut by: impl FnMut(&str) -> bool) -> bool {
         let usages = self
             .metrics
             .get_cpu_usages()
