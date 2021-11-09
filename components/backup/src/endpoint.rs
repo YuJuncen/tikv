@@ -470,6 +470,7 @@ impl SoftLimitKeeper {
                 ..
             } = *self.config.0.read().unwrap();
             cpu_quota.set_remain(auto_tune_remain_threads);
+
             if !enable_auto_tune {
                 if let Err(e) = self.limit.resize(num_threads).await {
                     error!("failed to resize the soft limit to num-threads, backup may be restricted unexpectly.";
@@ -477,6 +478,12 @@ impl SoftLimitKeeper {
                         "error" => %e
                     );
                 }
+            } else if cpu_quota.has_running(|s| s.contains("bkwkr")) {
+                // If we adjust the quota during running, the positive feedback of:
+                // 1. backup workers get running.
+                // 2. ...hence, the latency of workload grows(may trigger some queuing in the front end),
+                //  so the resource used by the workload would probably decreased.
+                // 3. ...backup workers get more aggressive, so the workload get even less resource to run.
             } else if let Err(e) = cpu_quota
                 .exec_over_with_exclude(&self.limit, |s| s.contains("bkwkr"))
                 .await
@@ -752,9 +759,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     // It is critical to speed up backup, otherwise workers are
                     // blocked by each other.
                     let mut progress = prs.as_ref().lock().await;
-                info!("progress lock get"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                     let batch = progress.forward(batch_size).await;
-                info!("batch forward done"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                     if batch.is_empty() {
                         return;
                     }
@@ -763,11 +768,9 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     result
                 };
 
-                info!("start to backup range"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                 for brange in batch {
                     let engine = engine.clone();
                     let guard = limit.guard().await;
-                    info!("start to backup region"; "start_key" => &log_wrappers::Value::key(&request.start_key[..]), "worker" => worker_id);
                     if let Err(e) = guard {
                         warn!("failed to retrieve limit guard, omitting."; "err" => %e);
                     }

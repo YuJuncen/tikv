@@ -153,6 +153,16 @@ impl<Statistics: CpuStatistics> SoftLimitByCpu<Statistics> {
         idle.saturating_sub(self.keep_remain).max(1)
     }
 
+    pub fn has_running(&mut self, by: impl FnMut(&str) -> bool) -> bool {
+        let usages = self
+            .metrics
+            .get_cpu_usages()
+            .into_iter()
+            .filter(|(s, _)| by(s))
+            .fold(0, |data, (_, usage)| data + usage);
+        usages > 10
+    }
+
     /// set the keep_remain to the keeper.
     /// this applies to subsequent `exec_over` calls.
     pub fn set_remain(&mut self, remain: usize) {
