@@ -6,6 +6,7 @@ edition = "2018"
 publish = false
 
 [features]
+default = ["test-engines-rocksdb"]
 tcmalloc = ["tikv/tcmalloc"]
 jemalloc = ["tikv/jemalloc"]
 mimalloc = ["tikv/mimalloc"]
@@ -27,6 +28,7 @@ nortcheck = ["engine_rocks/nortcheck"]
 
 [dependencies]
 backup = { path = "../backup", default-features = false }
+br-stream = { path = "../br-stream", default-features = false }
 cdc = { path = "../cdc", default-features = false }
 chrono = "0.4"
 tempfile = "3.0"

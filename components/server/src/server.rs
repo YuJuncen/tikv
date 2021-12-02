@@ -26,6 +26,9 @@ use std::{
     u64,
 };
 
+
+use br_stream::metadata::MetadataClient;
+use br_stream::metadata::store::{MetaStore, EtcdStore};
 use cdc::{CdcConfigManager, MemoryQuota};
 use concurrency_manager::ConcurrencyManager;
 use encryption_export::{data_key_manager_from_config, DataKeyManager};
@@ -863,6 +866,29 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             self.to_stop.push(ttl_checker);
         }
 
+
+        // Create backup stream.
+        let mut br_stream_worker = Box::new(LazyWorker::new("br-stream"));
+        let br_stream_scheduler = br_stream_worker.scheduler();
+
+        // Register br-stream observer.
+        // let br_stream_ob = 
+        // br_stream_ob.register_to(self.coprocessor_host.as_mut().unwrap());
+        // Register cdc config manager.
+        // cfg_controller.register(
+        //     tikv::config::Module::BackupStream,
+        //     Box::new(BackupStreamConfigManager(br_stream_worker.scheduler())),
+        // );
+
+        let meta_store = EtcdStore::connect(&self.config.pd.endpoints);
+        let meta_client = MetadataClient::new(meta_store, node.id());
+        let br_stream_endpoint = br_stream::Endpoint::new(
+            meta_client,
+            self.config.backup.clone(),
+            br_stream_scheduler.clone(),
+        );
+        br_stream_worker.start(br_stream_endpoint);
+
         // Start CDC.
         let cdc_memory_quota = MemoryQuota::new(self.config.cdc.sink_memory_quota.0 as _);
         let cdc_endpoint = cdc::Endpoint::new(
@@ -1007,7 +1033,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             )
             .unwrap_or_else(|e| fatal!("failed to start lock manager: {}", e));
 
-        // Backup service.
+       // Backup service.
         let mut backup_worker = Box::new(self.background_worker.lazy_build("backup-endpoint"));
         let backup_scheduler = backup_worker.scheduler();
         let backup_service = backup::Service::new(backup_scheduler);
