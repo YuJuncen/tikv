@@ -2,5 +2,6 @@
 mod endpoint;
 pub mod errors;
 pub mod metadata;
+pub mod observer;
 
 pub use endpoint::Endpoint;

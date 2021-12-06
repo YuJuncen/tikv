@@ -405,6 +405,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes 0.4.12",
+ "crossbeam",
  "engine_rocks",
  "engine_traits",
  "etcd-client",
@@ -420,6 +421,7 @@ dependencies = [
  "slog-global",
  "thiserror",
  "tikv",
+ "tikv_alloc",
  "tikv_util",
  "tokio",
  "tokio-stream",

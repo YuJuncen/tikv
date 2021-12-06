@@ -1,7 +1,7 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 use etcd_client::{DeleteOptions, EventType, GetOptions, SortOrder, SortTarget, WatchOptions};
-use std::{os::unix::prelude::AsRawFd, pin::Pin};
 use std::sync::Arc;
+use std::pin::Pin;
 use tikv_util::warn;
 use tokio::sync::Mutex;
 
@@ -21,8 +21,8 @@ pub struct EtcdStore(Arc<Mutex<etcd_client::Client>>);
 impl EtcdStore {
     pub fn connect<E: AsRef<str>, S: AsRef<[E]>>(endpoints: S) -> Self {
         // TODO remove block_on
-        let cli = futures::executor::block_on(
-            etcd_client::Client::connect(&endpoints, None)).unwrap();
+        let cli =
+            futures::executor::block_on(etcd_client::Client::connect(&endpoints, None)).unwrap();
         Self(Arc::new(Mutex::new(cli)))
     }
 }
