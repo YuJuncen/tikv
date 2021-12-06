@@ -42,3 +42,4 @@ engine_traits = { path = "../engine_traits", default-features = false }
 raft = { version = "0.6.0-alpha", default-features = false, features = ["protobuf-codec"] }
 raftstore = { path = "../raftstore", default-features = false }
 tikv = { path = "../../", default-features = false }
+online_config = { path = "../online_config" }

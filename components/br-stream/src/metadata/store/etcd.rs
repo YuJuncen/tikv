@@ -1,7 +1,7 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 use etcd_client::{DeleteOptions, EventType, GetOptions, SortOrder, SortTarget, WatchOptions};
-use std::sync::Arc;
 use std::pin::Pin;
+use std::sync::Arc;
 use tikv_util::warn;
 use tokio::sync::Mutex;
 

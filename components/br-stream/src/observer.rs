@@ -6,8 +6,8 @@ use engine_traits::KvEngine;
 use kvproto::metapb::{Peer, Region};
 use raft::StateRole;
 use raftstore::coprocessor::*;
-use tikv_util::worker::Scheduler;
 use tikv_util::warn;
+use tikv_util::worker::Scheduler;
 
 use crate::endpoint::Task;
 
@@ -44,7 +44,7 @@ impl BackupStreamObserver {
     }
 
     // keep ranges in memory to filter kv events not in these ranges.
-    pub fn register_ranges(&self, ranges: Vec<(Vec<u8>, Vec<u8>)>) {
+    pub fn register_ranges(&self, _ranges: Vec<(Vec<u8>, Vec<u8>)>) {
         // TODO reigister ranges to route kv event
         unimplemented!();
     }
@@ -59,7 +59,7 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
         &self,
         max_level: ObserveLevel,
         cmd_batches: &mut Vec<CmdBatch>,
-        engine: &E,
+        _engine: &E,
     ) {
         assert!(!cmd_batches.is_empty());
         if max_level < ObserveLevel::All {

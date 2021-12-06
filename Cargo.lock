@@ -413,6 +413,7 @@ dependencies = [
  "hex 0.4.2",
  "kvproto",
  "lazy_static",
+ "online_config",
  "protobuf",
  "raft",
  "raftstore",

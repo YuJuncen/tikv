@@ -26,7 +26,8 @@ use std::{
     u64,
 };
 
-use br_stream::metadata::store::{EtcdStore, MetaStore};
+use br_stream::config::BackupStreamConfigManager;
+use br_stream::metadata::store::EtcdStore;
 use br_stream::metadata::MetadataClient;
 use br_stream::observer::BackupStreamObserver;
 use cdc::{CdcConfigManager, MemoryQuota};
@@ -876,7 +877,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             backup_stream_ob.register_to(self.coprocessor_host.as_mut().unwrap());
             // Register config manager.
             cfg_controller.register(
-                tikv::config::Module::BackupStream,
+                tikv::config::Module::Backup,
                 Box::new(BackupStreamConfigManager(backup_stream_worker.scheduler())),
             );
 

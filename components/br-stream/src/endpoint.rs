@@ -5,9 +5,10 @@ use tokio::io::Result as TokioResult;
 use tokio::runtime::Runtime;
 use tokio_stream::StreamExt;
 
-use crate::{errors::Result, observer::BackupStreamObserver};
 use crate::metadata::store::MetaStore;
 use crate::metadata::{MetadataClient, MetadataEvent, Task as MetaTask};
+use crate::{errors::Result, observer::BackupStreamObserver};
+use online_config::ConfigChange;
 use raftstore::coprocessor::CmdBatch;
 use tikv::config::BackupConfig;
 use tikv_util::worker::{Runnable, Scheduler};
@@ -53,7 +54,6 @@ where
         scheduler: Scheduler<Task>,
     ) -> Result<()> {
         let tasks = meta_client.get_tasks().await?;
-        let revision = tasks.revision;
         let mut watcher = meta_client.events_from(tasks.revision).await?;
         for task in tasks.inner {
             info!("starts watch task {:?} from backup stream", task);
@@ -72,7 +72,7 @@ where
                             error!("backup stream schedule task failed"; "error" => ?e);
                         }
                     }
-                    MetadataEvent::RemoveTask { task } => {
+                    MetadataEvent::RemoveTask { task: _ } => {
                         // TODO implement remove task
                     }
                     MetadataEvent::Error { .. } => {
@@ -88,17 +88,17 @@ where
         let cli = self.meta_client.clone();
         let ob = self.observer.clone();
         self.pool.spawn(async move {
-            match cli.ranges_of_task(task.info.get_name()).await { 
+            match cli.ranges_of_task(task.info.get_name()).await {
                 Ok(ranges) => {
                     debug!("backup stream register ranges to observer");
                     ob.register_ranges(ranges.inner);
-                },
+                }
                 Err(e) => error!("backup stream register task failed"; "error" => ?e),
             }
         });
     }
 
-    pub fn do_backup(&self, events: Vec<CmdBatch>) {
+    pub fn do_backup(&self, _events: Vec<CmdBatch>) {
         // TODO append events to local storage.
         unimplemented!();
     }
@@ -118,12 +118,13 @@ fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<R
             tikv_alloc::remove_thread_memory_accessor();
         })
         .worker_threads(thread_count)
-        .build() 
+        .build()
 }
 
 pub enum Task {
     WatchTask(MetaTask),
     BatchEvent(Vec<CmdBatch>),
+    ChangeConfig(ConfigChange),
 }
 
 impl fmt::Debug for Task {
@@ -137,6 +138,10 @@ impl fmt::Debug for Task {
                 .field("end_ts", &t.info.end_ts)
                 .finish(),
             Task::BatchEvent(_) => de.field("name", &"batch_event").finish(),
+            Task::ChangeConfig(change) => de
+                .field("type", &"change_config")
+                .field("change", change)
+                .finish(),
         }
     }
 }
