@@ -36,17 +36,11 @@ impl BackupStreamObserver {
     }
 
     pub fn register_to(&self, coprocessor_host: &mut CoprocessorHost<impl KvEngine>) {
-        // use 0 as the priority of the cmd observer. CDC should have a higher priority than
+        // use 0 as the priority of the cmd observer. should have a higher priority than
         // the `resolved-ts`'s cmd observer
         coprocessor_host
             .registry
             .register_cmd_observer(0, BoxCmdObserver::new(self.clone()));
-    }
-
-    // keep ranges in memory to filter kv events not in these ranges.
-    pub fn register_ranges(&self, _ranges: Vec<(Vec<u8>, Vec<u8>)>) {
-        // TODO reigister ranges to route kv event
-        unimplemented!();
     }
 }
 
@@ -65,6 +59,7 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
         if max_level < ObserveLevel::All {
             return;
         }
+        // TODO may be we should filter cmd batch here, to reduce the cost of clone.
         let cmd_batches: Vec<_> = cmd_batches
             .iter()
             .filter(|cb| cb.level == ObserveLevel::All && !cb.is_empty())

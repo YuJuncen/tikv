@@ -83,15 +83,30 @@ where
         }
     }
 
-    // register task range to observer
+    // keep ranges in memory to filter kv events not in these ranges.
+    fn register_ranges(_ranges: Vec<(Vec<u8>, Vec<u8>)>) {
+        // TODO reigister ranges to filter kv event
+        // register ranges has two main purpose.
+        // 1. filter kv event that no need to backup
+        // 2. route kv event to the corresponding file.
+        unimplemented!();
+    }
+
+    // filter key not in ranges
+    fn key_in_ranges() -> bool {
+        // TODO use this filter key not in given range(table-filter).
+        unimplemented!();
+    }
+
+    // register task ranges
     pub fn on_register(&self, task: MetaTask) {
         let cli = self.meta_client.clone();
-        let ob = self.observer.clone();
         self.pool.spawn(async move {
             match cli.ranges_of_task(task.info.get_name()).await {
                 Ok(ranges) => {
                     debug!("backup stream register ranges to observer");
-                    ob.register_ranges(ranges.inner);
+                    // TODO implement register ranges
+                    // Endpoint::register_ranges(ranges.inner);
                 }
                 Err(e) => error!("backup stream register task failed"; "error" => ?e),
             }
