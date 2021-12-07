@@ -414,6 +414,7 @@ dependencies = [
  "kvproto",
  "lazy_static",
  "online_config",
+ "prometheus",
  "protobuf",
  "raft",
  "raftstore",

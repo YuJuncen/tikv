@@ -10,6 +10,7 @@ use super::{
 
 use kvproto::brpb::StreamBackupTaskInfo;
 
+use tikv_util::{defer, time::Instant};
 use tokio_stream::StreamExt;
 
 use crate::errors::{Error, Result};
@@ -60,8 +61,6 @@ impl PartialEq for MetadataEvent {
     }
 }
 
-impl Eq for MetadataEvent {}
-
 impl MetadataEvent {
     fn from_watch_event(event: &KvEvent) -> Option<MetadataEvent> {
         // Maybe report an error when the kv isn't present?
@@ -79,11 +78,11 @@ impl MetadataEvent {
 }
 
 /// extract the start key and the end key from a metadata key-value pair.
-/// example: KeyValue(<prefix>/ranges/<start-key>, <end-key>) -> (<start-key>, <end-key>)
-fn take_range(kv: &mut KeyValue, task_name: &str) -> (Vec<u8>, Vec<u8>) {
+/// example: `KeyValue(<prefix>/ranges/<start-key>, <end-key>) -> (<start-key>, <end-key>)`
+fn take_range(kv: &mut KeyValue) -> (Vec<u8>, Vec<u8>) {
     let key = kv.take_key();
     (
-        super::keys::extract_range_from_key(key.as_slice(), task_name)
+        super::keys::extract_range_from_key(key.as_slice())
             .map(|v| v.to_vec())
             .unwrap_or(key),
         kv.take_value(),
@@ -102,6 +101,10 @@ impl<Store: MetaStore> MetadataClient<Store> {
 
     /// query the named task from the meta store.
     pub async fn get_task(&self, name: &str) -> Result<Task> {
+        let now = Instant::now();
+        defer! {
+            super::metrics::METADATA_OPERATION_LATENCY.with_label_values(&["task_get"]).observe(now.saturating_elapsed().as_secs_f64())
+        }
         let items = self
             .meta_store
             .snapshot()
@@ -119,6 +122,10 @@ impl<Store: MetaStore> MetadataClient<Store> {
 
     /// fetch all tasks from the meta store.
     pub async fn get_tasks(&self) -> Result<WithRevision<Vec<Task>>> {
+        let now = Instant::now();
+        defer! {
+            super::metrics::METADATA_OPERATION_LATENCY.with_label_values(&["task_fetch"]).observe(now.saturating_elapsed().as_secs_f64())
+        }
         let snap = self.meta_store.snapshot().await?;
         let kvs = snap.get(Keys::Prefix(MetaKey::tasks())).await?;
         let mut tasks = Vec::with_capacity(kvs.len());
@@ -141,16 +148,42 @@ impl<Store: MetaStore> MetadataClient<Store> {
             .watch(Keys::Prefix(MetaKey::tasks()), revision + 1)
             .await?;
         Ok(Subscription {
-            stream: Box::pin(watcher.stream.filter_map(|item| match item {
-                Err(err) => Some(MetadataEvent::Error { err }),
-                Ok(event) => MetadataEvent::from_watch_event(&event),
-            })),
+            stream: Box::pin(
+                watcher
+                    .stream
+                    .filter_map(|item| match item {
+                        Err(err) => Some(MetadataEvent::Error { err }),
+                        Ok(event) => MetadataEvent::from_watch_event(&event),
+                    })
+                    .map(|event| {
+                        match event {
+                            MetadataEvent::AddTask { .. } => {
+                                super::metrics::METADATA_EVENT_RECEIVED
+                                    .with_label_values(&["task_add"])
+                                    .inc()
+                            }
+                            MetadataEvent::RemoveTask { .. } => {
+                                super::metrics::METADATA_EVENT_RECEIVED
+                                    .with_label_values(&["task_remove"])
+                                    .inc()
+                            }
+                            MetadataEvent::Error { .. } => super::metrics::METADATA_EVENT_RECEIVED
+                                .with_label_values(&["error"])
+                                .inc(),
+                        }
+                        event
+                    }),
+            ),
             cancel: watcher.cancel,
         })
     }
 
     /// forward the progress of some task.
     pub async fn step_task(&self, task_name: &str, region_id: u64, ts: u64) -> Result<()> {
+        let now = Instant::now();
+        defer! {
+            super::metrics::METADATA_OPERATION_LATENCY.with_label_values(&["task_step"]).observe(now.saturating_elapsed().as_secs_f64())
+        }
         self.meta_store
             .set(KeyValue(
                 MetaKey::next_backup_ts_of(task_name, self.store_id, region_id),
@@ -174,7 +207,7 @@ impl<Store: MetaStore> MetadataClient<Store> {
             revision: snap.revision(),
             inner: ranges
                 .into_iter()
-                .map(|mut kv| take_range(&mut kv, task_name))
+                .map(|mut kv| take_range(&mut kv))
                 .collect(),
         })
     }
@@ -187,6 +220,10 @@ impl<Store: MetaStore> MetadataClient<Store> {
         task_name: &str,
         (start_key, end_key): (Vec<u8>, Vec<u8>),
     ) -> Result<WithRevision<Vec<(Vec<u8>, Vec<u8>)>>> {
+        let now = Instant::now();
+        defer! {
+            super::metrics::METADATA_OPERATION_LATENCY.with_label_values(&["task_range_search"]).observe(now.saturating_elapsed().as_secs_f64())
+        }
         let snap = self.meta_store.snapshot().await?;
         let mut prev = snap
             .get_extra(
@@ -212,11 +249,11 @@ impl<Store: MetaStore> MetadataClient<Store> {
         if !prev.kvs.is_empty() {
             let kv = &mut prev.kvs[0];
             if kv.value() > start_key.as_slice() {
-                result.push(take_range(kv, task_name));
+                result.push(take_range(kv));
             }
         }
         for mut kv in all {
-            result.push(take_range(&mut kv, task_name));
+            result.push(take_range(&mut kv));
         }
         Ok(WithRevision {
             revision: snap.revision(),
@@ -226,6 +263,10 @@ impl<Store: MetaStore> MetadataClient<Store> {
 
     /// access the next backup ts of some task and some region.
     pub async fn progress_of_task(&self, task_name: &str, region: u64) -> Result<u64> {
+        let now = Instant::now();
+        defer! {
+            super::metrics::METADATA_OPERATION_LATENCY.with_label_values(&["task_progress_get"]).observe(now.saturating_elapsed().as_secs_f64())
+        }
         let task = self.get_task(task_name).await?;
         let timestamp = self.meta_store.snapshot().await?;
         let mut items = timestamp
