@@ -4,13 +4,16 @@ use std::convert::AsRef;
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use dashmap::DashMap;
 use engine_traits::KvEngine;
 
 use kvproto::metapb::Region;
 use raftstore::router::RaftStoreRouter;
 
 use raftstore::store::fsm::ChangeObserver;
+use resolved_ts::Resolver;
 use tikv_util::time::Instant;
 use tokio::io::Result as TokioResult;
 use tokio::runtime::Runtime;
@@ -51,6 +54,7 @@ pub struct Endpoint<S: MetaStore + 'static, R, E, RT> {
     regions: R,
     engine: PhantomData<E>,
     router: RT,
+    resolvers: Arc<DashMap<u64, Resolver>>,
 }
 
 impl<R, E, RT> Endpoint<EtcdStore, R, E, RT>
@@ -104,6 +108,7 @@ where
             });
         }
 
+        info!("the endpoint of stream backup started"; "path" => %config.streaming_path);
         Endpoint {
             config,
             meta_client,
@@ -115,6 +120,7 @@ where
             regions: accessor,
             engine: PhantomData,
             router,
+            resolvers: Default::default(),
         }
     }
 }
@@ -159,7 +165,17 @@ where
     fn backup_batch(&self, batch: CmdBatch) {
         let mut sw = StopWatch::new();
         let region_id = batch.region_id;
-        let kvs = ApplyEvent::from_cmd_batch(batch, /* TODO */ 0);
+        let mut resolver = match self.resolvers.as_ref().get_mut(&region_id) {
+            Some(rts) => rts,
+            None => {
+                warn!("BUG: the region isn't registered (no resolver found) but sent to backup_batch."; "region_id" => %region_id);
+                return;
+            }
+        };
+
+        let kvs = ApplyEvent::from_cmd_batch(batch, resolver.value_mut());
+        drop(resolver);
+
         HANDLE_EVENT_DURATION_HISTOGRAM
             .with_label_values(&["to_stream_event"])
             .observe(sw.lap().as_secs_f64());
@@ -248,6 +264,7 @@ where
                             let start = Instant::now_coarse();
                             let start_ts = task.info.get_start_ts();
                             let ob = self.observer.clone();
+                            let rs = self.resolvers.clone();
                             let success = self
                                 .observer
                                 .ranges
@@ -266,7 +283,11 @@ where
                                     start_key.clone(),
                                     end_key.clone(),
                                     TimeStamp::new(start_ts),
-                                    |region_id, handle| ob.subs.register_region(region_id, handle),
+                                    |region_id, handle| {
+                                        // Note: maybe we'd better schedule a "register region" here?
+                                        ob.subs.register_region(region_id, handle);
+                                        rs.insert(region_id, Resolver::new(region_id));
+                                    },
                                 );
                                 match range_init_result {
                                     Ok(stat) => {
@@ -300,8 +321,17 @@ where
 
     pub fn on_flush(&self, task: String, store_id: u64) {
         let router = self.range_router.clone();
+        let cli = self
+            .meta_client
+            .as_ref()
+            .expect("on_flush: executed from an endpoint without cli")
+            .clone();
         self.pool.spawn(async move {
-            router.do_flush(&task, store_id).await;
+            if let Some(rts) = router.do_flush(&task, store_id).await {
+                if let Err(err) = cli.step_task(&task, rts).await {
+                    err.report(format!("on flushing task {}", task));
+                }
+            }
         });
     }
 
@@ -320,6 +350,7 @@ where
             e.report(format!("register region {} to raftstore", region.get_id()));
         }
         self.observer.subs.register_region(region_id, handle);
+        self.resolvers.insert(region.id, Resolver::new(region.id));
     }
 
     pub fn do_backup(&mut self, events: Vec<CmdBatch>) {

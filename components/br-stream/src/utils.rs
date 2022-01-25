@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use crate::errors::{Error, Result};
+use crate::{
+    annotate,
+    errors::{Error, Result},
+};
 
 use engine_traits::CF_DEFAULT;
 use futures::{channel::mpsc, executor::block_on, StreamExt};
@@ -28,11 +31,11 @@ pub fn wrap_key(v: Vec<u8>) -> Vec<u8> {
 /// decode ts from a key, and transform the error to the crate error.
 pub fn get_ts(key: &Key) -> Result<TimeStamp> {
     key.decode_ts().map_err(|err| {
-        Error::Other(box_err!(
-            "failed to get ts from key '{}': {}",
-            log_wrappers::Value::key(key.as_encoded().as_slice()),
-            err
-        ))
+        annotate!(
+            err,
+            "failed to get ts from key '{}'",
+            redact(&key.as_encoded())
+        )
     })
 }
 
