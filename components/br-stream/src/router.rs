@@ -113,8 +113,9 @@ impl ApplyEvent {
                         }
                     }
                     CmdType::Delete => resolver.untrack_lock(&key, None),
-                    _ => continue,
+                    _ => {}
                 }
+                continue;
             }
             // use the key ts as min_ts would be safe.
             // - if it is uncommitted, the lock would be tracked, preventing resolved ts
