@@ -99,22 +99,22 @@ impl ApplyEvent {
                 }
             };
             if cf == CF_LOCK {
-                match Lock::parse(&value).map_err(|err| {
-                    annotate!(
-                        err,
-                        "failed to parse lock (value = {})",
-                        utils::redact(&value)
-                    )
-                }) {
-                    Ok(lock) => match cmd_type {
-                        CmdType::Put => resolver.track_lock(lock.ts, key, None),
-                        CmdType::Delete => resolver.untrack_lock(&key, None),
-                        _ => continue,
-                    },
-                    Err(err) => err.report(format!("region id = {}", region_id)),
-                };
-
-                continue;
+                match cmd_type {
+                    CmdType::Put => {
+                        match Lock::parse(&value).map_err(|err| {
+                            annotate!(
+                                err,
+                                "failed to parse lock (value = {})",
+                                utils::redact(&value)
+                            )
+                        }) {
+                            Ok(lock) => resolver.track_lock(lock.ts, key, None),
+                            Err(err) => err.report(format!("region id = {}", region_id)),
+                        }
+                    }
+                    CmdType::Delete => resolver.untrack_lock(&key, None),
+                    _ => continue,
+                }
             }
             // use the key ts as min_ts would be safe.
             // - if it is uncommitted, the lock would be tracked, preventing resolved ts
