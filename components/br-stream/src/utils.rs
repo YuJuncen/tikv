@@ -207,6 +207,29 @@ pub fn request_to_triple(mut req: Request) -> Either<(Vec<u8>, Vec<u8>, String),
     Either::Left((key, value, cf))
 }
 
+/// `try_send!(s: Scheduler<T>, task: T)` tries to send a task to the scheduler,
+/// once meet an error, would report it, with the current file and line (so it is made as a macro).    
+/// returns whether it success.
+#[macro_export(crate)]
+macro_rules! try_send {
+    ($s: expr, $task: expr) => {
+        match $s.schedule($task) {
+            Err(err) => {
+                $crate::errors::Error::from(err).report(concat!(
+                    "[",
+                    file!(),
+                    ":",
+                    line!(),
+                    "]",
+                    "failed to schedule task"
+                ));
+                false
+            }
+            Ok(_) => true,
+        }
+    };
+}
+
 #[cfg(test)]
 mod test {
     use super::SegmentTree;

@@ -344,21 +344,46 @@ where
     }
 
     /// Start observe over some region.
-    /// This would register the region to the RaftStore.
-    ///
-    /// > Note: This won't trigger a incremental scanning.
-    /// >      When the follower progress faster than leader and then be elected,
-    /// >      there is a risk of losing data.
-    pub fn on_observe_region(&self, region: Region) {
+    /// This would modify some internal state, and delegate the task to InitialLoader::observe_over.
+    fn observe_over(&self, region: &Region) -> Result<()> {
         let init = self.make_initial_loader();
         let handle = ObserveHandle::new();
         let region_id = region.get_id();
         let ob = ChangeObserver::from_cdc(region_id, handle.clone());
-        if let Err(e) = init.observe_over(&region, ob) {
-            e.report(format!("register region {} to raftstore", region.get_id()));
-        }
+        init.observe_over(&region, ob)?;
         self.observer.subs.register_region(region_id, handle);
         self.resolvers.insert(region.id, Resolver::new(region.id));
+        Ok(())
+    }
+
+    /// Modify observe over some region.
+    /// This would register the region to the RaftStore.
+    ///
+    /// > Note: If using this to start observe, this won't trigger a incremental scanning.
+    /// >      When the follower progress faster than leader and then be elected,
+    /// >      there is a risk of losing data.
+    pub fn on_modify_observe(&self, op: ObserveOp) {
+        match op {
+            ObserveOp::Start { region } => {
+                if let Err(e) = self.observe_over(&region) {
+                    e.report(format!("register region {} to raftstore", region.get_id()));
+                }
+            }
+            ObserveOp::Stop { region } => {
+                self.observer.subs.deregister_region(region.id);
+                self.resolvers.as_ref().remove(&region.id);
+            }
+            ObserveOp::RefreshResolver { region } => {
+                self.observer.subs.deregister_region(region.id);
+                self.resolvers.as_ref().remove(&region.id);
+                if let Err(e) = self.observe_over(&region) {
+                    e.report(format!(
+                        "register region {} to raftstore when refreshing",
+                        region.get_id()
+                    ));
+                }
+            }
+        }
     }
 
     pub fn do_backup(&mut self, events: Vec<CmdBatch>) {
@@ -394,11 +419,22 @@ pub enum Task {
     ChangeConfig(ConfigChange),
     /// Flush the task with name.
     Flush(String),
-    /// Start observe over the region.
-    ObserverRegion {
+    /// Change the observe status of some region.
+    ModifyObserve(ObserveOp),
+}
+
+#[derive(Debug)]
+pub enum ObserveOp {
+    Start {
         region: Region,
         // Note: Maybe add the request for initial scanning too.
         // needs_initial_scanning: bool
+    },
+    Stop {
+        region: Region,
+    },
+    RefreshResolver {
+        region: Region,
     },
 }
 
@@ -412,10 +448,7 @@ impl fmt::Debug for Task {
                 .finish(),
             Self::ChangeConfig(arg0) => f.debug_tuple("ChangeConfig").field(arg0).finish(),
             Self::Flush(arg0) => f.debug_tuple("Flush").field(arg0).finish(),
-            Self::ObserverRegion { region } => f
-                .debug_struct("ObserverRegion")
-                .field("region", region)
-                .finish(),
+            Self::ModifyObserve(op) => f.debug_tuple("ModifyObserve").field(op).finish(),
         }
     }
 }
@@ -440,8 +473,8 @@ where
         match task {
             Task::WatchTask(task) => self.on_register(task),
             Task::BatchEvent(events) => self.do_backup(events),
-            Task::ObserverRegion { region } => self.on_observe_region(region),
             Task::Flush(task) => self.on_flush(task, self.store_id),
+            Task::ModifyObserve(op) => self.on_modify_observe(op),
             _ => (),
         }
     }
