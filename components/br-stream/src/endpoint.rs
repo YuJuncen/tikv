@@ -330,7 +330,15 @@ where
             if let Some(rts) = router.do_flush(&task, store_id).await {
                 if let Err(err) = cli.step_task(&task, rts).await {
                     err.report(format!("on flushing task {}", task));
+                    // we can advance the progress at next time.
+                    // return early so we won't be mislead by the metrics.
+                    return;
                 }
+                metrics::STORE_CHECKPOINT_TS
+                    // Currently, we only support one task at the same time,
+                    // so use the task as label would be ok.
+                    .with_label_values(&[task.as_str()])
+                    .set(rts as _)
             }
         });
     }
