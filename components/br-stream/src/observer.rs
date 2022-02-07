@@ -184,10 +184,6 @@ impl RegionChangeObserver for BackupStreamObserver {
         event: RegionChangeEvent,
         _role: StateRole,
     ) {
-        // No need for handling `Create` -- once it becomes leader, it would start by
-        // `on_applied_current_term`.
-        // But should we deregister and register again when the region is `Update`d?
-
         match event {
             RegionChangeEvent::Destroy if self.subs.should_observe(ctx.region().get_id()) => {
                 try_send!(
@@ -205,6 +201,8 @@ impl RegionChangeObserver for BackupStreamObserver {
                     })
                 );
             }
+            // No need for handling `Create` -- once it becomes leader, it would start by
+            // `on_applied_current_term`.
             _ => {}
         }
     }
