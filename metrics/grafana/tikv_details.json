@@ -38518,7 +38518,7 @@
           "targets": [
             {
               "exemplar": true,
-              "expr": "irate(tikv_stream_errors{instance=~\"$instance\"}[30s]) * 30",
+              "expr": "increase(tikv_stream_errors{instance=~\"$instance\"}[$__rate_interval])",
               "format": "time_series",
               "hide": false,
               "instant": false,
@@ -38637,7 +38637,6 @@
               "expr": "tikv_stream_store_checkpoint_ts{instance=~\"$instance\"} / 262144 ",
               "interval": "",
               "legendFormat": "{{ task }}@{{instance}}",
-              "queryType": "randomWalk",
               "refId": "A"
             },
             {
@@ -38765,7 +38764,6 @@
               "format": "time_series",
               "interval": "",
               "legendFormat": "{{ task }}",
-              "queryType": "randomWalk",
               "refId": "A"
             }
           ],
