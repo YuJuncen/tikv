@@ -5,9 +5,10 @@ use std::{
     path::{Path, PathBuf},
     result,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
         Arc, RwLock as SyncRwLock,
     },
+    time::Duration,
 };
 
 use crate::{
@@ -40,7 +41,7 @@ use slog_global::debug;
 use tidb_query_datatype::codec::table::decode_table_id;
 
 use tikv_util::{
-    box_err, defer, info,
+    box_err, defer, error, info,
     time::{Instant, Limiter},
     warn,
     worker::Scheduler,
@@ -50,6 +51,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::{fs::remove_file, fs::File};
 use txn_types::{Key, Lock, TimeStamp};
+
+const FLUSH_STORAGE_INTERVAL: u64 = 300;
 
 #[derive(Debug)]
 pub struct ApplyEvent {
@@ -330,6 +333,19 @@ impl RouterInner {
             )
     }
 
+    pub async fn get_task_info(&self, task_name: &str) -> Result<Arc<StreamTaskInfo>> {
+        let task_info = match self.tasks.lock().await.get(task_name) {
+            Some(t) => t.clone(),
+            None => {
+                info!("backup stream no task"; "task" => ?task_name);
+                return Err(Error::NoSuchTask {
+                    task_name: task_name.to_string(),
+                });
+            }
+        };
+        Ok(task_info)
+    }
+
     pub async fn on_event(&self, kv: ApplyEvent) -> Result<()> {
         if let Some(task) = self.get_task_by_key(&kv.key) {
             debug!(
@@ -339,13 +355,7 @@ impl RouterInner {
                 "key" => &log_wrappers::Value::key(&kv.key),
             );
 
-            let task_info = match self.tasks.lock().await.get(&task) {
-                Some(t) => t.clone(),
-                None => {
-                    info!("backup stream no task"; "task" => ?task);
-                    return Err(Error::NoSuchTask { task_name: task });
-                }
-            };
+            let task_info = self.get_task_info(&task).await?;
             task_info.on_event(kv).await?;
 
             // When this event make the size of temporary files exceeds the size limit, make a flush.
@@ -361,9 +371,8 @@ impl RouterInner {
             if cur_size > self.temp_file_size_limit && !task_info.is_flushing() {
                 info!("try flushing task"; "task" => %task, "size" => %cur_size);
                 if task_info.set_flushing_status_cas(false, true).is_ok() {
-                    // delay the schedule when failure? (Why the scheduler doesn't support blocking send...)
-                    if self.scheduler.schedule(Task::Flush(task)).is_err() {
-                        // oops... we failed, let's leave the chance to next challenger.
+                    if let Err(e) = self.scheduler.schedule(Task::Flush(task)) {
+                        error!("backup stream schedule task failed"; "error" => ?e);
                         task_info.set_flushing_status(false);
                     }
                 }
@@ -385,7 +394,7 @@ impl RouterInner {
 
                 // set false to flushing whether success or fail
                 task_info.set_flushing_status(false);
-
+                task_info.update_flush_time();
                 result.ok().flatten()
             }
             _ => None,
@@ -495,6 +504,10 @@ pub struct StreamTaskInfo {
     files: SlotMap<TempFileKey, DataFile>,
     /// flushing_files contains files pending flush.
     flushing_files: SlotMap<TempFileKey, DataFile>,
+    /// last_flush_ts represents last time this task flushed to storage.
+    last_flush_time: AtomicPtr<Instant>,
+    /// flush_interval represents the tick interval of flush, setting by users.
+    flush_interval: Duration,
     /// The min resolved TS of all regions involved.
     min_resolved_ts: TimeStamp,
     /// Total size of all temporary files in byte.
@@ -531,6 +544,9 @@ impl StreamTaskInfo {
             min_resolved_ts: TimeStamp::max(),
             files: SlotMap::default(),
             flushing_files: SlotMap::default(),
+            last_flush_time: AtomicPtr::new(Box::into_raw(Box::new(Instant::now()))),
+            // TODO make this config set by config or task?
+            flush_interval: Duration::from_secs(FLUSH_STORAGE_INTERVAL),
             total_size: AtomicUsize::new(0),
             flushing: AtomicBool::new(false),
         })
@@ -564,6 +580,10 @@ impl StreamTaskInfo {
             .fetch_add(f.lock().await.on_event(kv).await?, Ordering::SeqCst);
 
         Ok(())
+    }
+
+    pub fn get_last_flush_time(&self) -> Instant {
+        unsafe { *(self.last_flush_time.load(Ordering::SeqCst) as *const Instant) }
     }
 
     pub fn total_size(&self) -> u64 {
@@ -600,6 +620,18 @@ impl StreamTaskInfo {
 
     pub fn set_flushing_status(&self, set_flushing: bool) {
         self.flushing.store(set_flushing, Ordering::SeqCst);
+    }
+
+    pub fn update_flush_time(&self) {
+        let ptr = self
+            .last_flush_time
+            .swap(Box::into_raw(Box::new(Instant::now())), Ordering::SeqCst);
+        // manual gc last instant
+        unsafe { Box::from_raw(ptr) };
+    }
+
+    pub fn should_flush(&self) -> bool {
+        self.get_last_flush_time().saturating_elapsed() >= self.flush_interval
     }
 
     pub fn is_flushing(&self) -> bool {
