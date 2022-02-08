@@ -389,7 +389,7 @@ where
         let handle = ObserveHandle::new();
         let region_id = region.get_id();
         let ob = ChangeObserver::from_cdc(region_id, handle.clone());
-        init.observe_over(&region, ob)?;
+        init.observe_over(region, ob)?;
         self.observer.subs.register_region(region_id, handle);
         self.resolvers.insert(region.id, Resolver::new(region.id));
         Ok(())
