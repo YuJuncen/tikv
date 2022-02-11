@@ -17,7 +17,7 @@ use engine_rocks::{get_env, RocksSstReader};
 use engine_traits::{
     name_to_cf, CfName, EncryptionKeyManager, FileEncryptionInfo, Iterator, KvEngine, Mutable,
     SSTMetaInfo, SeekKey, SstCompressionType, SstExt, SstReader, SstWriter, SstWriterBuilder,
-    WriteBatch, WriteBatchExt, CF_DEFAULT, CF_WRITE,
+    WriteBatch, CF_DEFAULT, CF_WRITE,
 };
 use file_system::{get_io_rate_limiter, OpenOptions};
 use kvproto::kvrpcpb::ApiVersion;
