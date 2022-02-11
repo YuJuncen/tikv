@@ -16,21 +16,20 @@ pub trait Iterator {
 
 pub struct EventIterator {
     buf: Cursor<Vec<u8>>,
-    index: usize,
-    len: usize,
-    key: Vec<u8>,
-    val: Vec<u8>,
+    key_pos: usize,
+    value_pos: usize,
+    key_len: usize,
+    value_len: usize,
 }
 
 impl EventIterator {
     pub fn new(buf: Vec<u8>) -> EventIterator {
-        let len = buf.len();
         EventIterator {
             buf: Cursor::new(buf),
-            index: 0,
-            len,
-            key: vec![],
-            val: vec![],
+            key_pos: 0,
+            key_len: 0,
+            value_pos: 0,
+            value_len: 0,
         }
     }
 }
@@ -38,31 +37,27 @@ impl EventIterator {
 impl Iterator for EventIterator {
     fn next(&mut self) -> Result<()> {
         if self.valid() {
-            let len = self.buf.get_u32_le() as usize;
-            self.index += 4;
-            self.key.resize(len, 0);
-            self.buf.read_exact(self.key.as_mut_slice())?;
-            self.index += len;
-
-            let len = self.buf.get_u32_le() as usize;
-            self.index += 4;
-            self.val.resize(len, 0);
-            self.buf.read_exact(self.val.as_mut_slice())?;
-            self.index += len;
+            self.key_len = self.buf.get_u32_le() as usize;
+            self.key_pos = self.buf.position() as _;
+            self.buf.set_position((self.key_pos + self.key_len) as u64);
+            self.value_len = self.buf.get_u32_le() as usize;
+            self.value_pos = self.buf.position() as _;
+            self.buf
+                .set_position((self.value_pos + self.value_len) as u64);
         }
         Ok(())
     }
 
     fn valid(&self) -> bool {
-        self.index < self.len
+        (self.buf.position() as usize) < self.buf.get_ref().len()
     }
 
     fn key(&self) -> &[u8] {
-        &self.key
+        &self.buf.get_ref()[self.key_pos..self.key_pos + self.key_len]
     }
 
     fn value(&self) -> &[u8] {
-        &self.val
+        &self.buf.get_ref()[self.value_pos..self.value_pos + self.value_len]
     }
 }
 
