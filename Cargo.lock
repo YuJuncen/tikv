@@ -422,6 +422,7 @@ dependencies = [
  "external_storage_export",
  "file_system",
  "futures 0.3.15",
+ "grpcio",
  "hex 0.4.2",
  "kvproto",
  "lazy_static",
@@ -437,6 +438,9 @@ dependencies = [
  "resolved_ts",
  "slog",
  "slog-global",
+ "tempdir",
+ "test_raftstore",
+ "test_util",
  "thiserror",
  "tidb_query_datatype",
  "tikv",
@@ -446,6 +450,7 @@ dependencies = [
  "tokio-stream",
  "txn_types",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

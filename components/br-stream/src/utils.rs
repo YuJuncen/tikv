@@ -140,6 +140,17 @@ impl<'a, T: ?Sized> RangeBounds<T> for RangeToInclusiveRef<'a, T> {
     }
 }
 
+struct RangeToExclusiveRef<'a, T: ?Sized>(&'a T);
+
+impl<'a, T: ?Sized> RangeBounds<T> for RangeToExclusiveRef<'a, T> {
+    fn start_bound(&self) -> Bound<&T> {
+        Bound::Unbounded
+    }
+
+    fn end_bound(&self) -> Bound<&T> {
+        Bound::Excluded(self.0)
+    }
+}
 #[derive(Default, Debug, Clone)]
 pub struct SegmentMap<K: Ord, V>(BTreeMap<K, SegmentValue<K, V>>);
 
@@ -220,10 +231,32 @@ impl<K: Ord, V> SegmentMap<K, V> {
         K: Borrow<R>,
         R: Ord + ?Sized,
     {
-        self.get_interval_by_point(range.0).is_some()
-            || self
-                .get_interval_by_point(range.1)
-                .map_or(false, |rng| <K as Borrow<R>>::borrow(rng.0) != range.1)
+        // o: The Start Key.
+        // e: The End Key.
+        // +: The Boundary of Candidate Range.
+        // |------+-s----+----e----|
+        // Firstly, we check whether the start point is in some range.
+        // if true, it must be overlapping.
+        let overlap_with_start = self.get_interval_by_point(range.0).is_some();
+        // |--s----+-----+----e----|
+        // Otherwise, the possibility of being overlapping would be there are some sub range
+        // of the queried range...
+        // |--s----+----e----+-----|
+        // ...Or the end key is contained by some Range.
+        // For faster query, we merged the two cases together.
+        let covered_by_the_range = self
+            .0
+            // When querying possibility of overlapping by end key,
+            // we don't want the range [end key, ...) become a candidate.
+            // (which is impossible to overlapping with the range)
+            .range(RangeToExclusiveRef(range.1))
+            .next_back()
+            .filter(|(start, end)| {
+                <K as Borrow<R>>::borrow(&end.range_end) > range.1
+                    || <K as Borrow<R>>::borrow(start) > range.0
+            })
+            .is_some();
+        overlap_with_start || covered_by_the_range
     }
 }
 
@@ -296,5 +329,6 @@ mod test {
         assert!(!tree.is_overlapping((&8, &42)));
         assert!(!tree.is_overlapping((&9, &10)));
         assert!(tree.is_overlapping((&2, &10)));
+        assert!(tree.is_overlapping((&0, &9999999)));
     }
 }

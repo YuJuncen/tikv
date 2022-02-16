@@ -371,6 +371,7 @@ impl RouterInner {
             Some(task_info) => {
                 let result = task_info.do_flush(store_id).await;
                 if let Err(ref e) = result {
+                    e.report("failed to flush task.");
                     warn!("backup steam do flush fail"; "err" => ?e);
                 }
 
@@ -712,11 +713,6 @@ impl StreamTaskInfo {
     /// execute the flush: copy local files to external storage.
     /// if success, return the last resolved ts of this flush.
     pub async fn do_flush(&self, store_id: u64) -> Result<Option<u64>> {
-        // do nothing if not flushing status.
-        if !self.is_flushing() {
-            return Ok(None);
-        }
-
         // generage meta data and prepare to flush to storage
         let metadata_info = self
             .move_to_flushing_files()

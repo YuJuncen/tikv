@@ -59,6 +59,62 @@ pub struct Endpoint<S: MetaStore + 'static, R, E, RT> {
     resolvers: Arc<DashMap<u64, Resolver>>,
 }
 
+impl<R, E, RT, S> Endpoint<S, R, E, RT>
+where
+    R: RegionInfoProvider + 'static + Clone,
+    E: KvEngine,
+    RT: RaftStoreRouter<E> + 'static,
+    S: MetaStore,
+{
+    pub fn with_client(
+        store_id: u64,
+        config: BackupStreamConfig,
+        scheduler: Scheduler<Task>,
+        observer: BackupStreamObserver,
+        region_infos: R,
+        raft_router: RT,
+        meta_client: MetadataClient<S>,
+    ) -> Self {
+        let pool = create_tokio_runtime(config.num_threads, "br-stream")
+            .expect("failed to create tokio runtime for backup stream worker.");
+
+        let range_router = Router::new(
+            PathBuf::from(config.streaming_path.clone()),
+            scheduler.clone(),
+            config.temp_file_size_limit_per_task.0,
+        );
+
+        // spawn a worker to watch task changes from etcd periodically.
+        let meta_client_clone = meta_client.clone();
+        let scheduler_clone = scheduler.clone();
+        // TODO build a error handle mechanism #error 2
+        pool.spawn(async {
+            if let Err(err) =
+                Endpoint::<_, R, E, RT>::starts_watch_tasks(meta_client_clone, scheduler_clone)
+                    .await
+            {
+                err.report("failed to start watch tasks");
+            }
+        });
+        pool.spawn(Endpoint::<EtcdStore, R, E, RT>::starts_flush_ticks(
+            range_router.clone(),
+        ));
+        Endpoint {
+            config,
+            meta_client: Some(meta_client),
+            range_router,
+            scheduler,
+            observer,
+            pool,
+            store_id,
+            regions: region_infos,
+            engine: PhantomData,
+            router: raft_router,
+            resolvers: Default::default(),
+        }
+    }
+}
+
 impl<R, E, RT> Endpoint<EtcdStore, R, E, RT>
 where
     R: RegionInfoProvider + 'static + Clone,

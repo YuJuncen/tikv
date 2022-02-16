@@ -10,4 +10,4 @@ pub mod observer;
 mod router;
 mod utils;
 
-pub use endpoint::Endpoint;
+pub use endpoint::{Endpoint, Task};

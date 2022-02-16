@@ -1,7 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 use std::sync::{Arc, RwLock};
 
-use crate::errors::Error;
 use crate::try_send;
 use crate::utils::SegmentSet;
 use dashmap::DashMap;
@@ -52,6 +51,7 @@ impl BackupStreamObserver {
 
     /// The internal way to register a region.
     /// It delegate the initial scanning and modify of the subs to the endpoint.
+    #[cfg(test)]
     fn register_region(&self, region: &Region) {
         if let Err(err) = self
             .scheduler
@@ -59,6 +59,7 @@ impl BackupStreamObserver {
                 region: region.clone(),
             }))
         {
+            use crate::errors::Error;
             Error::from(err).report(format_args!(
                 "failed to schedule role change for region {}",
                 region.get_id()
@@ -68,9 +69,16 @@ impl BackupStreamObserver {
 
     /// Test whether a region should be observed by the observer.
     fn should_register_region(&self, region: &Region) -> bool {
+        // If the end key is empty, it actually meant infinity.
+        // However, this way is a little hacky, maybe we'd better make a
+        // `RangesBound<R>` version for `is_overlapping`.
+        let mut end_key = region.get_end_key();
+        if end_key.is_empty() {
+            end_key = &[0xff; 32];
+        }
         self.ranges
             .rl()
-            .is_overlapping((region.get_start_key(), region.get_end_key()))
+            .is_overlapping((region.get_start_key(), end_key))
     }
 }
 
@@ -159,7 +167,12 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
 
     fn on_applied_current_term(&self, role: StateRole, region: &Region) {
         if role == StateRole::Leader && self.should_register_region(region) {
-            self.register_region(region);
+            try_send!(
+                self.scheduler,
+                Task::ModifyObserve(ObserveOp::Start {
+                    region: region.clone(),
+                })
+            );
         }
     }
 }
