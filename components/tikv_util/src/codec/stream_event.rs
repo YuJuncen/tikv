@@ -1,5 +1,6 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 use crate::{codec::Result, Either};
+use byteorder::ByteOrder;
 use bytes::{Buf, Bytes};
 use std::io::prelude::*;
 use std::io::Cursor;
@@ -15,9 +16,10 @@ pub trait Iterator {
 }
 
 pub struct EventIterator {
-    buf: Cursor<Vec<u8>>,
-    key_pos: usize,
-    value_pos: usize,
+    buf: Vec<u8>,
+    offset: usize,
+    key_offset: usize,
+    value_offset: usize,
     key_len: usize,
     value_len: usize,
 }
@@ -25,39 +27,46 @@ pub struct EventIterator {
 impl EventIterator {
     pub fn new(buf: Vec<u8>) -> EventIterator {
         EventIterator {
-            buf: Cursor::new(buf),
-            key_pos: 0,
+            buf,
+            offset: 0,
+            key_offset: 0,
             key_len: 0,
-            value_pos: 0,
+            value_offset: 0,
             value_len: 0,
         }
+    }
+
+    fn get_size(&mut self) -> u32 {
+        let result = byteorder::LE::read_u32(&self.buf[self.offset..]);
+        self.offset += 4;
+        result
     }
 }
 
 impl Iterator for EventIterator {
     fn next(&mut self) -> Result<()> {
         if self.valid() {
-            self.key_len = self.buf.get_u32_le() as usize;
-            self.key_pos = self.buf.position() as _;
-            self.buf.set_position((self.key_pos + self.key_len) as u64);
-            self.value_len = self.buf.get_u32_le() as usize;
-            self.value_pos = self.buf.position() as _;
-            self.buf
-                .set_position((self.value_pos + self.value_len) as u64);
+            self.key_len = self.get_size() as usize;
+            self.key_offset = self.offset;
+            self.offset += self.key_len;
+
+            self.value_len = self.get_size() as usize;
+            self.value_offset = self.offset;
+            self.offset += self.value_len;
         }
         Ok(())
     }
 
     fn valid(&self) -> bool {
-        (self.buf.position() as usize) < self.buf.get_ref().len()
+        self.offset < self.buf.len()
     }
 
     fn key(&self) -> &[u8] {
-        &self.buf.get_ref()[self.key_pos..self.key_pos + self.key_len]
+        &self.buf[self.key_offset..self.key_offset + self.key_len]
     }
 
     fn value(&self) -> &[u8] {
-        &self.buf.get_ref()[self.value_pos..self.value_pos + self.value_len]
+        &self.buf[self.value_offset..self.value_offset + self.value_len]
     }
 }
 
