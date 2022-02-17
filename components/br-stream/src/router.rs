@@ -364,11 +364,20 @@ impl RouterInner {
     }
 
     /// flush the specified task, once once success, return the min resolved ts of this flush.
-    /// returns `None` if failed.
-    pub async fn do_flush(&self, task_name: &str, store_id: u64) -> Option<u64> {
+    /// returns `None` if failed or no necessary for flushing.
+    /// when `force` is true, would try to transform the internal status of the task for making it be suitable for flushing.
+    pub async fn do_flush(&self, task_name: &str, store_id: u64, force: bool) -> Option<u64> {
         debug!("backup stream do flush"; "task" => task_name);
         match self.tasks.lock().await.get(task_name) {
             Some(task_info) => {
+                if force {
+                    if task_info.set_flushing_status_cas(false, true).is_err() {
+                        return None;
+                    }
+                }
+                if !task_info.is_flushing() {
+                    return None;
+                }
                 let result = task_info.do_flush(store_id).await;
                 if let Err(ref e) = result {
                     e.report("failed to flush task.");

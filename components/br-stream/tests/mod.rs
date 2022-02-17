@@ -14,6 +14,7 @@ use br_stream::{
     observer::BackupStreamObserver,
     Endpoint, Task,
 };
+use futures::executor::block_on;
 use grpcio::ChannelBuilder;
 use kvproto::{brpb::Local, tikvpb::*};
 use kvproto::{brpb::StorageBackend, kvrpcpb::*};
@@ -51,9 +52,18 @@ fn make_table_key(table_id: i64, key: &[u8]) -> Vec<u8> {
 }
 
 fn make_record_key(table_id: i64, handle: u64) -> Vec<u8> {
-    let mut record = b"_r".to_vec();
+    let mut record = make_table_key(table_id, b"_r");
     record.encode_u64(handle ^ 0x8000_0000_0000_0000).unwrap();
-    make_table_key(table_id, &record)
+    record
+}
+
+fn make_split_key_at_record(table_id: i64, handle: u64) -> Vec<u8> {
+    let mut record = make_record_key(table_id, handle);
+    // push an extra byte for don't put the key in the boundary of the region.
+    // (Or the mock cluster may find wrong region for putting)
+    record.push(255u8);
+    let key = Key::from_raw(&record);
+    key.into_encoded()
 }
 
 fn make_encoded_record_key(table_id: i64, handle: u64, ts: u64) -> Vec<u8> {
@@ -71,6 +81,7 @@ pub struct Suite {
 
     temp_files: TempDir,
     flushed_files: TempDir,
+    case_name: String,
 }
 
 impl Suite {
@@ -127,7 +138,7 @@ impl Suite {
         worker.start(endpoint);
     }
 
-    pub fn new(n: usize) -> Self {
+    pub fn new(case: &str, n: usize) -> Self {
         let cluster = new_server_cluster(42, n);
         let mut suite = Self {
             endpoints: Default::default(),
@@ -139,6 +150,7 @@ impl Suite {
 
             temp_files: TempDir::new("temp").unwrap(),
             flushed_files: TempDir::new("flush").unwrap(),
+            case_name: case.to_owned(),
         };
         for id in 1..=(n as u64) {
             let worker = suite.start_br_stream_on(id);
@@ -155,12 +167,30 @@ impl Suite {
         MetadataClient::new(self.meta_store.clone(), 0)
     }
 
+    fn must_split(&mut self, key: &[u8]) {
+        let region = self.cluster.get_region(key);
+        self.cluster.must_split(&region, key);
+    }
+
+    fn must_register_task(&self, for_table: i64, name: &str) {
+        let cli = self.get_meta_cli();
+        block_on(cli.insert_task_with_range(
+            &self.simple_task(name),
+            &[(
+                &make_table_key(for_table, b""),
+                &make_table_key(for_table + 1, b""),
+            )],
+        ))
+        .unwrap();
+    }
+
     fn write_records(&mut self, from: usize, n: usize, for_table: i64) {
         for ts in (from..(from + n)).map(|x| x * 2) {
             let ts = ts as u64;
             let key = make_record_key(for_table, ts);
             let muts = vec![mutation(key.clone(), b"hello, world".to_vec())];
-            let region = self.cluster.get_region_id(&key);
+            let enc_key = Key::from_raw(&key).into_encoded();
+            let region = self.cluster.get_region_id(&enc_key);
             self.must_kv_prewrite(region, muts, key.clone(), TimeStamp::new(ts));
             self.must_kv_commit(
                 region,
@@ -171,12 +201,23 @@ impl Suite {
         }
     }
 
+    fn force_flush_files(&self, task: &str) {
+        for worker in self.endpoints.values() {
+            worker
+                .scheduler()
+                .schedule(Task::ForceFlush(task.to_owned()))
+                .unwrap();
+        }
+    }
+
     fn check_for_write_records(&self, n: u64, for_table: i64, path: &Path) {
         let mut remain_keys: HashSet<Vec<u8>> = HashSet::from_iter(
             (0..n)
                 .map(|x| x * 2)
                 .map(|n| make_encoded_record_key(for_table, n, n + 1)),
         );
+        let mut extra_key = 0;
+        let mut extra_len = 0;
         for entry in WalkDir::new(path) {
             let entry = entry.unwrap();
             println!("checking: {:?}", entry);
@@ -189,15 +230,14 @@ impl Suite {
                 let content = std::fs::read(entry.path()).unwrap();
                 let mut iter = EventIterator::new(content);
                 loop {
-                    iter.next().unwrap();
                     if !iter.valid() {
                         break;
                     }
-                    assert!(
-                        remain_keys.remove(iter.key()),
-                        "key {:?} not found, maybe recorded twice or lost",
-                        iter.key(),
-                    );
+                    iter.next().unwrap();
+                    if !remain_keys.remove(iter.key()) {
+                        extra_key += 1;
+                        extra_len += iter.key().len() + iter.value().len();
+                    }
 
                     let value = iter.value();
                     let wf = WriteRef::parse(value).unwrap();
@@ -206,10 +246,23 @@ impl Suite {
             }
         }
 
+        if extra_key != 0 {
+            println!(
+                "check_for_write_records of “{}”: extra {} keys ({:.02}% of recorded keys), extra {} bytes.",
+                self.case_name,
+                extra_key,
+                (extra_key as f64) / (n as f64) * 100.0,
+                extra_len
+            )
+        }
         if !remain_keys.is_empty() {
             panic!(
                 "not all keys are recorded: it remains {:?} (total = {})",
-                remain_keys.iter().take(3).collect::<Vec<_>>(),
+                remain_keys
+                    .iter()
+                    .take(3)
+                    .map(|v| hex::encode(v))
+                    .collect::<Vec<_>>(),
                 remain_keys.len()
             );
         }
@@ -298,36 +351,51 @@ impl Suite {
 mod test {
     use std::time::Duration;
 
-    use br_stream::Task;
-
-    use crate::make_table_key;
+    use crate::make_split_key_at_record;
 
     #[test]
     fn basic() {
-        let mut suite = super::Suite::new(4);
-        let meta_cli = suite.get_meta_cli();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut suite = super::Suite::new("basic", 4);
 
         // write data before the task starting, for testing incremental scanning.
         suite.write_records(0, 128, 1);
-        rt.block_on(meta_cli.insert_task_with_range(
-            &suite.simple_task("test"),
-            &[(&make_table_key(1, b""), &make_table_key(2, b""))],
-        ))
-        .unwrap();
+        suite.must_register_task(1, "test_basic");
         suite.write_records(128, 128, 1);
+        suite.check_for_write_records(256, 1, suite.temp_files.path());
 
-        suite.check_for_write_records(255, 1, suite.temp_files.path());
-
-        for worker in suite.endpoints.values() {
-            worker
-                .scheduler()
-                .schedule(Task::Flush("test".to_owned()))
-                .unwrap();
-        }
+        suite.force_flush_files("test_basic");
         std::thread::sleep(Duration::from_secs(4));
-        suite.check_for_write_records(255, 1, suite.flushed_files.path());
+        suite.check_for_write_records(256, 1, suite.flushed_files.path());
+        suite.cluster.shutdown();
+    }
 
+    #[test]
+    fn with_split() {
+        let mut suite = super::Suite::new("with_split", 4);
+        suite.write_records(0, 128, 1);
+        suite.must_split(&make_split_key_at_record(1, 42));
+        suite.must_register_task(1, "test_with_split");
+        suite.write_records(128, 128, 1);
+        suite.check_for_write_records(256, 1, suite.temp_files.path());
+        suite.force_flush_files("test_with_split");
+        std::thread::sleep(Duration::from_secs(4));
+        suite.check_for_write_records(256, 1, suite.flushed_files.path());
+        suite.cluster.shutdown();
+    }
+
+    #[test]
+    fn leader_down() {
+        let mut suite = super::Suite::new("leader_down", 4);
+        suite.must_register_task(1, "test_leader_down");
+
+        suite.write_records(0, 128, 1);
+        let leader = suite.cluster.leader_of_region(1).unwrap().get_store_id();
+        suite.cluster.stop_node(leader);
+        suite.write_records(128, 128, 1);
+        suite.check_for_write_records(256, 1, suite.temp_files.path());
+        suite.force_flush_files("test_leader_down");
+        std::thread::sleep(Duration::from_secs(4));
+        suite.check_for_write_records(256, 1, suite.flushed_files.path());
         suite.cluster.shutdown();
     }
 }

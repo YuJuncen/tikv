@@ -59,3 +59,4 @@ test_raftstore = { path = "../test_raftstore", default-features = false }
 test_util = { path = "../test_util", default-features = false }
 engine_panic = {path = "../engine_panic"}
 walkdir = "2"
+hex = "0.4"

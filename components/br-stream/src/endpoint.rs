@@ -363,7 +363,7 @@ where
                                 );
                                 match range_init_result {
                                     Ok(stat) => {
-                                        info!("success to do initial scanning"; "stat" => ?stat, 
+                                        info!("success to do initial scanning"; "stat" => ?stat,
                                             "start_key" => utils::redact(&start_key),
                                             "end_key" => utils::redact(&end_key),
                                             "take" => ?start.saturating_elapsed(),)
@@ -391,7 +391,7 @@ where
         };
     }
 
-    pub fn on_flush(&self, task: String, store_id: u64) {
+    pub fn on_flush(&self, task: String, store_id: u64, force: bool) {
         let router = self.range_router.clone();
         let cli = self
             .meta_client
@@ -399,7 +399,7 @@ where
             .expect("on_flush: executed from an endpoint without cli")
             .clone();
         self.pool.spawn(async move {
-            if let Some(rts) = router.do_flush(&task, store_id).await {
+            if let Some(rts) = router.do_flush(&task, store_id, force).await {
                 if let Err(err) = cli.step_task(&task, rts).await {
                     err.report(format!("on flushing task {}", task));
                     // we can advance the progress at next time.
@@ -493,6 +493,8 @@ pub enum Task {
     Flush(String),
     /// Change the observe status of some region.
     ModifyObserve(ObserveOp),
+    /// Convert status of some task into `flushing` and do flush then.
+    ForceFlush(String),
 }
 
 #[derive(Debug)]
@@ -521,6 +523,7 @@ impl fmt::Debug for Task {
             Self::ChangeConfig(arg0) => f.debug_tuple("ChangeConfig").field(arg0).finish(),
             Self::Flush(arg0) => f.debug_tuple("Flush").field(arg0).finish(),
             Self::ModifyObserve(op) => f.debug_tuple("ModifyObserve").field(op).finish(),
+            Self::ForceFlush(arg0) => f.debug_tuple("ForceFlush").field(arg0).finish(),
         }
     }
 }
@@ -545,8 +548,9 @@ where
         match task {
             Task::WatchTask(task) => self.on_register(task),
             Task::BatchEvent(events) => self.do_backup(events),
-            Task::Flush(task) => self.on_flush(task, self.store_id),
+            Task::Flush(task) => self.on_flush(task, self.store_id, false),
             Task::ModifyObserve(op) => self.on_modify_observe(op),
+            Task::ForceFlush(task) => self.on_flush(task, self.store_id, true),
             _ => (),
         }
     }
