@@ -77,7 +77,7 @@ use tikv::{
         config::Config as ServerConfig,
         config::ServerConfigManager,
         create_raft_storage,
-        gc_worker::{AutoGcConfig, GcWorker},
+        gc_worker::{AutoGcConfig, GcWorker, WithUserSafePoint},
         lock_manager::LockManager,
         resolve,
         service::{DebugService, DiagnosticsService},
@@ -800,6 +800,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
             )),
         );
 
+        let stream_backup_safe_point = Arc::new(AtomicU64::new(u64::MAX));
         // Start backup stream
         if self.config.backup_stream.enable_streaming {
             // Create backup stream.
@@ -821,6 +822,7 @@ impl<ER: RaftEngine> TiKVServer<ER> {
                 self.config.backup_stream.clone(),
                 backup_stream_scheduler,
                 backup_stream_ob,
+                stream_backup_safe_point.clone(),
                 self.region_info_accessor.clone(),
                 self.router.clone(),
             );
@@ -905,11 +907,10 @@ impl<ER: RaftEngine> TiKVServer<ER> {
 
         // Start auto gc. Must after `Node::start` because `node_id` is initialized there.
         assert!(node.id() > 0); // Node id should never be 0.
-        let auto_gc_config = AutoGcConfig::new(
-            self.pd_client.clone(),
-            self.region_info_accessor.clone(),
-            node.id(),
-        );
+        let provider =
+            WithUserSafePoint::new(self.pd_client.clone(), stream_backup_safe_point.clone());
+        let auto_gc_config =
+            AutoGcConfig::new(provider, self.region_info_accessor.clone(), node.id());
         if let Err(e) = gc_worker.start_auto_gc(auto_gc_config, safe_point) {
             fatal!("failed to start auto_gc on storage, error: {}", e);
         }

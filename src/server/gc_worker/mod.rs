@@ -12,7 +12,9 @@ pub use compaction_filter::WriteCompactionFilterFactory;
 pub use config::{GcConfig, GcWorkerConfigManager, DEFAULT_GC_BATCH_KEYS};
 use engine_traits::MvccProperties;
 pub use gc_manager::AutoGcConfig;
-pub use gc_worker::{sync_gc, GcSafePointProvider, GcTask, GcWorker, GC_MAX_EXECUTING_TASKS};
+pub use gc_worker::{
+    sync_gc, GcSafePointProvider, GcTask, GcWorker, WithUserSafePoint, GC_MAX_EXECUTING_TASKS,
+};
 use txn_types::TimeStamp;
 
 #[cfg(any(test, feature = "failpoints"))]

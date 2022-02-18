@@ -69,6 +69,36 @@ impl<T: PdClient + 'static> GcSafePointProvider for Arc<T> {
     }
 }
 
+pub struct WithUserSafePoint<P> {
+    inner: P,
+    user_safe_point: Arc<AtomicU64>,
+    last_safe_point: std::cell::Cell<u64>,
+}
+
+impl<P: GcSafePointProvider> GcSafePointProvider for WithUserSafePoint<P> {
+    fn get_safe_point(&self) -> Result<TimeStamp> {
+        let user_safe_point = self.user_safe_point.load(Ordering::SeqCst);
+        // The user safe point must works, eliding fetch safe point from inner provider.
+        if self.last_safe_point.get() > user_safe_point {
+            return Ok(TimeStamp::new(user_safe_point));
+        }
+        // Try update from the inner provider; and use min(user_safe_point, last_safe_point)
+        let new_safe_point = self.inner.get_safe_point()?.into_inner();
+        self.last_safe_point.set(new_safe_point);
+        Ok(TimeStamp::new(Ord::min(user_safe_point, new_safe_point)))
+    }
+}
+
+impl<P> WithUserSafePoint<P> {
+    pub fn new(inner: P, user_safe_point: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            user_safe_point,
+            last_safe_point: std::cell::Cell::new(0),
+        }
+    }
+}
+
 pub enum GcTask<E>
 where
     E: KvEngine,
@@ -1417,6 +1447,46 @@ mod tests {
         fn get_safe_point(&self) -> Result<TimeStamp> {
             Ok(self.0.into())
         }
+    }
+
+    #[test]
+    fn test_gc_worker_with_user_safe_point() {
+        struct EditableMockSafePointProvider(Arc<AtomicU64>);
+        impl GcSafePointProvider for EditableMockSafePointProvider {
+            fn get_safe_point(&self) -> Result<TimeStamp> {
+                Ok(self.0.load(Ordering::SeqCst).into())
+            }
+        }
+
+        let user_safe_point = Arc::new(AtomicU64::new(0));
+        let set_user_safe_point = |n: u64| {
+            user_safe_point.store(n, Ordering::SeqCst);
+        };
+        let pd_safe_point = Arc::new(AtomicU64::new(0));
+        let set_safe_point = |n: u64| {
+            pd_safe_point.store(n, Ordering::SeqCst);
+        };
+        let provider = EditableMockSafePointProvider(pd_safe_point.clone());
+        let with_user_safe_point = WithUserSafePoint::new(provider, user_safe_point.clone());
+        let assert_safe_point_is = |n: u64| {
+            assert_eq!(
+                with_user_safe_point.get_safe_point().unwrap().into_inner(),
+                n
+            );
+        };
+
+        assert_safe_point_is(0);
+        set_safe_point(2);
+        assert_safe_point_is(0);
+
+        set_user_safe_point(3);
+        assert_safe_point_is(2);
+
+        set_safe_point(4);
+        assert_safe_point_is(3);
+
+        set_user_safe_point(29);
+        assert_safe_point_is(4);
     }
 
     #[test]

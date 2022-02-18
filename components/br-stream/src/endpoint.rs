@@ -4,6 +4,7 @@ use std::convert::AsRef;
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,6 +58,7 @@ pub struct Endpoint<S: MetaStore + 'static, R, E, RT> {
     engine: PhantomData<E>,
     router: RT,
     resolvers: Arc<DashMap<u64, Resolver>>,
+    safe_point: Arc<AtomicU64>,
 }
 
 impl<R, E, RT> Endpoint<EtcdStore, R, E, RT>
@@ -71,11 +73,13 @@ where
         config: BackupStreamConfig,
         scheduler: Scheduler<Task>,
         observer: BackupStreamObserver,
+        safe_point: Arc<AtomicU64>,
         accessor: R,
         router: RT,
     ) -> Endpoint<EtcdStore, R, E, RT> {
         let pool = create_tokio_runtime(config.num_threads, "br-stream")
             .expect("failed to create tokio runtime for backup stream worker.");
+        safe_point.store(0, Ordering::SeqCst);
 
         // TODO consider TLS?
         let meta_client = match pool.block_on(etcd_client::Client::connect(&endpoints, None)) {
@@ -125,6 +129,7 @@ where
             regions: accessor,
             engine: PhantomData,
             router,
+            safe_point,
             resolvers: Default::default(),
         }
     }
@@ -361,8 +366,10 @@ where
             .as_ref()
             .expect("on_flush: executed from an endpoint without cli")
             .clone();
+        let safe_point = self.safe_point.clone();
         self.pool.spawn(async move {
             if let Some(rts) = router.do_flush(&task, store_id).await {
+                safe_point.store(rts, Ordering::SeqCst);
                 if let Err(err) = cli.step_task(&task, rts).await {
                     err.report(format!("on flushing task {}", task));
                     // we can advance the progress at next time.
