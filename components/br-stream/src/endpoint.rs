@@ -14,6 +14,7 @@ use kvproto::metapb::Region;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::fsm::ChangeObserver;
 use resolved_ts::Resolver;
+use tikv::storage::Snapshot;
 use tikv_util::time::Instant;
 
 use crossbeam_channel::tick;
@@ -386,6 +387,24 @@ where
         Ok(())
     }
 
+    fn observe_over_with_initial_data(&self, region: &Region, from_ts: TimeStamp) -> Result<()> {
+        let init = self.make_initial_loader();
+        let handle = ObserveHandle::new();
+        let region_id = region.get_id();
+        let ob = ChangeObserver::from_cdc(region_id, handle.clone());
+        let snap = init.observe_over(region, ob)?;
+        self.observer.subs.register_region(region_id, handle);
+        self.resolvers.insert(region.id, Resolver::new(region.id));
+
+        tokio::task::spawn_blocking(move || match init.do_initial_scan(region, from_ts, snap) {
+            Ok(stat) => {
+                info!("initial scanning of leader transforming finished!"; "statistics" => stat, "region" => region.get_id());
+            }
+            Err(err) => err.report(format!("during initial scanning of region {:?}", region)),
+        });
+        Ok(())
+    }
+
     /// Modify observe over some region.
     /// This would register the region to the RaftStore.
     ///
@@ -394,10 +413,15 @@ where
     /// >      there is a risk of losing data.
     pub fn on_modify_observe(&self, op: ObserveOp) {
         match op {
-            ObserveOp::Start { region } => {
-                if let Err(e) = self.observe_over(&region) {
-                    e.report(format!("register region {} to raftstore", region.get_id()));
-                }
+            ObserveOp::Start {
+                region,
+                needs_initial_scanning,
+            } => {
+                let result = if needs_initial_scanning {
+                    self.observe_over_with_initial_data(&region, TimeStamp::zero())
+                } else {
+                    self.observe_over(&region)
+                };
             }
             ObserveOp::Stop { region } => {
                 self.observer.subs.deregister_region(region.id);
@@ -467,7 +491,7 @@ pub enum ObserveOp {
     Start {
         region: Region,
         // Note: Maybe add the request for initial scanning too.
-        // needs_initial_scanning: bool
+        needs_initial_scanning: bool,
     },
     Stop {
         region: Region,
