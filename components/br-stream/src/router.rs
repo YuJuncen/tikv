@@ -571,7 +571,7 @@ impl TempFileKey {
 pub struct StreamTaskInfo {
     task: StreamTask,
     /// support external storage. eg local/s3.
-    storage: Box<dyn ExternalStorage>,
+    storage: Arc<dyn ExternalStorage>,
     /// The parent directory of temporary files.
     temp_dir: PathBuf,
     /// The temporary file index. Both meta (m prefixed keys) and data (t prefixed keys).
@@ -610,7 +610,10 @@ impl StreamTaskInfo {
     /// Create a new temporary file set at the `temp_dir`.
     pub async fn new(temp_dir: PathBuf, task: StreamTask) -> Result<Self> {
         tokio::fs::create_dir_all(&temp_dir).await?;
-        let storage = create_storage(task.info.get_storage(), BackendConfig::default())?;
+        let storage = Arc::from(create_storage(
+            task.info.get_storage(),
+            BackendConfig::default(),
+        )?);
         Ok(Self {
             task,
             storage,
@@ -742,39 +745,46 @@ impl StreamTaskInfo {
         }
     }
 
-    pub async fn flush_log(&self) -> Result<()> {
-        // if failed to write storage, we should retry write flushing_files.
-        for (_, v) in self.flushing_files.write().await.iter() {
-            let data_file = v.lock().await;
-            // to do: limiter to storage
-            let limiter = Limiter::builder(std::f64::INFINITY).build();
-            let reader = File::open(data_file.local_path.clone()).await?;
-            let stat = reader.metadata().await?;
-            let reader = UnpinReader(Box::new(limiter.limit(reader.compat())));
-            let filepath = &data_file.storage_path;
+    async fn flush_log_file_to(
+        storage: Arc<dyn ExternalStorage>,
+        file: &Mutex<DataFile>,
+    ) -> Result<()> {
+        let data_file = file.lock().await;
+        // to do: limiter to storage
+        let limiter = Limiter::builder(std::f64::INFINITY).build();
+        let reader = File::open(data_file.local_path.clone()).await?;
+        let stat = reader.metadata().await?;
+        let reader = UnpinReader(Box::new(limiter.limit(reader.compat())));
+        let filepath = &data_file.storage_path;
 
-            let ret = self
-                .storage
-                .write(filepath, reader, stat.len().max(4096))
-                .await;
-            match ret {
-                Ok(_) => {
-                    debug!(
-                        "backup stream flush success";
-                        "tmp file" => ?data_file.local_path,
-                        "storage file" => ?filepath,
-                    );
-                }
-                Err(e) => {
-                    warn!("backup stream flush failed";
-                        "file" => ?data_file.local_path,
-                        "err" => ?e,
-                    );
-                    return Err(Error::Io(e));
-                }
+        let ret = storage.write(filepath, reader, stat.len().max(4096)).await;
+        match ret {
+            Ok(_) => {
+                debug!(
+                    "backup stream flush success";
+                    "tmp file" => ?data_file.local_path,
+                    "storage file" => ?filepath,
+                );
+            }
+            Err(e) => {
+                warn!("backup stream flush failed";
+                    "file" => ?data_file.local_path,
+                    "err" => ?e,
+                );
+                return Err(Error::Io(e));
             }
         }
+        Ok(())
+    }
 
+    pub async fn flush_log(&self) -> Result<()> {
+        // if failed to write storage, we should retry write flushing_files.
+        let storage = self.storage.clone();
+        let files = self.flushing_files.write().await;
+        let futs = files
+            .values()
+            .map(|v| Self::flush_log_file_to(storage.clone(), v));
+        futures::future::try_join_all(futs).await?;
         Ok(())
     }
 
