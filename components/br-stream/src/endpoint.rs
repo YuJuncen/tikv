@@ -380,9 +380,13 @@ where
         let pd_cli = self.pd_client.clone();
         let resolvers = self.resolvers.clone();
         self.pool.spawn(async move {
+            let start = Instant::now_coarse();
             // NOTE: Maybe push down the resolve step to the router?
             //       Or if there are too many duplicated `Flush` command, we may do some useless works.
             let new_rts = Self::try_resolve(pd_cli.clone(), resolvers).await;
+            metrics::FLUSH_DURATION
+                .with_label_values(&["resolve_by_now"])
+                .observe(start.saturating_elapsed_secs());
             if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
                 info!("flushing and refreshing checkpoint ts."; "checkpoint_ts" => %rts, "task" => %task);
                 if rts == 0 {

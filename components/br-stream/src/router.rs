@@ -18,7 +18,7 @@ use crate::{
     errors::Error,
     metadata::StreamTask,
     metrics::SKIP_KV_COUNTER,
-    utils::{self, SegmentMap, SlotMap},
+    utils::{self, SegmentMap, SlotMap, StopWatch},
 };
 
 use super::errors::Result;
@@ -49,9 +49,10 @@ use tikv_util::{
     worker::Scheduler,
     Either, HandyRwLock,
 };
+use tokio::fs::{remove_file, File};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Mutex;
-use tokio::{fs::remove_file, fs::File};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 use txn_types::{Key, Lock, TimeStamp};
 
 pub const FLUSH_STORAGE_INTERVAL: u64 = 300;
@@ -747,11 +748,15 @@ impl StreamTaskInfo {
             let data_file = v.lock().await;
             // to do: limiter to storage
             let limiter = Limiter::builder(std::f64::INFINITY).build();
-            let reader = std::fs::File::open(data_file.local_path.clone()).unwrap();
-            let reader = UnpinReader(Box::new(limiter.limit(AllowStdIo::new(reader))));
+            let reader = File::open(data_file.local_path.clone()).await?;
+            let stat = reader.metadata().await?;
+            let reader = UnpinReader(Box::new(limiter.limit(reader.compat())));
             let filepath = &data_file.storage_path;
 
-            let ret = self.storage.write(filepath, reader, 1024).await;
+            let ret = self
+                .storage
+                .write(filepath, reader, stat.len().max(4096))
+                .await;
             match ret {
                 Ok(_) => {
                     debug!(
@@ -801,6 +806,7 @@ impl StreamTaskInfo {
         if !self.is_flushing() {
             return Ok(None);
         }
+        let mut sw = StopWatch::new();
 
         // generate meta data and prepare to flush to storage
         let mut metadata_info = self
@@ -812,6 +818,9 @@ impl StreamTaskInfo {
             .min_resolved_ts
             .max(Some(resolved_ts_provided.into_inner()));
         let rts = metadata_info.min_resolved_ts;
+        crate::metrics::FLUSH_DURATION
+            .with_label_values(&["generate_metadata"])
+            .observe(sw.lap().as_secs_f64());
 
         // There is no file to flush, don't write the meta file.
         if metadata_info.files.is_empty() {
@@ -823,9 +832,15 @@ impl StreamTaskInfo {
 
         // flush meta file to storage.
         self.flush_meta(metadata_info).await?;
+        crate::metrics::FLUSH_DURATION
+            .with_label_values(&["save_files"])
+            .observe(sw.lap().as_secs_f64());
 
         // clear flushing files
         self.clear_flushing_files().await;
+        crate::metrics::FLUSH_DURATION
+            .with_label_values(&["clear_temp_files"])
+            .observe(sw.lap().as_secs_f64());
         Ok(rts)
     }
 }
