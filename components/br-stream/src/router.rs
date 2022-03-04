@@ -305,6 +305,12 @@ impl RouterInner {
         }
     }
 
+    pub fn find_task_by_range(&self, start_key: &[u8], end_key: &[u8]) -> Option<String> {
+        let r = self.ranges.rl();
+        r.find_overlapping((start_key, end_key))
+            .map(|x| x.2.clone())
+    }
+
     /// Register some ranges associated to some task.
     /// Because the observer interface yields encoded data key, the key should be ENCODED DATA KEY too.    
     /// (i.e. encoded by `Key::from_raw(key).into_encoded()`, [`utils::wrap_key`] could be a shortcut.).    

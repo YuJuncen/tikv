@@ -12,7 +12,7 @@ use kvproto::brpb::StreamBackupTaskInfo;
 
 use tikv_util::{defer, time::Instant, warn};
 use tokio_stream::StreamExt;
-use txn_types::TimeStamp;
+
 
 use crate::errors::{Error, Result};
 
@@ -285,7 +285,7 @@ impl<Store: MetaStore> MetadataClient<Store> {
             .iter()
             .filter_map(|kv| {
                 Self::parse_ts_from_bytes(kv.1.as_slice())
-                    .map_err(|err| warn!("failed to parse next_backup_ts."; "key" => ?kv.0, "err" => %err))
+                    .map_err(|err| warn!("br-stream: failed to parse next_backup_ts."; "key" => ?kv.0, "err" => %err))
                     .ok()
             })
             .min()

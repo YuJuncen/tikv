@@ -10,11 +10,12 @@ use std::time::Duration;
 use dashmap::DashMap;
 use engine_traits::KvEngine;
 
+use futures::executor::block_on;
 use kvproto::metapb::Region;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::fsm::ChangeObserver;
 use resolved_ts::Resolver;
-use tikv::storage::Snapshot;
+
 use tikv_util::time::Instant;
 
 use crossbeam_channel::tick;
@@ -387,30 +388,52 @@ where
         Ok(())
     }
 
-    fn observe_over_with_initial_data(&self, region: &Region, from_ts: TimeStamp) -> Result<()> {
+    fn observe_over_with_initial_data_from_checkpoint(
+        &self,
+        region: &Region,
+        task: String,
+    ) -> Result<()> {
         let init = self.make_initial_loader();
         let handle = ObserveHandle::new();
         let region_id = region.get_id();
         let ob = ChangeObserver::from_cdc(region_id, handle.clone());
         let snap = init.observe_over(region, ob)?;
+        let meta_cli = self.meta_client.as_ref().unwrap().clone();
         self.observer.subs.register_region(region_id, handle);
         self.resolvers.insert(region.id, Resolver::new(region.id));
 
-        tokio::task::spawn_blocking(move || match init.do_initial_scan(region, from_ts, snap) {
-            Ok(stat) => {
-                info!("initial scanning of leader transforming finished!"; "statistics" => stat, "region" => region.get_id());
+        let region = region.clone();
+        // Note: Even we did the initial scanning, if the next_backup_ts was updated by periodic flushing,
+        //       before the initial scanning done, there is still possibility of losing data:
+        //       if the server crashes immediately, and data of this scanning hasn't been sent to sink,
+        //       those data would be permanently lost.
+        // Maybe we need block the next_backup_ts from advancing before all initial scanning done(Or just for the region, via disabling the resolver)?
+        tokio::task::spawn_blocking(move || {
+            let from_ts = match block_on(meta_cli.global_progress_of_task(&task)) {
+                Ok(ts) => ts,
+                Err(err) => {
+                    err.report("failed to get global progress of task");
+                    return;
+                }
+            };
+
+            match init.do_initial_scan(&region, TimeStamp::new(from_ts), snap) {
+                Ok(stat) => {
+                    info!("initial scanning of leader transforming finished!"; "statistics" => ?stat, "region" => %region.get_id());
+                }
+                Err(err) => err.report(format!("during initial scanning of region {:?}", region)),
             }
-            Err(err) => err.report(format!("during initial scanning of region {:?}", region)),
         });
         Ok(())
     }
 
+    fn find_task_by_region(&self, r: &Region) -> Option<String> {
+        self.range_router
+            .find_task_by_range(&r.start_key, &r.end_key)
+    }
+
     /// Modify observe over some region.
     /// This would register the region to the RaftStore.
-    ///
-    /// > Note: If using this to start observe, this won't trigger a incremental scanning.
-    /// >      When the follower progress faster than leader and then be elected,
-    /// >      there is a risk of losing data.
     pub fn on_modify_observe(&self, op: ObserveOp) {
         match op {
             ObserveOp::Start {
@@ -418,10 +441,22 @@ where
                 needs_initial_scanning,
             } => {
                 let result = if needs_initial_scanning {
-                    self.observe_over_with_initial_data(&region, TimeStamp::zero())
+                    let for_task = self.find_task_by_region(&region).unwrap_or_else(|| {
+                        panic!(
+                            "BUG: the region {:?} is register to no task but being observed",
+                            region
+                        )
+                    });
+                    self.observe_over_with_initial_data_from_checkpoint(&region, for_task)
                 } else {
                     self.observe_over(&region)
                 };
+                if let Err(err) = result {
+                    err.report(format!(
+                        "during doing initial scanning for region {:?}",
+                        region
+                    ));
+                }
             }
             ObserveOp::Stop { region } => {
                 self.observer.subs.deregister_region(region.id);
@@ -490,7 +525,9 @@ pub enum TaskOp {
 pub enum ObserveOp {
     Start {
         region: Region,
-        // Note: Maybe add the request for initial scanning too.
+        // if `true`, would scan and sink change from the global checkpoint ts.
+        // Note: maybe we'd better make it Option<TimeStamp> to make it more generic,
+        //       but that needs the `observer` know where the checkpoint is, which is a little dirty...
         needs_initial_scanning: bool,
     },
     Stop {

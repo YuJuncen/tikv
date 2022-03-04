@@ -57,6 +57,7 @@ impl BackupStreamObserver {
             .scheduler
             .schedule(Task::ModifyObserve(ObserveOp::Start {
                 region: region.clone(),
+                needs_initial_scanning: true,
             }))
         {
             Error::from(err).report(format_args!(
