@@ -57,6 +57,7 @@ lazy_static! {
         "tikv_stream_flush_duration_sec",
         "The time cost of flushing a task.",
         &["stage"],
+        exponential_buckets(0.001, 2.0, 16).unwrap()
     )
     .unwrap();
 }

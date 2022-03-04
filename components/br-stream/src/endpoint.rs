@@ -463,7 +463,7 @@ where
 
             match init.do_initial_scan(&region, TimeStamp::new(from_ts), snap) {
                 Ok(stat) => {
-                    info!("initial scanning of leader transforming finished!"; "statistics" => ?stat, "region" => %region.get_id());
+                    info!("initial scanning of leader transforming finished!"; "statistics" => ?stat, "region" => %region.get_id(), "from_ts" => %from_ts);
                 }
                 Err(err) => err.report(format!("during initial scanning of region {:?}", region)),
             }
