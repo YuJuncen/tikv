@@ -77,6 +77,8 @@ impl<S: Snapshot> EventLoader<S> {
                     default: (key, value),
                     ..
                 } => {
+                    // FIXME: we also need to update the information for the `resolver` in the endpoint,
+                    //        otherwise we may advance the resolved ts too far in some conditions?
                     if !key.is_empty() {
                         result.push(ApplyEvent {
                             key,
