@@ -408,7 +408,7 @@ where
         //       if the server crashes immediately, and data of this scanning hasn't been sent to sink,
         //       those data would be permanently lost.
         // Maybe we need block the next_backup_ts from advancing before all initial scanning done(Or just for the region, via disabling the resolver)?
-        tokio::task::spawn_blocking(move || {
+        self.pool.spawn_blocking(move || {
             let from_ts = match block_on(meta_cli.global_progress_of_task(&task)) {
                 Ok(ts) => ts,
                 Err(err) => {
