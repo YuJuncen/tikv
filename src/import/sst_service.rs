@@ -162,7 +162,7 @@ where
     }
 
     fn build_apply_request<'a, 'b>(
-        raft_size: u64,
+        &self,
         reqs: &'a mut Vec<Request>,
         cmd_reqs: &'a mut Vec<RaftCmdRequest>,
         is_delete: bool,
@@ -173,6 +173,7 @@ where
         'a: 'b,
     {
         let mut req_size = 0_u64;
+        let raft_size = self.raft_entry_max_size.0;
 
         // use callback to collect kv data.
         if is_delete {
@@ -442,58 +443,56 @@ where
         let router = self.router.clone();
         let limiter = self.limiter.clone();
         let start = Instant::now();
-        let raft_size = self.raft_entry_max_size.0;
 
-        let handle_task = async move {
-            let mut futs = vec![];
-            let mut apply_resp = ApplyResponse::default();
-            let context = req.take_context();
-            let meta = req.get_meta();
+        let mut futs = vec![];
+        let mut apply_resp = ApplyResponse::default();
+        let context = req.take_context();
+        let meta = req.get_meta();
 
-            let result = (|| -> Result<()> {
-                let temp_file =
-                    importer.do_download_kv_file(meta, req.get_storage_backend(), &limiter)?;
-                let mut reqs = vec![];
-                let mut cmd_reqs = vec![];
-                let mut build_req_fn = Self::build_apply_request(
-                    raft_size,
-                    reqs.as_mut(),
-                    cmd_reqs.as_mut(),
-                    meta.get_is_delete(),
-                    meta.get_cf(),
-                    context.clone(),
-                );
-                let range = importer.do_apply_kv_file(
-                    meta.get_restore_ts(),
-                    temp_file,
-                    req.get_rewrite_rule(),
-                    &mut build_req_fn,
-                )?;
-                drop(build_req_fn);
-                if !reqs.is_empty() {
-                    let cmd = make_request(reqs.as_mut(), context);
-                    cmd_reqs.push(cmd);
-                }
-                for cmd in cmd_reqs {
-                    let (cb, future) = paired_future_callback();
-                    match router.send_command(cmd, Callback::write(cb), RaftCmdExtraOpts::default())
-                    {
-                        Ok(_) => futs.push(future),
-                        Err(e) => {
-                            let mut import_err = kvproto::import_sstpb::Error::default();
-                            import_err.set_message(format!("failed to send raft command: {}", e));
-                            apply_resp.set_error(import_err);
-                        }
+        let result = (|| -> Result<()> {
+            let temp_file =
+                importer.do_download_kv_file(meta, req.get_storage_backend(), &limiter)?;
+            let mut reqs = vec![];
+            let mut cmd_reqs = vec![];
+            let mut build_req_fn = self.build_apply_request(
+                reqs.as_mut(),
+                cmd_reqs.as_mut(),
+                meta.get_is_delete(),
+                meta.get_cf(),
+                context.clone(),
+            );
+            let range = importer.do_apply_kv_file(
+                meta.get_restore_ts(),
+                temp_file,
+                req.get_rewrite_rule(),
+                &mut build_req_fn,
+            )?;
+            drop(build_req_fn);
+            if !reqs.is_empty() {
+                let cmd = make_request(reqs.as_mut(), context);
+                cmd_reqs.push(cmd);
+            }
+            for cmd in cmd_reqs {
+                let (cb, future) = paired_future_callback();
+                match router.send_command(cmd, Callback::write(cb), RaftCmdExtraOpts::default()) {
+                    Ok(_) => futs.push(future),
+                    Err(e) => {
+                        let mut import_err = kvproto::import_sstpb::Error::default();
+                        import_err.set_message(format!("failed to send raft command: {}", e));
+                        apply_resp.set_error(import_err);
                     }
                 }
-                if let Some(r) = range {
-                    apply_resp.set_range(r);
-                }
-                Ok(())
-            })();
-            if let Err(err) = result {
-                apply_resp.set_error(err.into());
             }
+            if let Some(r) = range {
+                apply_resp.set_range(r);
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            apply_resp.set_error(e.into());
+        }
+
+        let handle_task = async move {
             // Records how long the apply task waits to be scheduled.
             sst_importer::metrics::IMPORTER_APPLY_DURATION
                 .with_label_values(&["queue"])
