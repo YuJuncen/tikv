@@ -128,12 +128,13 @@ impl Suite {
         let ob = self.obs.get(&id).unwrap().clone();
         let endpoint = Endpoint::with_client(
             id,
+            MetadataClient::new(self.meta_store.clone(), id),
             cfg,
             worker.scheduler(),
             ob,
             regions,
             raft_router,
-            MetadataClient::new(self.meta_store.clone(), id),
+            cluster.pd_client.clone(),
         );
         worker.start(endpoint);
     }
@@ -361,8 +362,6 @@ mod test {
         suite.write_records(0, 128, 1);
         suite.must_register_task(1, "test_basic");
         suite.write_records(128, 128, 1);
-        suite.check_for_write_records(256, 1, suite.temp_files.path());
-
         suite.force_flush_files("test_basic");
         std::thread::sleep(Duration::from_secs(4));
         suite.check_for_write_records(256, 1, suite.flushed_files.path());
@@ -376,7 +375,6 @@ mod test {
         suite.must_split(&make_split_key_at_record(1, 42));
         suite.must_register_task(1, "test_with_split");
         suite.write_records(128, 128, 1);
-        suite.check_for_write_records(256, 1, suite.temp_files.path());
         suite.force_flush_files("test_with_split");
         std::thread::sleep(Duration::from_secs(4));
         suite.check_for_write_records(256, 1, suite.flushed_files.path());
@@ -392,7 +390,6 @@ mod test {
         let leader = suite.cluster.leader_of_region(1).unwrap().get_store_id();
         suite.cluster.stop_node(leader);
         suite.write_records(128, 128, 1);
-        suite.check_for_write_records(256, 1, suite.temp_files.path());
         suite.force_flush_files("test_leader_down");
         std::thread::sleep(Duration::from_secs(4));
         suite.check_for_write_records(256, 1, suite.flushed_files.path());

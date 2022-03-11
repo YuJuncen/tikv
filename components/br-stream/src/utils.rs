@@ -180,18 +180,6 @@ impl<K: Ord, V: Default> SegmentMap<K, V> {
     }
 }
 
-struct RangeToExclusiveRef<'a, T: ?Sized>(&'a T);
-
-impl<'a, T: ?Sized> RangeBounds<T> for RangeToExclusiveRef<'a, T> {
-    fn start_bound(&self) -> Bound<&T> {
-        Bound::Unbounded
-    }
-
-    fn end_bound(&self) -> Bound<&T> {
-        Bound::Excluded(self.0)
-    }
-}
-
 impl<K: Ord, V> SegmentMap<K, V> {
     /// Like `add`, but insert a value associated to the key.
     pub fn insert(&mut self, (start, end): (K, K), value: V) -> bool {
