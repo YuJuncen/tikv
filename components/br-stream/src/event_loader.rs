@@ -22,19 +22,19 @@ use txn_types::{Key, TimeStamp};
 use crate::{
     annotate,
     errors::{Error, Result},
+    router::ApplyEvent,
     utils::RegionPager,
 };
 use crate::{
     metrics,
-    router::{ApplyEvent, Router},
+    router::{ApplyEvents, Router},
 };
 
-use kvproto::{kvrpcpb::ExtraOp, metapb::Region};
+use kvproto::{kvrpcpb::ExtraOp, metapb::Region, raft_cmdpb::CmdType};
 
 /// EventLoader transforms data from the snapshot into ApplyEvent.
 pub struct EventLoader<S: Snapshot> {
     scanner: DeltaScanner<S>,
-    region_id: u64,
 }
 
 impl<S: Snapshot> EventLoader<S> {
@@ -63,16 +63,12 @@ impl<S: Snapshot> EventLoader<S> {
                 )
             })?;
 
-        Ok(Self { scanner, region_id })
+        Ok(Self { scanner })
     }
 
     /// scan a batch of events from the snapshot.
     /// note: maybe make something like [`EntryBatch`] for reducing allocation.
-    fn scan_batch(
-        &mut self,
-        batch_size: usize,
-        result: &mut Vec<ApplyEvent>,
-    ) -> Result<Statistics> {
+    fn scan_batch(&mut self, batch_size: usize, result: &mut ApplyEvents) -> Result<Statistics> {
         let mut b = EntryBatch::with_capacity(batch_size);
         self.scanner.scan_entries(&mut b)?;
         for entry in b.drain() {
@@ -82,21 +78,28 @@ impl<S: Snapshot> EventLoader<S> {
                     ..
                 } => {
                     if !key.is_empty() {
-                        result.push(ApplyEvent::from_prewrite(key, value, self.region_id));
+                        result.push(ApplyEvent {
+                            key,
+                            value,
+                            cf: CF_DEFAULT,
+                            cmd_type: CmdType::Put,
+                        });
                     }
                 }
                 TxnEntry::Commit { default, write, .. } => {
-                    let write =
-                        ApplyEvent::from_committed(CF_WRITE, write.0, write.1, self.region_id)?;
-                    result.push(write);
+                    result.push(ApplyEvent {
+                        key: write.0,
+                        value: write.1,
+                        cf: CF_WRITE,
+                        cmd_type: CmdType::Put,
+                    });
                     if !default.0.is_empty() {
-                        let default = ApplyEvent::from_committed(
-                            CF_DEFAULT,
-                            default.0,
-                            default.1,
-                            self.region_id,
-                        )?;
-                        result.push(default);
+                        result.push(ApplyEvent {
+                            key: default.0,
+                            value: default.1,
+                            cf: CF_DEFAULT,
+                            cmd_type: CmdType::Put,
+                        });
                     }
                 }
             }
@@ -109,13 +112,13 @@ impl<S: Snapshot> EventLoader<S> {
 /// Like [`cdc::Initializer`], but supports initialize over range.
 /// Note: maybe we can merge those two structures?
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct InitialDataLoader<E, R, RT> {
     router: RT,
     regions: R,
     // Note: maybe we can make it an abstract thing like `EventSink` with
     //       method `async (KvEvent) -> Result<()>`?
     sink: Router,
-    store_id: u64,
 
     _engine: PhantomData<E>,
 }
@@ -126,12 +129,11 @@ where
     R: RegionInfoProvider + Clone + 'static,
     RT: RaftStoreRouter<E>,
 {
-    pub fn new(router: RT, regions: R, sink: Router, store_id: u64) -> Self {
+    pub fn new(router: RT, regions: R, sink: Router) -> Self {
         Self {
             router,
             regions,
             sink,
-            store_id,
             _engine: PhantomData,
         }
     }
@@ -147,14 +149,31 @@ where
         // Registering the observer to the raftstore is necessary because we should only listen events from leader.
         // In CDC, the change observer is per-delegate(i.e. per-region), we can create the command per-region here too.
 
-        let (callback, fut) = tikv_util::future::paired_future_callback();
+        let (callback, fut) = tikv_util::future::paired_future_callback::<
+            std::result::Result<_, Box<dyn std::error::Error + Send + Sync>>,
+        >();
         self.router
             .significant_send(
                 region.id,
                 SignificantMsg::CaptureChange {
                     cmd,
                     region_epoch: region.get_region_epoch().clone(),
-                    callback: Callback::Read(Box::new(|snapshot| callback(snapshot.snapshot))),
+                    callback: Callback::Read(Box::new(|snapshot| {
+                        if snapshot.response.get_header().has_error() {
+                            callback(Err(box_err!(
+                                "failed to get snapshot: {:?}",
+                                snapshot.response.get_header().get_error()
+                            )));
+                            return;
+                        }
+                        if let Some(snap) = snapshot.snapshot {
+                            callback(Ok(snap));
+                            return;
+                        }
+                        callback(Err(box_err!(
+                            "PROBABLY BUG: the response contains neither error nor snapshot"
+                        )))
+                    })),
                 },
             )
             .map_err(|err| {
@@ -166,11 +185,12 @@ where
             })?;
         let snap = block_on(fut)
             .expect("BUG: channel of paired_future_callback canceled.")
-            .ok_or_else(|| {
-                Error::Other(box_err!(
-                    "failed to get initial snapshot: the channel is dropped (region_id = {})",
+            .map_err(|err| {
+                annotate!(
+                    err,
+                    "failed to get initial snapshot: failed to get the snapshot (region_id = {})",
                     region.get_id()
-                ))
+                )
             })?;
         // Note: maybe warp the snapshot via `RegionSnapshot`?
         Ok(snap)
@@ -190,20 +210,18 @@ where
         let mut event_loader = EventLoader::load_from(snap, start_ts, TimeStamp::max(), region)?;
         let mut stats = StatisticsSummary::default();
         loop {
-            let mut events = Vec::with_capacity(2048);
+            let mut events = ApplyEvents::with_capacity(1024, region.id);
             let stat = event_loader.scan_batch(1024, &mut events)?;
-            if events.is_empty() {
+            if events.len() == 0 {
                 break;
             }
             stats.add_statistics(&stat);
             let sink = self.sink.clone();
             // Note: maybe we'd better don't spawn it to another thread for preventing OOM?
             tokio::spawn(async move {
-                for event in events {
-                    metrics::INCREMENTAL_SCAN_SIZE.observe(event.size() as f64);
-                    if let Err(err) = sink.on_event(event).await {
-                        warn!("failed to send event to sink"; "err" => %err);
-                    }
+                metrics::INCREMENTAL_SCAN_SIZE.observe(events.size() as f64);
+                if let Err(err) = sink.on_events(events).await {
+                    warn!("failed to send event to sink"; "err" => %err);
                 }
             });
         }

@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use engine_traits::KvEngine;
 
 use kvproto::metapb::Region;
+use pd_client::PdClient;
 use raftstore::router::RaftStoreRouter;
 use raftstore::store::fsm::ChangeObserver;
 use resolved_ts::Resolver;
@@ -22,11 +23,12 @@ use tokio::runtime::Runtime;
 use tokio_stream::StreamExt;
 use txn_types::TimeStamp;
 
+use crate::errors::Error;
 use crate::event_loader::InitialDataLoader;
 use crate::metadata::store::{EtcdStore, MetaStore};
 use crate::metadata::{MetadataClient, MetadataEvent, StreamTask};
 use crate::metrics;
-use crate::router::{ApplyEvent, Router, FLUSH_STORAGE_INTERVAL};
+use crate::router::{ApplyEvents, Router, FLUSH_STORAGE_INTERVAL};
 use crate::utils::{self, StopWatch};
 use crate::{errors::Result, observer::BackupStreamObserver};
 
@@ -42,7 +44,7 @@ use super::metrics::{HANDLE_EVENT_DURATION_HISTOGRAM, HANDLE_KV_HISTOGRAM};
 
 const SLOW_EVENT_THRESHOLD: f64 = 120.0;
 
-pub struct Endpoint<S: MetaStore + 'static, R, E, RT> {
+pub struct Endpoint<S: MetaStore + 'static, R, E, RT, PDC> {
     #[allow(dead_code)]
     config: BackupStreamConfig,
     meta_client: Option<MetadataClient<S>>,
@@ -56,70 +58,16 @@ pub struct Endpoint<S: MetaStore + 'static, R, E, RT> {
     regions: R,
     engine: PhantomData<E>,
     router: RT,
+    pd_client: Arc<PDC>,
     resolvers: Arc<DashMap<u64, Resolver>>,
 }
 
-impl<R, E, RT, S> Endpoint<S, R, E, RT>
+impl<R, E, RT, PDC> Endpoint<EtcdStore, R, E, RT, PDC>
 where
     R: RegionInfoProvider + 'static + Clone,
     E: KvEngine,
     RT: RaftStoreRouter<E> + 'static,
-    S: MetaStore,
-{
-    pub fn with_client(
-        store_id: u64,
-        config: BackupStreamConfig,
-        scheduler: Scheduler<Task>,
-        observer: BackupStreamObserver,
-        region_infos: R,
-        raft_router: RT,
-        meta_client: MetadataClient<S>,
-    ) -> Self {
-        let pool = create_tokio_runtime(config.num_threads, "br-stream")
-            .expect("failed to create tokio runtime for backup stream worker.");
-
-        let range_router = Router::new(
-            PathBuf::from(config.streaming_path.clone()),
-            scheduler.clone(),
-            config.temp_file_size_limit_per_task.0,
-        );
-
-        // spawn a worker to watch task changes from etcd periodically.
-        let meta_client_clone = meta_client.clone();
-        let scheduler_clone = scheduler.clone();
-        // TODO build a error handle mechanism #error 2
-        pool.spawn(async {
-            if let Err(err) =
-                Endpoint::<_, R, E, RT>::starts_watch_tasks(meta_client_clone, scheduler_clone)
-                    .await
-            {
-                err.report("failed to start watch tasks");
-            }
-        });
-        pool.spawn(Endpoint::<EtcdStore, R, E, RT>::starts_flush_ticks(
-            range_router.clone(),
-        ));
-        Endpoint {
-            config,
-            meta_client: Some(meta_client),
-            range_router,
-            scheduler,
-            observer,
-            pool,
-            store_id,
-            regions: region_infos,
-            engine: PhantomData,
-            router: raft_router,
-            resolvers: Default::default(),
-        }
-    }
-}
-
-impl<R, E, RT> Endpoint<EtcdStore, R, E, RT>
-where
-    R: RegionInfoProvider + 'static + Clone,
-    E: KvEngine,
-    RT: RaftStoreRouter<E> + 'static,
+    PDC: PdClient + 'static,
 {
     pub fn new<S: AsRef<str>>(
         store_id: u64,
@@ -129,7 +77,8 @@ where
         observer: BackupStreamObserver,
         accessor: R,
         router: RT,
-    ) -> Endpoint<EtcdStore, R, E, RT> {
+        pd_client: Arc<PDC>,
+    ) -> Endpoint<EtcdStore, R, E, RT, PDC> {
         let pool = create_tokio_runtime(config.num_threads, "br-stream")
             .expect("failed to create tokio runtime for backup stream worker.");
 
@@ -157,16 +106,12 @@ where
             let scheduler_clone = scheduler.clone();
             // TODO build a error handle mechanism #error 2
             pool.spawn(async {
-                if let Err(err) =
-                    Endpoint::<_, R, E, RT>::starts_watch_tasks(meta_client_clone, scheduler_clone)
-                        .await
+                if let Err(err) = Self::starts_watch_tasks(meta_client_clone, scheduler_clone).await
                 {
                     err.report("failed to start watch tasks");
                 }
             });
-            pool.spawn(Endpoint::<EtcdStore, R, E, RT>::starts_flush_ticks(
-                range_router.clone(),
-            ));
+            pool.spawn(Self::starts_flush_ticks(range_router.clone()));
         }
 
         info!("the endpoint of stream backup started"; "path" => %config.streaming_path);
@@ -181,22 +126,24 @@ where
             regions: accessor,
             engine: PhantomData,
             router,
+            pd_client,
             resolvers: Default::default(),
         }
     }
 }
 
-impl<S, R, E, RT> Endpoint<S, R, E, RT>
+impl<S, R, E, RT, PDC> Endpoint<S, R, E, RT, PDC>
 where
     S: MetaStore + 'static,
     R: RegionInfoProvider + Clone + 'static,
     E: KvEngine,
     RT: RaftStoreRouter<E> + 'static,
+    PDC: PdClient + 'static,
 {
     async fn starts_flush_ticks(router: Router) {
         let ticker = tick(Duration::from_secs(FLUSH_STORAGE_INTERVAL / 5));
         loop {
-            // wait 10s to trigger tick
+            // wait 1min to trigger tick
             let _ = ticker.recv().unwrap();
             debug!("backup stream trigger flush tick");
             router.tick().await;
@@ -212,7 +159,7 @@ where
         for task in tasks.inner {
             info!("backup stream watch task"; "task" => ?task);
             // move task to schedule
-            scheduler.schedule(Task::WatchTask(task))?;
+            scheduler.schedule(Task::WatchTask(TaskOp::AddTask(task)))?;
         }
 
         let mut watcher = meta_client.events_from(tasks.revision).await?;
@@ -222,10 +169,10 @@ where
                 match event {
                     MetadataEvent::AddTask { task } => {
                         let t = meta_client.get_task(&task).await?;
-                        scheduler.schedule(Task::WatchTask(t))?;
+                        scheduler.schedule(Task::WatchTask(TaskOp::AddTask(t)))?;
                     }
-                    MetadataEvent::RemoveTask { task: _ } => {
-                        // TODO implement remove task
+                    MetadataEvent::RemoveTask { task } => {
+                        scheduler.schedule(Task::WatchTask(TaskOp::RemoveTask(task)))?;
                     }
                     MetadataEvent::Error { err } => err.report("metadata client watch meet error"),
                 }
@@ -244,8 +191,11 @@ where
             }
         };
 
-        let kvs = ApplyEvent::from_cmd_batch(batch, resolver.value_mut());
+        let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut());
         drop(resolver);
+        if kvs.len() == 0 {
+            return;
+        }
 
         HANDLE_EVENT_DURATION_HISTOGRAM
             .with_label_values(&["to_stream_event"])
@@ -255,24 +205,17 @@ where
             HANDLE_EVENT_DURATION_HISTOGRAM
                 .with_label_values(&["get_router_lock"])
                 .observe(sw.lap().as_secs_f64());
-            let mut kv_count = 0;
-            let total_size = kvs.as_slice().iter().fold(0usize, |init, kv| init + kv.size());
+            let kv_count = kvs.len();
+            let total_size = kvs.size();
             metrics::HEAP_MEMORY
                 .with_label_values(&["alloc"])
                 .inc_by(total_size as f64);
-            for kv in kvs {
-                let size = kv.size();
-                // TODO build a error handle mechanism #error 6
-                if kv.should_record() {
-                    if let Err(err) = router.on_event(kv).await {
-                        err.report("failed to send event.");
-                    }
-                    metrics::HEAP_MEMORY
-                        .with_label_values(&["free"])
-                        .inc_by(size as f64);
-                    kv_count += 1;
-                }
+            if let Err(err) = router.on_events(kvs).await {
+                err.report("failed to send event.");
             }
+            metrics::HEAP_MEMORY
+                .with_label_values(&["free"])
+                .inc_by(total_size as f64);
             HANDLE_KV_HISTOGRAM.observe(kv_count as _);
             let time_cost = sw.lap().as_secs_f64();
             if time_cost > SLOW_EVENT_THRESHOLD {
@@ -290,8 +233,18 @@ where
             self.router.clone(),
             self.regions.clone(),
             self.range_router.clone(),
-            self.store_id,
         )
+    }
+
+    pub fn handle_watch_task(&self, op: TaskOp) {
+        match op {
+            TaskOp::AddTask(task) => {
+                self.on_register(task);
+            }
+            TaskOp::RemoveTask(task_name) => {
+                self.on_unregister(&task_name);
+            }
+        }
     }
 
     // register task ranges
@@ -391,15 +344,60 @@ where
         };
     }
 
-    pub fn on_flush(&self, task: String, store_id: u64, force: bool) {
+    pub fn on_unregister(&self, task: &str) {
+        let router = self.range_router.clone();
+
+        self.pool.block_on(async move {
+            router.unregister_task(task).await;
+        });
+    }
+
+    /// try advance the resolved ts by the pd tso.
+    async fn try_resolve(pd_client: Arc<PDC>, resolvers: Arc<DashMap<u64, Resolver>>) -> TimeStamp {
+        let tso = pd_client
+            .get_tso()
+            .await
+            .map_err(|err| Error::from(err).report("failed to get tso from pd"))
+            .unwrap_or_default();
+        let new_tso = resolvers
+            .as_ref()
+            .iter_mut()
+            .map(|mut r| r.value_mut().resolve(tso))
+            .min();
+        debug!("try resolve resolved ts from PD"; "new_tso" => ?new_tso);
+        new_tso.unwrap_or_default()
+    }
+
+    pub fn on_flush(&self, task: String, store_id: u64) {
         let router = self.range_router.clone();
         let cli = self
             .meta_client
             .as_ref()
             .expect("on_flush: executed from an endpoint without cli")
             .clone();
+        let pd_cli = self.pd_client.clone();
+        let resolvers = self.resolvers.clone();
         self.pool.spawn(async move {
-            if let Some(rts) = router.do_flush(&task, store_id, force).await {
+            // NOTE: Maybe push down the resolve step to the router?
+            //       Or if there are too many duplicated `Flush` command, we may do some useless works.
+            let new_rts = Self::try_resolve(pd_cli.clone(), resolvers).await;
+            if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
+                info!("flushing and refreshing checkpoint ts."; "checkpoint_ts" => %rts, "task" => %task);
+                if rts == 0 {
+                    // We cannot advance the resolved ts for now.
+                    return;
+                }
+                if let Err(err) = pd_cli
+                    .update_service_safe_point(
+                        format!("br-stream-{}-{}", task, store_id),
+                        TimeStamp::new(rts),
+                        Duration::from_secs(600),
+                    )
+                    .await
+                {
+                    Error::from(err).report("failed to update service safe point!");
+                    // don't give up?
+                }
                 if let Err(err) = cli.step_task(&task, rts).await {
                     err.report(format!("on flushing task {}", task));
                     // we can advance the progress at next time.
@@ -435,6 +433,7 @@ where
     /// >      When the follower progress faster than leader and then be elected,
     /// >      there is a risk of losing data.
     pub fn on_modify_observe(&self, op: ObserveOp) {
+        info!("br-stream: on_modify_observe"; "op" => ?op);
         match op {
             ObserveOp::Start { region } => {
                 if let Err(e) = self.observe_over(&region) {
@@ -446,13 +445,16 @@ where
                 self.resolvers.as_ref().remove(&region.id);
             }
             ObserveOp::RefreshResolver { region } => {
-                self.observer.subs.deregister_region(region.id);
+                let canceled = self.observer.subs.deregister_region(region.id);
                 self.resolvers.as_ref().remove(&region.id);
-                if let Err(e) = self.observe_over(&region) {
-                    e.report(format!(
-                        "register region {} to raftstore when refreshing",
-                        region.get_id()
-                    ));
+
+                if canceled {
+                    if let Err(e) = self.observe_over(&region) {
+                        e.report(format!(
+                            "register region {} to raftstore when refreshing",
+                            region.get_id()
+                        ));
+                    }
                 }
             }
         }
@@ -486,7 +488,7 @@ fn create_tokio_runtime(thread_count: usize, thread_name: &str) -> TokioResult<R
 }
 
 pub enum Task {
-    WatchTask(StreamTask),
+    WatchTask(TaskOp),
     BatchEvent(Vec<CmdBatch>),
     ChangeConfig(ConfigChange),
     /// Flush the task with name.
@@ -495,6 +497,12 @@ pub enum Task {
     ModifyObserve(ObserveOp),
     /// Convert status of some task into `flushing` and do flush then.
     ForceFlush(String),
+}
+
+#[derive(Debug)]
+pub enum TaskOp {
+    AddTask(StreamTask),
+    RemoveTask(String),
 }
 
 #[derive(Debug)]
@@ -534,19 +542,20 @@ impl fmt::Display for Task {
     }
 }
 
-impl<S, R, E, RT> Runnable for Endpoint<S, R, E, RT>
+impl<S, R, E, RT, PDC> Runnable for Endpoint<S, R, E, RT, PDC>
 where
     S: MetaStore + 'static,
     R: RegionInfoProvider + Clone + 'static,
     E: KvEngine,
     RT: RaftStoreRouter<E> + 'static,
+    PDC: PdClient + 'static,
 {
     type Task = Task;
 
     fn run(&mut self, task: Task) {
         debug!("run backup stream task"; "task" => ?task);
         match task {
-            Task::WatchTask(task) => self.on_register(task),
+            Task::WatchTask(op) => self.handle_watch_task(op),
             Task::BatchEvent(events) => self.do_backup(events),
             Task::Flush(task) => self.on_flush(task, self.store_id, false),
             Task::ModifyObserve(op) => self.on_modify_observe(op),

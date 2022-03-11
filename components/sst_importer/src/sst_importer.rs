@@ -15,9 +15,9 @@ use kvproto::import_sstpb::*;
 use encryption::{encryption_method_to_db_encryption_method, DataKeyManager};
 use engine_rocks::{get_env, RocksSstReader};
 use engine_traits::{
-    name_to_cf, CfName, EncryptionKeyManager, FileEncryptionInfo, Iterator, KvEngine, SSTMetaInfo,
-    SeekKey, SstCompressionType, SstExt, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT,
-    CF_WRITE,
+    name_to_cf, util::check_key_in_range, CfName, EncryptionKeyManager, FileEncryptionInfo,
+    Iterator, KvEngine, SSTMetaInfo, SeekKey, SstCompressionType, SstExt, SstReader, SstWriter,
+    SstWriterBuilder, CF_DEFAULT, CF_WRITE,
 };
 use file_system::{get_io_rate_limiter, OpenOptions};
 use kvproto::kvrpcpb::ApiVersion;
@@ -111,8 +111,17 @@ impl SSTImporter {
         self.dir.validate(meta, self.key_manager.clone())
     }
 
+    /// check if api version of sst files are compatible
+    pub fn check_api_version(&self, metas: &[SstMeta]) -> Result<bool> {
+        self.dir
+            .check_api_version(metas, self.key_manager.clone(), self.api_version)
+    }
+
     pub fn ingest<E: KvEngine>(&self, metas: &[SSTMetaInfo], engine: &E) -> Result<()> {
-        match self.dir.ingest(metas, engine, self.key_manager.clone()) {
+        match self
+            .dir
+            .ingest(metas, engine, self.key_manager.clone(), self.api_version)
+        {
             Ok(..) => {
                 info!("ingest"; "metas" => ?metas);
                 Ok(())
@@ -130,41 +139,6 @@ impl SSTImporter {
 
     pub fn exist(&self, meta: &SstMeta) -> bool {
         self.dir.exist(meta).unwrap_or(false)
-    }
-
-    // Donwloads and apply a KV file from an external storage.
-    pub fn apply<E: KvEngine>(
-        &self,
-        backend: &StorageBackend,
-        name: &str,
-        rewrite_rule: &RewriteRule,
-        cf: &str,
-        speed_limiter: Limiter,
-        engine: E,
-    ) -> Result<Option<Range>> {
-        debug!("apply start";
-            "url" => ?backend,
-            "name" => name,
-            "cf" => cf,
-            "rewrite_rule" => ?rewrite_rule,
-        );
-        match self.do_download_and_apply::<E>(
-            backend,
-            name,
-            rewrite_rule,
-            cf,
-            &speed_limiter,
-            engine,
-        ) {
-            Ok(r) => {
-                info!("apply"; "name" => name, "range" => ?r);
-                Ok(r)
-            }
-            Err(e) => {
-                error!(%e; "apply failed"; "name" => name,);
-                Err(e)
-            }
-        }
     }
 
     // Downloads an SST file from an external storage.
@@ -288,20 +262,18 @@ impl SSTImporter {
         Ok(())
     }
 
-    fn do_download_and_apply<E: KvEngine>(
+    pub fn do_download_kv_file(
         &self,
+        meta: &KvMeta,
         backend: &StorageBackend,
-        name: &str,
-        rewrite_rule: &RewriteRule,
-        cf: &str,
         speed_limiter: &Limiter,
-        engine: E,
-    ) -> Result<Option<Range>> {
+    ) -> Result<PathBuf> {
+        let name = meta.get_name();
         let path = self.dir.get_import_path(name)?;
         let start = Instant::now();
         self.download_file_from_external_storage(
             // don't check file length after download file for now.
-            0,
+            meta.get_length(),
             name,
             path.temp.clone(),
             backend,
@@ -315,8 +287,20 @@ impl SSTImporter {
             .with_label_values(&["download"])
             .observe(start.saturating_elapsed().as_secs_f64());
 
-        // iterator `path.temp` file and performs rewrites and apply.
-        let file = File::open(path.temp)?;
+        Ok(path.temp)
+    }
+
+    pub fn do_apply_kv_file<P: AsRef<Path>>(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        restore_ts: u64,
+        file_path: P,
+        rewrite_rule: &RewriteRule,
+        build_fn: &mut dyn FnMut(Vec<u8>, Vec<u8>),
+    ) -> Result<Option<Range>> {
+        // iterator file and performs rewrites and apply.
+        let file = File::open(file_path)?;
         let mut reader = BufReader::new(file);
         let mut buffer = Vec::new();
         reader.read_to_end(&mut buffer)?;
@@ -329,7 +313,7 @@ impl SSTImporter {
         let perform_rewrite = old_prefix != new_prefix;
 
         // perform iteration and key rewrite.
-        let mut key = keys::data_key(new_prefix);
+        let mut key = new_prefix.to_vec();
         let new_prefix_data_key_len = key.len();
         let mut smallest_key = None;
         let mut largest_key = None;
@@ -340,18 +324,14 @@ impl SSTImporter {
                 break;
             }
             event_iter.next()?;
-            let iter_key = event_iter.key().to_vec();
 
-            smallest_key = smallest_key.map_or_else(
-                || Some(iter_key.clone()),
-                |v: Vec<u8>| Some(v.min(iter_key.clone())),
-            );
-
-            largest_key = largest_key.map_or_else(
-                || Some(iter_key.clone()),
-                |v: Vec<u8>| Some(v.max(iter_key.clone())),
-            );
-
+            let ts = Key::decode_ts_from(event_iter.key())?;
+            if ts > TimeStamp::new(restore_ts) {
+                // we assume the keys in file are sorted by ts.
+                // so if we met the key not satisfy the ts.
+                // we can easily filter the remain keys.
+                break;
+            }
             if perform_rewrite {
                 let old_key = event_iter.key();
 
@@ -367,20 +347,37 @@ impl SSTImporter {
 
                 debug!(
                     "perform rewrite new key: {:?}, new key prefix: {:?}, old key prefix: {:?}",
-                    log_wrappers::Value::key(keys::origin_key(&key)),
+                    log_wrappers::Value::key(&key),
                     log_wrappers::Value::key(new_prefix),
                     log_wrappers::Value::key(old_prefix),
                 );
             } else {
-                key = keys::data_key(event_iter.key());
+                key = event_iter.key().to_vec();
             }
-            let value = Cow::Borrowed(event_iter.value());
-            // TODO handle delete cf
-            engine.put_cf(cf, &key, &value)?;
+            if check_key_in_range(&key, 0, start_key, end_key).is_err() {
+                // key not in range, we can simply skip this key here.
+                // the client make sure the correct region will download and apply the same file.
+                INPORTER_APPLY_COUNT
+                    .with_label_values(&["key_not_in_region"])
+                    .inc();
+                continue;
+            }
+            let value = event_iter.value().to_vec();
+            build_fn(key.clone(), value);
+
+            let iter_key = key.clone();
+            smallest_key = smallest_key.map_or_else(
+                || Some(iter_key.clone()),
+                |v: Vec<u8>| Some(v.min(iter_key.clone())),
+            );
+
+            largest_key = largest_key.map_or_else(
+                || Some(iter_key.clone()),
+                |v: Vec<u8>| Some(v.max(iter_key.clone())),
+            );
         }
-        engine.flush_cf(cf, true)?;
+
         let label = if perform_rewrite { "rewrite" } else { "normal" };
-        info!("apply file finished {}", name);
         IMPORTER_APPLY_DURATION
             .with_label_values(&[label])
             .observe(start.saturating_elapsed().as_secs_f64());
@@ -705,7 +702,6 @@ fn is_after_end_bound<K: AsRef<[u8]>>(value: &[u8], bound: &Bound<K>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::f64::INFINITY;
     use std::io;
 
     use engine_traits::{
@@ -784,7 +780,9 @@ mod tests {
                 total_kvs: 0,
                 meta: meta.to_owned(),
             };
-            dir.ingest(&[info], &db, key_manager.clone()).unwrap();
+            let api_version = info.meta.api_version;
+            dir.ingest(&[info], &db, key_manager.clone(), api_version)
+                .unwrap();
             check_db_range(&db, range);
 
             ingested.push(meta);
@@ -1067,7 +1065,7 @@ mod tests {
         block_on_external_io(external_storage_export::read_external_storage_into_file(
             &mut input,
             &mut output,
-            &Limiter::new(INFINITY),
+            &Limiter::new(f64::INFINITY),
             input_len,
             8192,
         ))
@@ -1084,7 +1082,7 @@ mod tests {
         let err = block_on_external_io(external_storage_export::read_external_storage_into_file(
             &mut input,
             &mut output,
-            &Limiter::new(INFINITY),
+            &Limiter::new(f64::INFINITY),
             0,
             usize::MAX,
         ))
@@ -1110,7 +1108,7 @@ mod tests {
                 "sample.sst",
                 &RewriteRule::default(),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1169,7 +1167,7 @@ mod tests {
                 "sample.sst",
                 &RewriteRule::default(),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1218,7 +1216,7 @@ mod tests {
                 "sample.sst",
                 &new_rewrite_rule(b"t123", b"t567", 0),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1266,7 +1264,7 @@ mod tests {
                 "sample_default.sst",
                 &new_rewrite_rule(b"", b"", 16),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1310,7 +1308,7 @@ mod tests {
                 "sample_write.sst",
                 &new_rewrite_rule(b"", b"", 16),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1373,7 +1371,7 @@ mod tests {
                     "sample.sst",
                     &new_rewrite_rule(b"t123", b"t9102", 0),
                     None,
-                    Limiter::new(INFINITY),
+                    Limiter::new(f64::INFINITY),
                     db,
                 )
                 .unwrap()
@@ -1448,7 +1446,7 @@ mod tests {
                 "sample.sst",
                 &RewriteRule::default(),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1493,7 +1491,7 @@ mod tests {
                 "sample.sst",
                 &new_rewrite_rule(b"t123", b"t5", 0),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1538,7 +1536,7 @@ mod tests {
             "sample.sst",
             &RewriteRule::default(),
             None,
-            Limiter::new(INFINITY),
+            Limiter::new(f64::INFINITY),
             db,
         );
         match &result {
@@ -1564,7 +1562,7 @@ mod tests {
             "sample.sst",
             &RewriteRule::default(),
             None,
-            Limiter::new(INFINITY),
+            Limiter::new(f64::INFINITY),
             db,
         );
 
@@ -1588,7 +1586,7 @@ mod tests {
             "sample.sst",
             &new_rewrite_rule(b"xxx", b"yyy", 0),
             None,
-            Limiter::new(INFINITY),
+            Limiter::new(f64::INFINITY),
             db,
         );
 
@@ -1626,7 +1624,7 @@ mod tests {
                 "sample.sst",
                 &RewriteRule::default(),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1685,7 +1683,7 @@ mod tests {
                 "sample.sst",
                 &RewriteRule::default(),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1740,7 +1738,7 @@ mod tests {
                 "sample.sst",
                 &RewriteRule::default(),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()
@@ -1788,7 +1786,7 @@ mod tests {
                 "sample.sst",
                 &new_rewrite_rule(b"t123", b"t789", 0),
                 None,
-                Limiter::new(INFINITY),
+                Limiter::new(f64::INFINITY),
                 db,
             )
             .unwrap()

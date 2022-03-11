@@ -6,12 +6,9 @@ use std::{
     time::Duration,
 };
 
-use crate::{
-    annotate,
-    errors::{Error, Result},
-};
+use crate::errors::{Error, Result};
 
-use engine_traits::CF_DEFAULT;
+use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use futures::{channel::mpsc, executor::block_on, StreamExt};
 use kvproto::raft_cmdpb::{CmdType, Request};
 use raft::StateRole;
@@ -19,7 +16,7 @@ use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
 
 use tikv_util::{box_err, time::Instant, warn, Either};
 use tokio::sync::{Mutex, RwLock};
-use txn_types::{Key, TimeStamp};
+use txn_types::Key;
 
 /// wrap a user key with encoded data key.
 pub fn wrap_key(v: Vec<u8>) -> Vec<u8> {
@@ -28,15 +25,20 @@ pub fn wrap_key(v: Vec<u8>) -> Vec<u8> {
     key
 }
 
-/// decode ts from a key, and transform the error to the crate error.
-pub fn get_ts(key: &Key) -> Result<TimeStamp> {
-    key.decode_ts().map_err(|err| {
-        annotate!(
-            err,
-            "failed to get ts from key '{}'",
-            redact(&key.as_encoded())
-        )
-    })
+/// Transform a str to a [`engine_traits::CfName`]\(`&'static str`).
+/// If the argument isn't one of `""`, `"DEFAULT"`, `"default"`, `"WRITE"`, `"write"`, `"LOCK"`, `"lock"`...
+/// returns "ERR_CF". (Which would be ignored then.)
+pub fn cf_name(s: &str) -> CfName {
+    match s {
+        "" | "DEFAULT" | "default" => CF_DEFAULT,
+        "WRITE" | "write" => CF_WRITE,
+        "LOCK" | "lock" => CF_LOCK,
+        "RAFT" | "raft" => CF_RAFT,
+        _ => {
+            Error::Other(box_err!("unknown cf name {}", s)).report("");
+            "ERR_CF"
+        }
+    }
 }
 
 pub fn redact(key: &impl AsRef<[u8]>) -> log_wrappers::Value<'_> {
@@ -156,8 +158,8 @@ pub struct SegmentMap<K: Ord, V>(BTreeMap<K, SegmentValue<K, V>>);
 
 #[derive(Clone, Debug)]
 pub struct SegmentValue<R, T> {
-    range_end: R,
-    item: T,
+    pub range_end: R,
+    pub item: T,
 }
 
 /// A container for holding ranges without overlapping.
@@ -175,6 +177,18 @@ impl<K: Ord, V: Default> SegmentMap<K, V> {
     /// - If overlapping detected, do nothing and return `false`.
     pub fn add(&mut self, (start, end): (K, K)) -> bool {
         self.insert((start, end), V::default())
+    }
+}
+
+struct RangeToExclusiveRef<'a, T: ?Sized>(&'a T);
+
+impl<'a, T: ?Sized> RangeBounds<T> for RangeToExclusiveRef<'a, T> {
+    fn start_bound(&self) -> Bound<&T> {
+        Bound::Unbounded
+    }
+
+    fn end_bound(&self) -> Bound<&T> {
+        Bound::Excluded(self.0)
     }
 }
 
@@ -245,26 +259,30 @@ impl<K: Ord, V> SegmentMap<K, V> {
         // ...Or the end key is contained by some Range.
         // For faster query, we merged the two cases together.
         let covered_by_the_range = self
-            .0
-            // When querying possibility of overlapping by end key,
-            // we don't want the range [end key, ...) become a candidate.
-            // (which is impossible to overlapping with the range)
-            .range(RangeToExclusiveRef(range.1))
-            .next_back()
-            .filter(|(start, end)| {
-                <K as Borrow<R>>::borrow(&end.range_end) > range.1
-                    || <K as Borrow<R>>::borrow(start) > range.0
-            })
-            .is_some();
+             .0
+             // When querying possibility of overlapping by end key,
+             // we don't want the range [end key, ...) become a candidate.
+             // (which is impossible to overlapping with the range)
+             .range(RangeToExclusiveRef(range.1))
+             .next_back()
+             .filter(|(start, end)| {
+                 <K as Borrow<R>>::borrow(&end.range_end) > range.1
+                     || <K as Borrow<R>>::borrow(start) > range.0
+             })
+             .is_some();
         overlap_with_start || covered_by_the_range
+    }
+
+    pub fn get_inner(&mut self) -> &mut BTreeMap<K, SegmentValue<K, V>> {
+        &mut self.0
     }
 }
 
 /// transform a [`RaftCmdRequest`] to `(key, value, cf)` triple.
 /// once it contains a write request, extract it, and return `Left((key, value, cf))`,
 /// otherwise return the request itself via `Right`.
-pub fn request_to_triple(mut req: Request) -> Either<(Vec<u8>, Vec<u8>, String), Request> {
-    let (key, value, mut cf) = match req.get_cmd_type() {
+pub fn request_to_triple(mut req: Request) -> Either<(Vec<u8>, Vec<u8>, CfName), Request> {
+    let (key, value, cf) = match req.get_cmd_type() {
         CmdType::Put => {
             let mut put = req.take_put();
             (put.take_key(), put.take_value(), put.cf)
@@ -275,11 +293,7 @@ pub fn request_to_triple(mut req: Request) -> Either<(Vec<u8>, Vec<u8>, String),
         }
         _ => return Either::Right(req),
     };
-    // Sometimes `cf` of some request would be empty, which means write them to `default` CF.
-    if cf.is_empty() {
-        cf = CF_DEFAULT.to_owned();
-    }
-    Either::Left((key, value, cf))
+    Either::Left((key, value, cf_name(cf.as_str())))
 }
 
 /// `try_send!(s: Scheduler<T>, task: T)` tries to send a task to the scheduler,

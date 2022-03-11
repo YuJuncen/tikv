@@ -17,13 +17,18 @@ pub use self::feature_gate::{Feature, FeatureGate};
 pub use self::util::PdConnector;
 pub use self::util::REQUEST_RECONNECT_INTERVAL;
 
+use std::collections::HashMap;
 use std::ops::Deref;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
+use grpcio::ClientSStreamReceiver;
 use kvproto::metapb;
 use kvproto::pdpb;
-use kvproto::replication_modepb::{RegionReplicationStatus, ReplicationStatus};
-use pdpb::QueryStats;
+use kvproto::replication_modepb::{
+    RegionReplicationStatus, ReplicationStatus, StoreDrAutoSyncStatus,
+};
+use pdpb::{QueryStats, WatchGlobalConfigResponse};
 use tikv_util::time::UnixSecs;
 use txn_types::TimeStamp;
 
@@ -75,6 +80,21 @@ pub const INVALID_ID: u64 = 0;
 /// creating the PdClient is enough and the PdClient will use this cluster id
 /// all the time.
 pub trait PdClient: Send + Sync {
+    /// Load a list of GlobalConfig
+    fn load_global_config(&self, _list: Vec<String>) -> PdFuture<HashMap<String, String>> {
+        unimplemented!();
+    }
+
+    /// Store a list of GlobalConfig
+    fn store_global_config(&self, _list: HashMap<String, String>) -> PdFuture<()> {
+        unimplemented!();
+    }
+
+    /// Watching change of GlobalConfig
+    fn watch_global_config(&self) -> Result<ClientSStreamReceiver<WatchGlobalConfigResponse>> {
+        unimplemented!();
+    }
+
     /// Returns the cluster ID.
     fn get_cluster_id(&self) -> Result<u64> {
         unimplemented!();
@@ -222,6 +242,7 @@ pub trait PdClient: Send + Sync {
         &self,
         _stats: pdpb::StoreStats,
         _report: Option<pdpb::StoreReport>,
+        _status: Option<StoreDrAutoSyncStatus>,
     ) -> PdFuture<pdpb::StoreHeartbeatResponse> {
         unimplemented!();
     }
@@ -261,6 +282,16 @@ pub trait PdClient: Send + Sync {
 
     /// Gets a timestamp from PD.
     fn get_tso(&self) -> PdFuture<TimeStamp> {
+        unimplemented!()
+    }
+
+    /// Set a service safe point.
+    fn update_service_safe_point(
+        &self,
+        _name: String,
+        _safepoint: TimeStamp,
+        _ttl: Duration,
+    ) -> PdFuture<()> {
         unimplemented!()
     }
 
