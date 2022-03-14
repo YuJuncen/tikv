@@ -547,8 +547,7 @@ impl TempFileKey {
 
     fn path_to_log_file(&self, min_ts: u64, max_ts: u64) -> String {
         format!(
-            // "/v1/t{:012}/{:012}-{}.log",
-            "t{:08}/{}/{:012}-{}.log",
+            "t{:08}/{}-{:012}-{}.log",
             self.table_id,
             // We may delete a range of files, so using the max_ts for preventing remove some records wrong.
             Self::format_date_time(max_ts),
@@ -558,13 +557,11 @@ impl TempFileKey {
     }
 
     fn path_to_schema_file(min_ts: u64, max_ts: u64) -> String {
-        // format!("/v1/m/{:012}-{}.log", min_ts, uuid::Uuid::new_v4())
-
         format!(
-            "m{:012}/{}/{}.log",
-            min_ts,
+            "schema-meta/{}-{:012}-{}.log",
             Self::format_date_time(max_ts),
-            uuid::Uuid::new_v4()
+            min_ts,
+            uuid::Uuid::new_v4(),
         )
     }
 
@@ -1289,9 +1286,9 @@ mod tests {
     #[test]
     #[cfg(feature = "failpoints")]
     fn test_format_datetime() {
-        fail::cfg("stream_format_date_time", "return(%Y)").unwrap();
+        let _scenario = fail::FailScenario::setup();
         let s = TempFileKey::format_date_time(431656320867237891);
         let s = s.to_string();
-        assert_eq!(s, "2022")
+        assert_eq!(s, "20220307");
     }
 }

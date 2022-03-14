@@ -67,13 +67,19 @@ impl ExternalStorage for LocalStorage {
 
     async fn write(&self, name: &str, reader: UnpinReader, _content_length: u64) -> io::Result<()> {
         let p = Path::new(name);
+        if p.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the file name (it is {}) should never be absolute path",
+                    p.display()
+                ),
+            ));
+        }
         if name.is_empty() || p.file_name().map(|s| s.is_empty()).unwrap_or(true) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                format!(
-                    "the file name (full path = {}) should not be empty",
-                    p.display()
-                ),
+                format!("the file name (it is {}) should not be empty", p.display()),
             ));
         }
         // create the parent dir if there isn't one.
