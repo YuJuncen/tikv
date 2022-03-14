@@ -24,7 +24,8 @@ failpoints = [
   "fail/failpoints",
   "raftstore/failpoints",
   "tikv_util/failpoints",
-  "engine_rocks/failpoints"
+  "engine_rocks/failpoints",
+  "br-stream/failpoints"
 ]
 cloud-aws = [
   "encryption_export/cloud-aws",
