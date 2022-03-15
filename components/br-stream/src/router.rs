@@ -1284,9 +1284,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "failpoints")]
     fn test_format_datetime() {
-        let _scenario = fail::FailScenario::setup();
         let s = TempFileKey::format_date_time(431656320867237891);
         let s = s.to_string();
         assert_eq!(s, "20220307");
