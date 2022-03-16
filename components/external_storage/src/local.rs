@@ -86,7 +86,18 @@ impl ExternalStorage for LocalStorage {
         // note: we may write to arbitrary directory here if the path contains things like '../'
         // but internally the file name should be fully controlled by TiKV, so maybe it is OK?
         if let Some(parent) = Path::new(name).parent() {
-            fs::create_dir_all(self.base.join(parent)).await?;
+            fs::create_dir_all(self.base.join(parent))
+                .await
+                // According to the man page mkdir(2), it returns EEXIST if there is already the dir.
+                // (However in practice, it doesn't fail in both Linux(CentOS 7) and macOS(12.2).)
+                // Ignore the `AlreadyExists` anyway for safety.
+                .or_else(|e| {
+                    if e.kind() == io::ErrorKind::AlreadyExists {
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })?;
         }
         // Sanitize check, do not save file if it is already exist.
         if fs::metadata(self.base.join(name)).await.is_ok() {
@@ -169,7 +180,18 @@ mod tests {
         r.read_to_string(&mut s).await.unwrap();
         assert_eq!(magic_contents, s.as_bytes());
 
-        // Empty name is not allowed.
+        ls.write(
+            "a/b.log",
+            UnpinReader(Box::new(magic_contents)),
+            content_length,
+        )
+        .await
+        .unwrap();
+        let mut r = ls.read("a/b.log");
+        let mut s = String::new();
+        r.read_to_string(&mut s).await.unwrap();
+        assert_eq!(magic_contents, s.as_bytes()); // Empty name is not allowed.
+
         ls.write("", UnpinReader(Box::new(magic_contents)), content_length)
             .await
             .unwrap_err();
