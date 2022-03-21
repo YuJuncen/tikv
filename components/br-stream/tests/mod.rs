@@ -202,6 +202,14 @@ impl Suite {
         }
     }
 
+    fn just_async_commit_prewrite(&mut self, ts: u64, for_table: i64) {
+        let key = make_record_key(for_table, ts);
+        let muts = vec![mutation(key.clone(), b"hello, world".to_vec())];
+        let enc_key = Key::from_raw(&key).into_encoded();
+        let region = self.cluster.get_region_id(&enc_key);
+        self.must_kv_async_commit_prewrite(region, muts, key.clone(), ts)
+    }
+
     fn force_flush_files(&self, task: &str) {
         for worker in self.endpoints.values() {
             worker
@@ -301,6 +309,48 @@ impl Suite {
         );
     }
 
+    pub fn must_kv_async_commit_prewrite(
+        &mut self,
+        region_id: u64,
+        muts: Vec<Mutation>,
+        pk: Vec<u8>,
+        ts: TimeStamp,
+    ) -> TimeStamp {
+        let mut prewrite_req = PrewriteRequest::default();
+        prewrite_req.set_context(self.get_context(region_id));
+        prewrite_req.use_async_commit = true;
+        prewrite_req.secondaries = muts
+            .iter()
+            .filter_map(|m| {
+                if m.op != Op::Put && m.op != Op::Del && m.op != Op::Insert {
+                    None
+                } else {
+                    Some(m.key)
+                }
+            })
+            .collect();
+        prewrite_req.set_mutations(muts.into());
+        prewrite_req.primary_lock = pk;
+        prewrite_req.start_version = ts.into_inner();
+        prewrite_req.lock_ttl = prewrite_req.start_version + 1;
+        let prewrite_resp = self
+            .get_tikv_client(region_id)
+            .kv_prewrite(&prewrite_req)
+            .unwrap();
+        assert!(
+            !prewrite_resp.has_region_error(),
+            "{:?}",
+            prewrite_resp.get_region_error()
+        );
+        assert!(
+            prewrite_resp.errors.is_empty(),
+            "{:?}",
+            prewrite_resp.get_errors()
+        );
+        assert_ne!(prewrite_resp.min_commit_ts, 0);
+        prewrite_resp.min_commit_ts
+    }
+
     pub fn must_kv_commit(
         &mut self,
         region_id: u64,
@@ -352,6 +402,8 @@ impl Suite {
 mod test {
     use std::time::Duration;
 
+    use br_stream::metadata::MetadataClient;
+
     use crate::make_split_key_at_record;
 
     #[test]
@@ -394,5 +446,22 @@ mod test {
         std::thread::sleep(Duration::from_secs(4));
         suite.check_for_write_records(256, 1, suite.flushed_files.path());
         suite.cluster.shutdown();
+    }
+
+    #[test]
+    fn async_commit() {
+        let mut suite = super::Suite::new("async_commit", 3);
+        suite.must_register_task(1, "test_async_commit");
+
+        suite.write_records(0, 128, 1);
+        suite.just_async_commit_prewrite(128, 1);
+        suite.write_records(130, 128, 1);
+        suite.force_flush_files("test_async_commit");
+        std::thread::sleep(Duration::from_secs(4));
+        let cli = MetadataClient::new(suite.meta_store, 1);
+        assert_eq!(
+            li.global_progress_of_task("test_async_commit").unwrap(),
+            128
+        );
     }
 }
