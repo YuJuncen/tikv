@@ -402,7 +402,7 @@ impl Suite {
 mod test {
     use std::time::Duration;
 
-    use br_stream::metadata::MetadataClient;
+    use backup_stream::metadata::MetadataClient;
 
     use crate::make_split_key_at_record;
 
