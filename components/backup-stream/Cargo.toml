@@ -1,5 +1,5 @@
 [package]
-name = "br-stream"
+name = "backup-stream"
 version = "0.1.0"
 edition = "2018"
 
@@ -16,6 +16,7 @@ failpoints = ["fail/failpoints"]
 
 [dependencies]
 tokio = { version = "1.5", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] } 
 prometheus = { version = "0.13", default-features = false, features = ["nightly"] }
 async-trait = { version = "0.1" }
 thiserror = "1"

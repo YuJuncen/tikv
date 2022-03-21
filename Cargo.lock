@@ -434,6 +434,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "backup-stream"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes 0.4.12",
+ "chrono",
+ "crossbeam",
+ "crossbeam-channel",
+ "dashmap 5.0.0",
+ "engine_panic",
+ "engine_rocks",
+ "engine_traits",
+ "etcd-client",
+ "external_storage",
+ "external_storage_export",
+ "fail 0.4.0",
+ "file_system",
+ "futures 0.3.15",
+ "hex 0.4.2",
+ "kvproto",
+ "lazy_static",
+ "log_wrappers",
+ "online_config",
+ "openssl",
+ "pd_client",
+ "prometheus",
+ "protobuf",
+ "raft",
+ "raftstore",
+ "rand 0.8.3",
+ "regex",
+ "resolved_ts",
+ "slog",
+ "slog-global",
+ "thiserror",
+ "tidb_query_datatype",
+ "tikv",
+ "tikv_alloc",
+ "tikv_util",
+ "tokio",
+ "tokio-stream",
+ "tokio-util 0.7.0",
+ "txn_types",
+ "uuid",
+]
+
+[[package]]
 name = "base64"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -539,52 +586,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f901accdf830d2ea2f4e27f923a5e1125cd8b1a39ab578b9db1a42d578a6922b"
 dependencies = [
  "cmake",
-]
-
-[[package]]
-name = "br-stream"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes 0.4.12",
- "chrono",
- "crossbeam",
- "crossbeam-channel",
- "dashmap 5.0.0",
- "engine_panic",
- "engine_rocks",
- "engine_traits",
- "etcd-client",
- "external_storage",
- "external_storage_export",
- "fail 0.4.0",
- "file_system",
- "futures 0.3.15",
- "hex 0.4.2",
- "kvproto",
- "lazy_static",
- "log_wrappers",
- "online_config",
- "openssl",
- "pd_client",
- "prometheus",
- "protobuf",
- "raft",
- "raftstore",
- "rand 0.8.3",
- "regex",
- "resolved_ts",
- "slog",
- "slog-global",
- "thiserror",
- "tidb_query_datatype",
- "tikv",
- "tikv_alloc",
- "tikv_util",
- "tokio",
- "tokio-stream",
- "txn_types",
- "uuid",
 ]
 
 [[package]]
@@ -1545,7 +1546,7 @@ dependencies = [
  "tikv_alloc",
  "tikv_util",
  "tokio",
- "tokio-util",
+ "tokio-util 0.6.6",
  "url",
 ]
 
@@ -1585,7 +1586,7 @@ dependencies = [
  "tempfile",
  "tikv_util",
  "tokio",
- "tokio-util",
+ "tokio-util 0.6.6",
  "url",
 ]
 
@@ -2132,7 +2133,7 @@ dependencies = [
  "indexmap",
  "slab",
  "tokio",
- "tokio-util",
+ "tokio-util 0.6.6",
  "tracing",
 ]
 
@@ -4763,7 +4764,7 @@ name = "server"
 version = "0.0.1"
 dependencies = [
  "backup",
- "br-stream",
+ "backup-stream",
  "cdc",
  "chrono",
  "clap",
@@ -6129,6 +6130,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-util"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64910e1b9c1901aaf5375561e35b9c057d95ff41a44ede043a03e09279eabaf1"
+dependencies = [
+ "bytes 1.1.0",
+ "futures-core",
+ "futures-io",
+ "futures-sink",
+ "log",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "toml"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6160,7 +6176,7 @@ dependencies = [
  "prost-derive 0.8.0",
  "tokio",
  "tokio-stream",
- "tokio-util",
+ "tokio-util 0.6.6",
  "tower",
  "tower-layer",
  "tower-service",
@@ -6194,7 +6210,7 @@ dependencies = [
  "slab",
  "tokio",
  "tokio-stream",
- "tokio-util",
+ "tokio-util 0.6.6",
  "tower-layer",
  "tower-service",
  "tracing",
