@@ -560,7 +560,7 @@ impl TempFileKey {
 
     fn path_to_log_file(&self, min_ts: u64, max_ts: u64) -> String {
         format!(
-            "t{:08}/{}-{:012}-{}.log",
+            "v1/t{:08}/{}-{:012}-{}.log",
             self.table_id,
             // We may delete a range of files, so using the max_ts for preventing remove some records wrong.
             Self::format_date_time(max_ts),
@@ -571,7 +571,7 @@ impl TempFileKey {
 
     fn path_to_schema_file(min_ts: u64, max_ts: u64) -> String {
         format!(
-            "schema-meta/{}-{:012}-{}.log",
+            "v1/schema-meta/{}-{:012}-{}.log",
             Self::format_date_time(max_ts),
             min_ts,
             uuid::Uuid::new_v4(),
