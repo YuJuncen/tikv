@@ -5647,7 +5647,7 @@ dependencies = [
  "anyhow",
  "codec",
  "collections",
- "fail",
+ "fail 0.5.0",
  "futures 0.3.15",
  "itertools 0.10.0",
  "kvproto",
@@ -6766,7 +6766,7 @@ source = "git+https://github.com/tikv/yatp.git?branch=master#5f3d58002b383bfd001
 dependencies = [
  "crossbeam-deque",
  "dashmap",
- "fail",
+ "fail 0.5.0",
  "lazy_static",
  "num_cpus",
  "parking_lot_core 0.9.1",
