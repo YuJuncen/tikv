@@ -19,7 +19,6 @@ use resolved_ts::Resolver;
 
 use tikv_util::time::Instant;
 
-use crossbeam_channel::tick;
 use tokio::io::Result as TokioResult;
 use tokio::runtime::Runtime;
 use tokio_stream::StreamExt;
@@ -143,10 +142,9 @@ where
     PDC: PdClient + 'static,
 {
     async fn starts_flush_ticks(router: Router) {
-        let ticker = tick(Duration::from_secs(FLUSH_STORAGE_INTERVAL / 5));
         loop {
             // wait 1min to trigger tick
-            let _ = ticker.recv().unwrap();
+            tokio::time::sleep(Duration::from_secs(FLUSH_STORAGE_INTERVAL / 5)).await;
             debug!("backup stream trigger flush tick");
             router.tick().await;
         }
@@ -165,21 +163,20 @@ where
         }
 
         let mut watcher = meta_client.events_from(tasks.revision).await?;
-        loop {
-            if let Some(event) = watcher.stream.next().await {
-                info!("backup stream watch event from etcd"; "event" => ?event);
-                match event {
-                    MetadataEvent::AddTask { task } => {
-                        let t = meta_client.get_task(&task).await?;
-                        scheduler.schedule(Task::WatchTask(TaskOp::AddTask(t)))?;
-                    }
-                    MetadataEvent::RemoveTask { task } => {
-                        scheduler.schedule(Task::WatchTask(TaskOp::RemoveTask(task)))?;
-                    }
-                    MetadataEvent::Error { err } => err.report("metadata client watch meet error"),
+        while let Some(event) = watcher.stream.next().await {
+            info!("backup stream watch event from etcd"; "event" => ?event);
+            match event {
+                MetadataEvent::AddTask { task } => {
+                    let t = meta_client.get_task(&task).await?;
+                    scheduler.schedule(Task::WatchTask(TaskOp::AddTask(t)))?;
                 }
+                MetadataEvent::RemoveTask { task } => {
+                    scheduler.schedule(Task::WatchTask(TaskOp::RemoveTask(task)))?;
+                }
+                MetadataEvent::Error { err } => err.report("metadata client watch meet error"),
             }
         }
+        Ok(())
     }
 
     fn backup_batch(&self, batch: CmdBatch) {
