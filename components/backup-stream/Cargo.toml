@@ -65,3 +65,5 @@ test_util = { path = "../test_util", default-features = false }
 engine_panic = {path = "../engine_panic"}
 walkdir = "2"
 hex = "0.4"
+url = "2"
+async-trait = "0.1"
