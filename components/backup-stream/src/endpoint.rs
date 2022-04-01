@@ -300,7 +300,6 @@ where
             self.router.clone(),
             self.regions.clone(),
             self.range_router.clone(),
-            self.concurrency_manager.clone(),
         )
     }
 
