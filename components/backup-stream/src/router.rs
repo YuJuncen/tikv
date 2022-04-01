@@ -132,14 +132,6 @@ impl ApplyEvents {
                 }
                 continue;
             }
-            // use the key ts as min_ts would be safe.
-            // - if it is uncommitted, the lock would be tracked, preventing resolved ts
-            //   advanced incorrectly.
-            // - if it is committed, it is safe(hopefully) to advance resolved ts to it.
-            //   (Will something like one PC break this?)
-            // note: maybe get this ts from PD? The current implement cannot advance the resolved ts
-            //       if there is no write.
-            resolver.resolve(Key::decode_ts_from(&key).unwrap_or_default());
             let item = ApplyEvent {
                 key,
                 value,

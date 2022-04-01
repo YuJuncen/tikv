@@ -82,6 +82,7 @@ where
         accessor: R,
         router: RT,
         pd_client: Arc<PDC>,
+        cm: ConcurrencyManager,
     ) -> Self {
         let pool = create_tokio_runtime(config.num_threads, "br-stream")
             .expect("failed to create tokio runtime for backup stream worker.");
@@ -122,6 +123,7 @@ where
             router,
             pd_client,
             resolvers: Default::default(),
+            concurrency_manager: cm,
         }
     }
 }
@@ -298,6 +300,7 @@ where
             self.router.clone(),
             self.regions.clone(),
             self.range_router.clone(),
+            self.concurrency_manager.clone(),
         )
     }
 
@@ -419,7 +422,7 @@ where
 
     /// try advance the resolved ts by the pd tso.
     async fn try_resolve(
-        cm: ConcurrencyManager,
+        cm: &ConcurrencyManager,
         pd_client: Arc<PDC>,
         resolvers: Arc<DashMap<u64, Resolver>>,
     ) -> TimeStamp {
@@ -430,6 +433,7 @@ where
             .unwrap_or_default();
         let min_ts = cm.global_min_lock_ts().unwrap_or(TimeStamp::max());
         let tso = Ord::min(pd_tso, min_ts);
+        info!("using tso for resolving"; "min_ts" => %min_ts, "pd_tso" => %pd_tso);
         let new_tso = resolvers
             .as_ref()
             .iter_mut()
@@ -451,7 +455,7 @@ where
         let start = Instant::now_coarse();
         // NOTE: Maybe push down the resolve step to the router?
         //       Or if there are too many duplicated `Flush` command, we may do some useless works.
-        let new_rts = Self::try_resolve(concurrency_manager, pd_cli.clone(), resolvers).await;
+        let new_rts = Self::try_resolve(&concurrency_manager, pd_cli.clone(), resolvers).await;
         metrics::FLUSH_DURATION
             .with_label_values(&["resolve_by_now"])
             .observe(start.saturating_elapsed_secs());
@@ -461,6 +465,7 @@ where
                 // We cannot advance the resolved ts for now.
                 return;
             }
+            concurrency_manager.update_max_ts(TimeStamp::new(rts));
             if let Err(err) = pd_cli
                 .update_service_safe_point(
                     format!("backup-stream-{}-{}", task, store_id),
