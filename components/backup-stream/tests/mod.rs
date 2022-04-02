@@ -440,7 +440,7 @@ mod test {
             // write data before the task starting, for testing incremental scanning.
             let round1 = suite.write_records(0, 128, 1).await;
             suite.must_register_task(1, "test_basic");
-            let round2 = suite.write_records(128, 128, 1).await;
+            let round2 = suite.write_records(256, 128, 1).await;
             suite.force_flush_files("test_basic");
             std::thread::sleep(Duration::from_secs(4));
             suite.check_for_write_records(

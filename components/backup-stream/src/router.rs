@@ -706,10 +706,12 @@ impl StreamTaskInfo {
     pub async fn generate_metadata(&self, store_id: u64) -> Result<MetadataInfo> {
         let w = self.flushing_files.read().await;
         // Let's flush all files first...
-        futures::future::join_all(
-            w.iter()
-                .map(|(_, f)| async move { f.lock().await.inner.flush().await }),
-        )
+        futures::future::join_all(w.iter().map(|(_, f)| async move {
+            let file = &mut f.lock().await.inner;
+            file.flush().await?;
+            file.get_ref().sync_all().await?;
+            Result::Ok(())
+        }))
         .await
         .into_iter()
         .map(|r| r.map_err(Error::from))
