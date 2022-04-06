@@ -265,11 +265,6 @@ impl<T: 'static + StdError> From<RusotoError<T>> for UploadError {
 /// try_read_exact tries to read exact length data as the buffer size.  
 /// like [`std::io::Read::read_exact`], but won't return `UnexpectedEof` when cannot read anything more from the `Read`.  
 /// once returning a size less than the buffer length, implies a EOF was meet, or nothing readed.
-///
-/// # Examples
-/// ```rust
-
-/// ```
 async fn try_read_exact<R: AsyncRead + ?Sized + Unpin>(
     r: &mut R,
     buf: &mut [u8],
