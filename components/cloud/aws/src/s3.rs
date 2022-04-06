@@ -269,15 +269,15 @@ async fn try_read_exact<R: AsyncRead + ?Sized + Unpin>(
     r: &mut R,
     buf: &mut [u8],
 ) -> io::Result<usize> {
-    let mut size_readed = 0;
+    let mut size_read = 0;
     loop {
-        let r = r.read(&mut buf[size_readed..]).await?;
+        let r = r.read(&mut buf[size_read..]).await?;
         if r == 0 {
-            return Ok(size_readed);
+            return Ok(size_read);
         }
-        size_readed += r;
-        if size_readed >= buf.len() {
-            return Ok(size_readed);
+        size_read += r;
+        if size_read >= buf.len() {
+            return Ok(size_read);
         }
     }
 }
