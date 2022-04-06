@@ -910,20 +910,21 @@ mod tests {
         use futures::io::AllowStdIo;
         use std::io::{self, Cursor, Read};
 
-        /// ThrottleRead throttles a `Read` -- make it emits one char for each `read` call.
+        /// ThrottleRead throttles a `Read` -- make it emits 2 chars for each `read` call.
         struct ThrottleRead<R>(R);
         impl<R: Read> Read for ThrottleRead<R> {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-                self.0.read(&mut buf[..1])
+                let idx = buf.len().min(2);
+                self.0.read(&mut buf[..idx])
             }
         }
 
-        let mut data = AllowStdIo::new(ThrottleRead(Cursor::new(b"muthologia")));
+        let mut data = AllowStdIo::new(ThrottleRead(Cursor::new(b"muthologia.")));
         let mut buf = vec![0u8; 6];
         assert_matches!(try_read_exact(&mut data, &mut buf).await, Ok(6));
         assert_eq!(buf, b"muthol");
-        assert_matches!(try_read_exact(&mut data, &mut buf).await, Ok(4));
-        assert_eq!(&buf[..4], b"ogia");
+        assert_matches!(try_read_exact(&mut data, &mut buf).await, Ok(5));
+        assert_eq!(&buf[..5], b"ogia.");
         assert_matches!(try_read_exact(&mut data, &mut buf).await, Ok(0));
     }
 }
