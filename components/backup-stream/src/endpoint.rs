@@ -432,7 +432,7 @@ where
             .unwrap_or_default();
         let min_ts = cm.global_min_lock_ts().unwrap_or(TimeStamp::max());
         let tso = Ord::min(pd_tso, min_ts);
-        info!("using tso for resolving"; "min_ts" => %min_ts, "pd_tso" => %pd_tso);
+        info!("backup stream using tso for resolving"; "min_ts" => %min_ts, "pd_tso" => %pd_tso);
         let new_tso = resolvers
             .as_ref()
             .iter_mut()
