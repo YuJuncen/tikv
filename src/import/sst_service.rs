@@ -878,6 +878,11 @@ fn make_request_header(mut context: Context) -> RaftRequestHeader {
     let mut header = RaftRequestHeader::default();
     header.set_peer(context.take_peer());
     header.set_region_id(region_id);
+    // Set the UUID of header to prevent raftstore batching our requests.
+    // The current `resolved_ts` observer assumes that each batch of request doesn't has
+    // two writes to the same key. (Even with 2 different TS). That was true for normal cases
+    // because the latches reject concurrency write to keys. However we have bypassed the latch layer :(
+    header.set_uuid(uuid::Uuid::new_v4().as_bytes().to_vec());
     header.set_region_epoch(context.take_region_epoch());
     header
 }
