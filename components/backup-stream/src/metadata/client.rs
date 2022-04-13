@@ -8,7 +8,7 @@ use super::{
     },
 };
 
-use kvproto::brpb::StreamBackupTaskInfo;
+use kvproto::brpb::{StreamBackupError, StreamBackupTaskInfo};
 
 use tikv_util::{defer, time::Instant, warn};
 use tokio_stream::StreamExt;
@@ -84,6 +84,38 @@ impl<Store: MetaStore> MetadataClient<Store> {
             meta_store: store,
             store_id,
         }
+    }
+
+    pub async fn report_last_error(&self, name: &str, last_error: StreamBackupError) -> Result<()> {
+        use protobuf::Message;
+        let now = Instant::now();
+        defer! {
+            super::metrics::METADATA_OPERATION_LATENCY.with_label_values(&["task_report_error"]).observe(now.saturating_elapsed_secs())
+        }
+
+        let key = MetaKey::last_error_of(name, self.store_id);
+        let mut value = Vec::with_capacity(last_error.compute_size() as _);
+        last_error.write_to_vec(&mut value)?;
+        self.meta_store.set(KeyValue(key, value)).await?;
+
+        Ok(())
+    }
+
+    pub async fn get_last_error(
+        &self,
+        name: &str,
+        store_id: u64,
+    ) -> Result<Option<StreamBackupError>> {
+        let key = MetaKey::last_error_of(name, store_id);
+
+        let s = self.meta_store.snapshot().await?;
+        let r = s.get(Keys::Key(key)).await?;
+        if r.len() < 1 {
+            return Ok(None);
+        }
+        let r = &r[0];
+        let err = protobuf::parse_from_bytes(r.value())?;
+        Ok(Some(err))
     }
 
     /// query the named task from the meta store.
