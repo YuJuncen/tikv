@@ -1,5 +1,6 @@
-use error_code::ErrorCodeExt;
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
+
+use error_code::ErrorCodeExt;
 use etcd_client::Error as EtcdError;
 use kvproto::errorpb::Error as StoreError;
 use pd_client::Error as PdError;
@@ -51,7 +52,7 @@ impl ErrorCodeExt for Error {
         match self {
             Error::Etcd(_) => ETCD,
             Error::Protobuf(_) => PROTO,
-            Error::NoSuchTask { .. } => NO_SUCK_TASK,
+            Error::NoSuchTask { .. } => NO_SUCH_TASK,
             Error::MalformedMetadata(_) => MALFORMED_META,
             Error::Io(_) => IO,
             Error::Txn(_) => TXN,

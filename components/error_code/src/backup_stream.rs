@@ -10,7 +10,7 @@ define_error_codes! {
         "Error during decode / encoding protocol buffer messages",
         "Please check the version of TiKV / BR are compatible, or whether data is corrupted."
     ),
-    NO_SUCK_TASK => ("NoSuchTask",
+    NO_SUCH_TASK => ("NoSuchTask",
         "A task not found.",
         "Please check the spell of your task name."
     ),
