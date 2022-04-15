@@ -537,7 +537,7 @@ mod test {
             .unwrap();
         let meta_cli = suite.get_meta_cli();
         // NOTE: maybe implement some message like `Sync` for get rid of those magic wait?
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(2));
         let err = run_async_test(meta_cli.get_last_error("test_fatal_error", *victim))
             .unwrap()
             .unwrap();
@@ -545,5 +545,7 @@ mod test {
         assert_eq!(err.error_code, error_code::backup_stream::OTHER.code);
         assert!(err.error_message.find("everything is alright").is_some());
         assert_eq!(err.store_id, *victim);
+        let paused = run_async_test(meta_cli.check_task_paused("test_fatal_error")).unwrap();
+        assert!(paused)
     }
 }

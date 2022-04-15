@@ -227,12 +227,17 @@ where
         let sched = self.scheduler.clone();
         self.pool.block_on(async move {
             // TODO: also pause the task using the meta client.
-            let mut last_error = StreamBackupError::new();
-            last_error.set_error_code(err.error_code().code.to_owned());
-            last_error.set_error_message(err.to_string());
-            last_error.set_store_id(store_id);
-            last_error.set_happen_at(TimeStamp::physical_now());
-            if let Err(err_report) = meta_cli.report_last_error(&task, last_error).await {
+            let err_fut = async {
+                meta_cli.pause(&task).await?;
+                let mut last_error = StreamBackupError::new();
+                last_error.set_error_code(err.error_code().code.to_owned());
+                last_error.set_error_message(err.to_string());
+                last_error.set_store_id(store_id);
+                last_error.set_happen_at(TimeStamp::physical_now());
+                meta_cli.report_last_error(&task, last_error).await?;
+                Result::Ok(())
+            };
+            if let Err(err_report) = err_fut.await {
                 err_report.report(format_args!("failed to upload error {}", err_report));
                 // Let's retry reporting after 5s.
                 tokio::task::spawn(async move {

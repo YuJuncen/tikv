@@ -166,6 +166,14 @@ impl<Store: MetaStore> MetadataClient<Store> {
         Ok(!kvs.is_empty())
     }
 
+    /// pause a task.
+    pub async fn pause(&self, name: &str) -> Result<()> {
+        Ok(self
+            .meta_store
+            .set(KeyValue(MetaKey::pause_of(name), vec![]))
+            .await?)
+    }
+
     pub async fn get_tasks_pause_status(&self) -> Result<HashMap<Vec<u8>, bool>> {
         let snap = self.meta_store.snapshot().await?;
         let kvs = snap.get(Keys::Prefix(MetaKey::pause_prefix())).await?;
