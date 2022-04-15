@@ -68,17 +68,6 @@ pub struct Endpoint<S: MetaStore + 'static, R, E, RT, PDC> {
     concurrency_manager: ConcurrencyManager,
 }
 
-enum TrackStatus {
-    InitialScanning,
-    Observing,
-}
-
-struct TrackingRegion {
-    resolver: Resolver,
-    observer: ObserveHandle,
-    status: TrackStatus,
-}
-
 impl<S, R, E, RT, PDC> Endpoint<S, R, E, RT, PDC>
 where
     R: RegionInfoProvider + 'static + Clone,

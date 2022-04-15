@@ -1398,10 +1398,6 @@ mod tests {
                 }),
             }
         }
-
-        fn into_inner(self) -> Inner {
-            self.inner
-        }
     }
 
     #[async_trait::async_trait]
