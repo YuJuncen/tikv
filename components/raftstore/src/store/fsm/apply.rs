@@ -3067,6 +3067,7 @@ impl Debug for GenSnapTask {
 pub struct ChangeObserver {
     cdc_id: Option<ObserveHandle>,
     rts_id: Option<ObserveHandle>,
+    pitr_id: Option<ObserveHandle>,
     region_id: u64,
 }
 
@@ -3075,6 +3076,7 @@ impl ChangeObserver {
         Self {
             cdc_id: Some(id),
             rts_id: None,
+            pitr_id: None,
             region_id,
         }
     }
@@ -3083,6 +3085,16 @@ impl ChangeObserver {
         Self {
             cdc_id: None,
             rts_id: Some(id),
+            pitr_id: None,
+            region_id,
+        }
+    }
+
+    pub fn from_pitr(region_id: u64, id: ObserveHandle) -> Self {
+        Self {
+            cdc_id: None,
+            rts_id: None,
+            pitr_id: Some(id),
             region_id,
         }
     }
@@ -3520,6 +3532,7 @@ where
         let ChangeObserver {
             cdc_id,
             rts_id,
+            pitr_id,
             region_id,
         } = cmd;
 
@@ -3544,6 +3557,20 @@ where
                     format!(
                         "stale observe id {:?}, current id: {:?}",
                         id, self.delegate.observe_info.rts_id.id
+                    ),
+                    cb,
+                );
+                return;
+            }
+        }
+
+        if let Some(ObserveHandle { id, .. }) = pitr_id {
+            if self.delegate.observe_info.pitr_id.id > id {
+                notify_stale_req_with_msg(
+                    self.delegate.term,
+                    format!(
+                        "stale observe id {:?}, current id: {:?}",
+                        id, self.delegate.observe_info.pitr_id.id
                     ),
                     cb,
                 );
@@ -3589,6 +3616,9 @@ where
         }
         if let Some(id) = rts_id {
             self.delegate.observe_info.rts_id = id;
+        }
+        if let Some(id) = pitr_id {
+            self.delegate.observe_info.pitr_id = id;
         }
 
         cb.invoke_read(resp);
@@ -5425,6 +5455,7 @@ mod tests {
                 cmd: ChangeObserver {
                     cdc_id: Some(observe_handle.clone()),
                     rts_id: Some(observe_handle.clone()),
+                    pitr_id: Some(observe_handle.clone()),
                     region_id: 1,
                 },
                 cb: Callback::Read(Box::new(|resp: ReadResponse<KvTestSnapshot>| {
@@ -5441,6 +5472,7 @@ mod tests {
         let cmd_batch = cmdbatch_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(cmd_batch.cdc_id, ObserveHandle::with_id(0).id);
         assert_eq!(cmd_batch.rts_id, ObserveHandle::with_id(0).id);
+        assert_eq!(cmd_batch.pitr_id, ObserveHandle::with_id(0).id);
 
         let (capture_tx, capture_rx) = mpsc::channel();
         let put_entry = EntryBuilder::new(3, 2)
@@ -5463,6 +5495,7 @@ mod tests {
         let cmd_batch = cmdbatch_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(cmd_batch.cdc_id, observe_handle.id);
         assert_eq!(cmd_batch.rts_id, observe_handle.id);
+        assert_eq!(cmd_batch.pitr_id, observe_handle.id);
         assert_eq!(resp, cmd_batch.into_iter(1).next().unwrap().response);
 
         let put_entry1 = EntryBuilder::new(4, 2)
@@ -5498,6 +5531,7 @@ mod tests {
                 cmd: ChangeObserver {
                     cdc_id: Some(observe_handle.clone()),
                     rts_id: Some(observe_handle),
+                    pitr_id: None,
                     region_id: 2,
                 },
                 cb: Callback::Read(Box::new(|resp: ReadResponse<_>| {
@@ -5674,6 +5708,7 @@ mod tests {
                 cmd: ChangeObserver {
                     cdc_id: Some(observe_handle.clone()),
                     rts_id: Some(observe_handle.clone()),
+                    pitr_id: None,
                     region_id: 1,
                 },
                 cb: Callback::Read(Box::new(|resp: ReadResponse<_>| {
@@ -5833,6 +5868,7 @@ mod tests {
                 cmd: ChangeObserver {
                     cdc_id: Some(observe_handle.clone()),
                     rts_id: Some(observe_handle),
+                    pitr_id: None,
                     region_id: 1,
                 },
                 cb: Callback::Read(Box::new(move |resp: ReadResponse<_>| {
