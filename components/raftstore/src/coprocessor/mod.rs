@@ -398,7 +398,6 @@ mod tests {
             ObserveHandle::new(),
             ObserveHandle::new(),
         );
-        observe_info.pitr_id.stop_observing();
         assert_eq!(observe_info.observe_level(), ObserveLevel::All);
 
         // No observer
