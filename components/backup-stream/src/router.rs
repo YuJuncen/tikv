@@ -895,8 +895,11 @@ impl StreamTaskInfo {
             // flush log file to storage.
             self.flush_log().await?;
 
-            let file_len = metadata_info.files.len();
-            let file_size = metadata_info.files.iter().fold(0, |a, d| a + d.length);
+            let file_size_vec = metadata_info
+                .files
+                .iter()
+                .map(|d| d.length)
+                .collect::<Vec<_>>();
             // flush meta file to storage.
             self.flush_meta(metadata_info).await?;
             crate::metrics::FLUSH_DURATION
@@ -908,10 +911,12 @@ impl StreamTaskInfo {
             crate::metrics::FLUSH_DURATION
                 .with_label_values(&["clear_temp_files"])
                 .observe(sw.lap().as_secs_f64());
-
+            file_size_vec
+                .iter()
+                .for_each(|size| crate::metrics::FLUSH_FILE_SIZE.observe(*size as _));
             info!("log backup flush done";
-                "files" => %file_len,
-                "total_size" => %file_size,
+                "files" => %file_size_vec.len(),
+                "total_size" => %file_size_vec.iter().sum::<u64>(),
                 "take" => ?begin.saturating_elapsed(),
             );
             Ok(rts)

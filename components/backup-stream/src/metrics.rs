@@ -60,10 +60,39 @@ lazy_static! {
         exponential_buckets(1.0, 2.0, 16).unwrap()
     )
     .unwrap();
+    pub static ref FLUSH_FILE_SIZE: Histogram = register_histogram!(
+        "tikv_stream_flush_file_size",
+        "Some statistics of flushing of this run.",
+        exponential_buckets(1024.0, 2.0, 16).unwrap()
+    )
+    .unwrap();
     pub static ref INITIAL_SCAN_DURATION: Histogram = register_histogram!(
-        "tikv_stream_initial_scan_duration",
+        "tikv_stream_initial_scan_duration_sec",
         "The duration of initial scanning.",
         exponential_buckets(0.001, 2.0, 16).unwrap()
+    )
+    .unwrap();
+    pub static ref SKIP_RETRY: IntCounterVec = register_int_counter_vec!(
+        "tikv_stream_skip_retry_observe",
+        "The reason of giving up observing region when meeting error.",
+        &["reason"],
+    )
+    .unwrap();
+    pub static ref INITIAL_SCAN_STAT: IntCounterVec = register_int_counter_vec!(
+        "tikv_stream_initial_scan_operations",
+        "The operations over rocksdb during initial scanning.",
+        &["cf", "op"],
+    )
+    .unwrap();
+    pub static ref STREAM_ENABLED: IntCounter = register_int_counter!(
+        "tikv_stream_enabled",
+        "When gt 0, this node enabled streaming."
+    )
+    .unwrap();
+    pub static ref TRACK_REGION: IntCounterVec = register_int_counter_vec!(
+        "tikv_stream_observed_region",
+        "the region being observed by the current store.",
+        &["type"],
     )
     .unwrap();
 }

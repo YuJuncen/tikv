@@ -14,6 +14,7 @@ use kvproto::raft_cmdpb::{CmdType, Request};
 use raft::StateRole;
 use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
 
+use tikv::storage::CfStatistics;
 use tikv_util::{box_err, time::Instant, warn, Either};
 use tokio::sync::{Mutex, RwLock};
 use txn_types::Key;
@@ -328,6 +329,43 @@ macro_rules! debug {
             tikv_util::debug!(#"backup-stream", $($t)+)
         }
     };
+}
+
+macro_rules! record_fields {
+    ($m:expr,$cf:expr,$stat:expr, [ $($s:ident),+ ]) => {
+        {
+            let m = &$m;
+            let cf = &$cf;
+            let stat = &$stat;
+            $( m.with_label_values(&[cf, stringify!($s)]).inc_by(stat.$s as _) );+
+        }
+    };
+}
+
+pub fn record_cf_stat(cf_name: &str, stat: &CfStatistics) {
+    let m = &crate::metrics::INITIAL_SCAN_STAT;
+    m.with_label_values(&[cf_name, "read_bytes"])
+        .inc_by(stat.flow_stats.read_bytes as _);
+    m.with_label_values(&[cf_name, "read_keys"])
+        .inc_by(stat.flow_stats.read_keys as _);
+    record_fields!(
+        m,
+        cf_name,
+        stat,
+        [
+            get,
+            next,
+            prev,
+            seek,
+            seek_for_prev,
+            over_seek_bound,
+            next_tombstone,
+            prev_tombstone,
+            seek_tombstone,
+            seek_for_prev_tombstone,
+            ttl_tombstone
+        ]
+    );
 }
 
 #[cfg(test)]

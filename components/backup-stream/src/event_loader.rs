@@ -1,12 +1,12 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Duration};
 
 use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 
 use futures::executor::block_on;
 use raftstore::{
-    coprocessor::{ObserveHandle, RegionInfoProvider},
+    coprocessor::{RegionInfoProvider},
     router::RaftStoreRouter,
     store::{fsm::ChangeObserver, Callback, SignificantMsg},
 };
@@ -14,18 +14,20 @@ use raftstore::{
 use tikv::storage::{
     kv::StatisticsSummary,
     mvcc::{DeltaScanner, ScannerBuilder},
-    txn::{EntryBatch, TxnEntry, TxnEntryScanner},
-    Snapshot, Statistics,
+    txn::{EntryBatch, TxnEntry, TxnEntryScanner}, Snapshot, Statistics,
 };
-use tikv_util::{box_err, time::Instant, warn};
+use tikv_util::{box_err, time::Instant, warn, worker::Scheduler};
 use txn_types::{Key, Lock, TimeStamp};
 
 use crate::{
     annotate, debug,
+    endpoint::ObserveOp,
     errors::{ContextualResultExt, Error, Result},
     router::ApplyEvent,
     subscription_track::{SubscriptionTracer, TwoPhaseResolver},
+    try_send,
     utils::{self, RegionPager},
+    Task,
 };
 use crate::{
     metrics,
@@ -135,6 +137,7 @@ pub struct InitialDataLoader<E, R, RT> {
     //       method `async (KvEvent) -> Result<()>`?
     sink: Router,
     tracing: SubscriptionTracer,
+    scheduler: Scheduler<Task>,
 
     _engine: PhantomData<E>,
 }
@@ -145,12 +148,19 @@ where
     R: RegionInfoProvider + Clone + 'static,
     RT: RaftStoreRouter<E>,
 {
-    pub fn new(router: RT, regions: R, sink: Router, tracing: SubscriptionTracer) -> Self {
+    pub fn new(
+        router: RT,
+        regions: R,
+        sink: Router,
+        tracing: SubscriptionTracer,
+        sched: Scheduler<Task>,
+    ) -> Self {
         Self {
             router,
             regions,
             sink,
             tracing,
+            scheduler: sched,
             _engine: PhantomData,
         }
     }
@@ -187,6 +197,7 @@ where
                     if !can_retry {
                         break;
                     }
+                    std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
             }
@@ -326,14 +337,8 @@ where
     }
 
     /// initialize a range: it simply scan the regions with leader role and send them to [`initialize_region`].
-    pub fn initialize_range(
-        &self,
-        start_key: Vec<u8>,
-        end_key: Vec<u8>,
-        start_ts: TimeStamp,
-    ) -> Result<Statistics> {
+    pub fn initialize_range(&self, start_key: Vec<u8>, end_key: Vec<u8>) -> Result<()> {
         let mut pager = RegionPager::scan_from(self.regions.clone(), start_key, end_key);
-        let mut total_stat = StatisticsSummary::default();
         loop {
             let regions = pager.next_page(8)?;
             debug!("scanning for entries in region."; "regions" => ?regions);
@@ -341,17 +346,19 @@ where
                 break;
             }
             for r in regions {
-                let handle = ObserveHandle::new();
-                self.tracing
-                    .register_region(&r.region, handle.clone(), Some(start_ts));
-                let region_id = r.region.get_id();
-                let snap = self.observe_over_with_retry(&r.region, move || {
-                    ChangeObserver::from_cdc(region_id, handle.clone())
-                })?;
-                let stat = self.do_initial_scan(&r.region, start_ts, snap)?;
-                total_stat.add_statistics(&stat);
+                // Note: Even we did the initial scanning, and blocking resolved ts from advancing,
+                //       if the next_backup_ts was updated in some extreme condition, there is still little chance to lost data:
+                //       For example, if a region cannot elect the leader for long time. (say, net work partition)
+                //       At that time, we have nowhere to record the lock status of this region.
+                try_send!(
+                    self.scheduler,
+                    Task::ModifyObserve(ObserveOp::Start {
+                        region: r.region,
+                        needs_initial_scanning: true
+                    })
+                );
             }
         }
-        Ok(total_stat.stat)
+        Ok(())
     }
 }
