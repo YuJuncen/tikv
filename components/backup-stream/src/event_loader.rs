@@ -6,7 +6,7 @@ use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 
 use futures::executor::block_on;
 use raftstore::{
-    coprocessor::{RegionInfoProvider},
+    coprocessor::RegionInfoProvider,
     router::RaftStoreRouter,
     store::{fsm::ChangeObserver, Callback, SignificantMsg},
 };
@@ -14,7 +14,8 @@ use raftstore::{
 use tikv::storage::{
     kv::StatisticsSummary,
     mvcc::{DeltaScanner, ScannerBuilder},
-    txn::{EntryBatch, TxnEntry, TxnEntryScanner}, Snapshot, Statistics,
+    txn::{EntryBatch, TxnEntry, TxnEntryScanner},
+    Snapshot, Statistics,
 };
 use tikv_util::{box_err, time::Instant, warn, worker::Scheduler};
 use txn_types::{Key, Lock, TimeStamp};
@@ -294,11 +295,14 @@ where
             }
             stats.add_statistics(&stat);
             let sink = self.sink.clone();
-            metrics::INCREMENTAL_SCAN_SIZE.observe(events.size() as f64);
+            let event_size = events.size();
+            metrics::INCREMENTAL_SCAN_SIZE.observe(event_size as f64);
+            metrics::HEAP_MEMORY.add(event_size as _);
             join_handles.push(tokio::spawn(async move {
                 if let Err(err) = sink.on_events(events).await {
                     warn!("failed to send event to sink"; "err" => %err);
                 }
+                metrics::HEAP_MEMORY.sub(event_size as _);
             }));
         }
     }

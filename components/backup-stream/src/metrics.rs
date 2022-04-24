@@ -34,10 +34,9 @@ lazy_static! {
         &["type"]
     )
     .unwrap();
-    pub static ref HEAP_MEMORY: CounterVec = register_counter_vec!(
+    pub static ref HEAP_MEMORY: IntGauge = register_int_gauge!(
         "tikv_stream_heap_memory",
-        "The heap memory allocating by stream backup.",
-        &["type"]
+        "The heap memory allocating by stream backup."
     )
     .unwrap();
     pub static ref ON_EVENT_COST_HISTOGRAM: HistogramVec = register_histogram_vec!(

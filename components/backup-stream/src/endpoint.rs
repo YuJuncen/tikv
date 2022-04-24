@@ -370,14 +370,12 @@ where
             let kv_count = kvs.len();
             let total_size = kvs.size();
             metrics::HEAP_MEMORY
-                .with_label_values(&["alloc"])
-                .inc_by(total_size as f64);
+                .add(total_size as _);
             if let Err(err) = router.on_events(kvs).await {
                 err.report("failed to send event.");
             }
             metrics::HEAP_MEMORY
-                .with_label_values(&["free"])
-                .inc_by(total_size as f64);
+                .sub(total_size as _);
             HANDLE_KV_HISTOGRAM.observe(kv_count as _);
             let time_cost = sw.lap().as_secs_f64();
             if time_cost > SLOW_EVENT_THRESHOLD {
