@@ -637,7 +637,7 @@ where
         let region_id = region.get_id();
         self.subs.register_region(region, handle.clone(), None);
         init.observe_over_with_retry(region, || {
-            ChangeObserver::from_cdc(region_id, handle.clone())
+            ChangeObserver::from_pitr(region_id, handle.clone())
         })?;
         Ok(())
     }
@@ -660,7 +660,7 @@ where
 
         let region_id = region.get_id();
         let snap = init.observe_over_with_retry(region, move || {
-            ChangeObserver::from_cdc(region_id, handle.clone())
+            ChangeObserver::from_pitr(region_id, handle.clone())
         })?;
         let region = region.clone();
 
