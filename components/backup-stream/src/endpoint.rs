@@ -802,7 +802,9 @@ where
                     region.get_id()
                 )
             })?;
-        let new_region_info = rx.recv().expect("BUG: unexpected channel closed");
+        let new_region_info = rx
+            .recv()
+            .map_err(|err| annotate!(err, "BUG?: unexpected channel message dropped."))?;
         if new_region_info.is_none() {
             metrics::SKIP_RETRY
                 .with_label_values(&["region-absent"])
