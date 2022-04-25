@@ -682,10 +682,12 @@ impl StreamTaskInfo {
         let mut w = self.files.write().await;
         // double check before insert. there may be someone already insert that
         // when we are waiting for the write lock.
+        // slience the lint advising us to use the `Entry` API which may introduce copying.
+        #[allow(clippy::map_entry)]
         if !w.contains_key(&key) {
             let path = self.temp_dir.join(key.temp_file_name());
             let val = Mutex::new(DataFile::new(path).await?);
-            w.insert(key.clone(), val);
+            w.insert(key, val);
         }
 
         let f = w.get(&key).unwrap();

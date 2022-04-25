@@ -131,7 +131,7 @@ impl SubscriptionTracer {
         let region_id = region.get_id();
         let remove_result = self
             .0
-            .remove_if(&region_id, |_, old_region| if_cond(&old_region, region));
+            .remove_if(&region_id, |_, old_region| if_cond(old_region, region));
         match remove_result {
             Some(o) => {
                 TRACK_REGION.with_label_values(&["dec"]).inc();
@@ -190,7 +190,10 @@ impl SubscriptionTracer {
         exists && still_observing
     }
 
-    pub fn get_subscription_of(&self, region_id: u64) -> Option<RefMut<u64, RegionSubscription>> {
+    pub fn get_subscription_of(
+        &self,
+        region_id: u64,
+    ) -> Option<RefMut<'_, u64, RegionSubscription>> {
         self.0.get_mut(&region_id)
     }
 }

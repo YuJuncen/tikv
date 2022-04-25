@@ -328,7 +328,10 @@ where
                     warn!("failed to join task."; "err" => %err);
                 }
             }
-            if let Err(err) = Self::with_resolver_by(&tr, region_id, |r| Ok(r.phase_one_done())) {
+            if let Err(err) = Self::with_resolver_by(&tr, region_id, |r| {
+                r.phase_one_done();
+                Ok(())
+            }) {
                 err.report(format_args!(
                     "failed to finish phase 1 for region {:?}",
                     region_id

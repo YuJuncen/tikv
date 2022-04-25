@@ -223,6 +223,7 @@ where
     fn on_fatal_error(&self, task: String, err: Box<Error>) {
         // Let's pause the task locally first.
         self.on_unregister(&task);
+        err.report(format_args!("fatal for task {}", err));
 
         let meta_cli = self.get_meta_client();
         let store_id = self.store_id;
@@ -634,7 +635,7 @@ where
     fn observe_over(&self, region: &Region, handle: ObserveHandle) -> Result<()> {
         let init = self.make_initial_loader();
         let region_id = region.get_id();
-        self.subs.register_region(&region, handle.clone(), None);
+        self.subs.register_region(region, handle.clone(), None);
         init.observe_over_with_retry(region, || {
             ChangeObserver::from_cdc(region_id, handle.clone())
         })?;
@@ -655,7 +656,7 @@ where
                 .block_on(meta_cli.global_progress_of_task(&task))?,
         );
         self.subs
-            .register_region(&region, handle.clone(), Some(last_checkpoint));
+            .register_region(region, handle.clone(), Some(last_checkpoint));
 
         let region_id = region.get_id();
         let snap = init.observe_over_with_retry(region, move || {
@@ -708,20 +709,20 @@ where
                 });
             }
             ObserveOp::RefreshResolver { ref region } => {
-                let need_refresh_all = !self.subs.try_update_region(&region);
+                let need_refresh_all = !self.subs.try_update_region(region);
 
                 if need_refresh_all {
                     let canceled = self.subs.deregister_region(region, |_, _| true);
                     let handle = ObserveHandle::new();
                     if canceled {
-                        let for_task = self.find_task_by_region(&region).unwrap_or_else(|| {
+                        let for_task = self.find_task_by_region(region).unwrap_or_else(|| {
                             panic!(
                                 "BUG: the region {:?} is register to no task but being observed",
                                 region
                             )
                         });
                         if let Err(e) = self.observe_over_with_initial_data_from_checkpoint(
-                            &region,
+                            region,
                             for_task,
                             handle.clone(),
                         ) {
@@ -816,14 +817,17 @@ where
             metrics::SKIP_RETRY.with_label_values(&["not-leader"]).inc();
             return Ok(());
         }
-        if !self.subs.deregister_region(&region, |old, _| {
+        let removed = self.subs.deregister_region(&region, |old, _| {
             let should_remove = old.handle().id == handle.id;
             if !should_remove {
                 warn!("stale retry command"; "region" => ?region, "handle" => ?handle, "old_handle" => ?old.handle());
             }
             should_remove
-        }) {
-            metrics::SKIP_RETRY.with_label_values(&["stale-command"]).inc();
+        });
+        if !removed {
+            metrics::SKIP_RETRY
+                .with_label_values(&["stale-command"])
+                .inc();
             return Ok(());
         }
         self.start_observe(region, true);
