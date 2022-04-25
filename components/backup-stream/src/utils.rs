@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use crate::errors::{Error, Result};
+use crate::{
+    errors::{Error, Result},
+    Task,
+};
 
 use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use futures::{channel::mpsc, executor::block_on, StreamExt};
@@ -15,7 +18,7 @@ use raft::StateRole;
 use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
 
 use tikv::storage::CfStatistics;
-use tikv_util::{box_err, time::Instant, warn, Either};
+use tikv_util::{box_err, time::Instant, warn, worker::Scheduler, Either};
 use tokio::sync::{Mutex, RwLock};
 use txn_types::Key;
 
@@ -182,6 +185,11 @@ impl<K: Ord, V: Default> SegmentMap<K, V> {
 }
 
 impl<K: Ord, V> SegmentMap<K, V> {
+    /// Remove all records in the map.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
     /// Like `add`, but insert a value associated to the key.
     pub fn insert(&mut self, (start, end): (K, K), value: V) -> bool {
         if self.is_overlapping((&start, &end)) {
@@ -332,7 +340,7 @@ macro_rules! debug {
 }
 
 macro_rules! record_fields {
-    ($m:expr,$cf:expr,$stat:expr, [ $($s:ident),+ ]) => {
+    ($m:expr,$cf:expr,$stat:expr, [ $(.$s:ident),+ ]) => {
         {
             let m = &$m;
             let cf = &$cf;
@@ -353,19 +361,34 @@ pub fn record_cf_stat(cf_name: &str, stat: &CfStatistics) {
         cf_name,
         stat,
         [
-            get,
-            next,
-            prev,
-            seek,
-            seek_for_prev,
-            over_seek_bound,
-            next_tombstone,
-            prev_tombstone,
-            seek_tombstone,
-            seek_for_prev_tombstone,
-            ttl_tombstone
+            .get,
+            .next,
+            .prev,
+            .seek,
+            .seek_for_prev,
+            .over_seek_bound,
+            .next_tombstone,
+            .prev_tombstone,
+            .seek_tombstone,
+            .seek_for_prev_tombstone,
+            .ttl_tombstone
         ]
     );
+}
+
+/// a shortcut for handing the result return from `Router::on_events`, when any faliure, send a fatal error to the `doom_messenger`.
+pub fn handle_on_event_result(doom_messenger: &Scheduler<Task>, result: Vec<(String, Result<()>)>) {
+    for (task, res) in result.into_iter() {
+        if let Err(err) = res {
+            try_send!(
+                doom_messenger,
+                Task::FatalError(
+                    task,
+                    Box::new(err.context("failed to record event to local temporary files"))
+                )
+            );
+        }
+    }
 }
 
 #[cfg(test)]

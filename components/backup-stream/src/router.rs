@@ -16,7 +16,7 @@ use std::{
 use crate::{
     annotate,
     endpoint::Task,
-    errors::Error,
+    errors::{ContextualResultExt, Error},
     metadata::StreamTask,
     metrics::SKIP_KV_COUNTER,
     subscription_track::TwoPhaseResolver,
@@ -434,13 +434,13 @@ impl RouterInner {
         Ok(())
     }
 
-    pub async fn on_events(&self, kv: ApplyEvents) -> Result<()> {
+    pub async fn on_events(&self, kv: ApplyEvents) -> Vec<(String, Result<()>)> {
+        use futures::FutureExt;
         let partitioned_events = kv.partition_by_range(&self.ranges.rl());
         let tasks = partitioned_events
             .into_iter()
-            .map(|(task, events)| self.on_event(task, events));
-        futures::future::try_join_all(tasks).await?;
-        Ok(())
+            .map(|(task, events)| self.on_event(task.clone(), events).map(move |r| (task, r)));
+        futures::future::join_all(tasks).await
     }
 
     /// flush the specified task, once once success, return the min resolved ts of this flush.
@@ -497,13 +497,13 @@ impl RouterInner {
 }
 
 /// The handle of a temporary file.
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 struct TempFileKey {
-    is_meta: bool,
     table_id: i64,
     region_id: u64,
     cf: CfName,
     cmd_type: CmdType,
+    is_meta: bool,
 }
 
 impl TempFileKey {
@@ -663,7 +663,8 @@ impl StreamTaskInfo {
             flushing_files: RwLock::default(),
             last_flush_time: AtomicPtr::new(Box::into_raw(Box::new(Instant::now()))),
             // TODO make this config set by config or task?
-            flush_interval: Duration::from_secs(FLUSH_STORAGE_INTERVAL),
+            // Keep `0.2 * FLUSH_STORAGE_INTERVAL` for doing flushing.
+            flush_interval: Duration::from_secs((FLUSH_STORAGE_INTERVAL as f64 * 0.8).round() as _),
             total_size: AtomicUsize::new(0),
             flushing: AtomicBool::new(false),
             flush_fail_count: AtomicUsize::new(0),
@@ -696,12 +697,14 @@ impl StreamTaskInfo {
     /// Append a event to the files. This wouldn't trigger `fsync` syscall.
     /// i.e. No guarantee of persistence.
     pub async fn on_events(&self, kv: ApplyEvents) -> Result<()> {
+        use futures::FutureExt;
         let now = Instant::now_coarse();
-        futures::future::try_join_all(
-            kv.partition_by_table_key()
-                .into_iter()
-                .map(|(key, events)| self.on_events_of_key(key, events)),
-        )
+        futures::future::try_join_all(kv.partition_by_table_key().into_iter().map(
+            |(key, events)| {
+                self.on_events_of_key(key, events)
+                    .map(move |r| r.context(format_args!("when handling the file key {:?}", key)))
+            },
+        ))
         .await?;
         crate::metrics::ON_EVENT_COST_HISTOGRAM
             .with_label_values(&["write_to_tempfile"])
@@ -1291,6 +1294,14 @@ mod tests {
             .expect("failed to register task")
     }
 
+    fn check_on_events_result(item: &Vec<(String, Result<()>)>) {
+        for (task, r) in item {
+            if let Err(err) = r {
+                panic!("task {} failed: {}", task, err);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_basic_file() -> Result<()> {
         test_util::init_log_for_test();
@@ -1312,7 +1323,7 @@ mod tests {
         region1.put_table(CF_WRITE, 1, b"hello", b"still isn't a write record :3");
         region1.delete_table(CF_DEFAULT, 1, b"hello");
         let events = region1.flush_events();
-        router.on_events(events).await?;
+        check_on_events_result(&router.on_events(events).await);
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let end_ts = TimeStamp::physical_now();
@@ -1461,14 +1472,14 @@ mod tests {
                 i.storage = Arc::new(ErrorStorage::with_first_time_error(i.storage.clone()))
             })
             .await;
-        router.on_events(build_kv_event(0, 10)).await.unwrap();
+        check_on_events_result(&router.on_events(build_kv_event(0, 10)).await);
         assert!(
             router
                 .do_flush("error_prone", 42, TimeStamp::max())
                 .await
                 .is_none()
         );
-        router.on_events(build_kv_event(10, 10)).await.unwrap();
+        check_on_events_result(&router.on_events(build_kv_event(10, 10)).await);
         let _ = router.do_flush("error_prone", 42, TimeStamp::max()).await;
         let t = router.get_task_info("error_prone").await.unwrap();
         assert_eq!(t.total_size(), 0);
@@ -1516,7 +1527,7 @@ mod tests {
             })
             .await;
         for i in 0..=16 {
-            router.on_events(build_kv_event(i * 10, 10)).await.unwrap();
+            check_on_events_result(&router.on_events(build_kv_event(i * 10, 10)).await);
             assert_eq!(
                 router
                     .do_flush("flush_failure", 42, TimeStamp::zero())

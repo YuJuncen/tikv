@@ -63,6 +63,11 @@ impl RegionSubscription {
 }
 
 impl SubscriptionTracer {
+    /// clear the current `SubscriptionTracer`.
+    pub fn clear(&self) {
+        self.0.clear();
+    }
+
     // Register a region as tracing.
     // The `start_ts` is used to tracking the progress of initial scanning.
     // (Note: the `None` case of `start_ts` is for testing / refresh region status when split / merge,

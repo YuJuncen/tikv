@@ -296,12 +296,11 @@ where
             stats.add_statistics(&stat);
             let sink = self.sink.clone();
             let event_size = events.size();
+            let sched = self.scheduler.clone();
             metrics::INCREMENTAL_SCAN_SIZE.observe(event_size as f64);
             metrics::HEAP_MEMORY.add(event_size as _);
             join_handles.push(tokio::spawn(async move {
-                if let Err(err) = sink.on_events(events).await {
-                    warn!("failed to send event to sink"; "err" => %err);
-                }
+                utils::handle_on_event_result(&sched, sink.on_events(events).await);
                 metrics::HEAP_MEMORY.sub(event_size as _);
             }));
         }

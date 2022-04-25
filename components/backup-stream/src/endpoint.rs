@@ -252,8 +252,9 @@ where
 
     async fn starts_flush_ticks(router: Router) {
         loop {
-            // wait 1min to trigger tick
-            tokio::time::sleep(Duration::from_secs(FLUSH_STORAGE_INTERVAL / 5)).await;
+            // check every 15s.
+            // TODO: maybe use global timer handle in the `tikv_utils::timer` (instead of enabling timing in the current runtime)?
+            tokio::time::sleep(Duration::from_secs(FLUSH_STORAGE_INTERVAL / 20)).await;
             debug!("backup stream trigger flush tick");
             router.tick().await;
         }
@@ -352,6 +353,7 @@ where
                 return;
             }
         };
+        let sched = self.scheduler.clone();
 
         let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut().resolver());
         drop(resolver);
@@ -371,9 +373,7 @@ where
             let total_size = kvs.size();
             metrics::HEAP_MEMORY
                 .add(total_size as _);
-            if let Err(err) = router.on_events(kvs).await {
-                err.report("failed to send event.");
-            }
+            utils::handle_on_event_result(&sched, router.on_events(kvs).await);
             metrics::HEAP_MEMORY
                 .sub(total_size as _);
             HANDLE_KV_HISTOGRAM.observe(kv_count as _);
@@ -521,6 +521,10 @@ where
         self.pool.block_on(async move {
             router.unregister_task(task).await;
         });
+        // for now, we support one concurrent task only.
+        // so simply clear all info would be fine.
+        self.subs.clear();
+        self.observer.ranges.wl().clear();
     }
 
     /// try advance the resolved ts by the pd tso.
