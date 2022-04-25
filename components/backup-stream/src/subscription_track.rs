@@ -65,7 +65,11 @@ impl RegionSubscription {
 impl SubscriptionTracer {
     /// clear the current `SubscriptionTracer`.
     pub fn clear(&self) {
-        self.0.clear();
+        self.0.retain(|_, v| {
+            v.stop_observing();
+            TRACK_REGION.with_label_values(&["dec"]).inc();
+            false
+        });
     }
 
     // Register a region as tracing.
