@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::debug;
 
+use crate::metrics::TRACK_REGION;
 use crate::utils;
 use dashmap::mapref::one::RefMut;
 use dashmap::DashMap;
@@ -55,9 +56,22 @@ impl RegionSubscription {
     pub fn resolver(&mut self) -> &mut TwoPhaseResolver {
         &mut self.resolver
     }
+
+    pub fn handle(&self) -> &ObserveHandle {
+        &self.handle
+    }
 }
 
 impl SubscriptionTracer {
+    /// clear the current `SubscriptionTracer`.
+    pub fn clear(&self) {
+        self.0.retain(|_, v| {
+            v.stop_observing();
+            TRACK_REGION.with_label_values(&["dec"]).inc();
+            false
+        });
+    }
+
     // Register a region as tracing.
     // The `start_ts` is used to tracking the progress of initial scanning.
     // (Note: the `None` case of `start_ts` is for testing / refresh region status when split / merge,
@@ -69,10 +83,12 @@ impl SubscriptionTracer {
         start_ts: Option<TimeStamp>,
     ) {
         info!("start listen stream from store"; "observer" => ?handle, "region_id" => %region.get_id());
+        TRACK_REGION.with_label_values(&["inc"]).inc();
         if let Some(o) = self.0.insert(
             region.get_id(),
             RegionSubscription::new(region.clone(), handle, start_ts),
         ) {
+            TRACK_REGION.with_label_values(&["dec"]).inc();
             warn!("register region which is already registered"; "region_id" => %region.get_id());
             o.stop_observing();
         }
@@ -110,14 +126,15 @@ impl SubscriptionTracer {
     pub fn deregister_region(
         &self,
         region: &Region,
-        if_cond: impl FnOnce(&Region, &Region) -> bool,
+        if_cond: impl FnOnce(&RegionSubscription, &Region) -> bool,
     ) -> bool {
         let region_id = region.get_id();
-        let remove_result = self.0.remove_if(&region_id, |_, old_region| {
-            if_cond(&old_region.meta, region)
-        });
+        let remove_result = self
+            .0
+            .remove_if(&region_id, |_, old_region| if_cond(old_region, region));
         match remove_result {
             Some(o) => {
+                TRACK_REGION.with_label_values(&["dec"]).inc();
                 o.1.stop_observing();
                 info!("stop listen stream from store"; "observer" => ?o.1, "region_id"=> %region_id);
                 true
@@ -173,7 +190,10 @@ impl SubscriptionTracer {
         exists && still_observing
     }
 
-    pub fn get_subscription_of(&self, region_id: u64) -> Option<RefMut<u64, RegionSubscription>> {
+    pub fn get_subscription_of(
+        &self,
+        region_id: u64,
+    ) -> Option<RefMut<'_, u64, RegionSubscription>> {
         self.0.get_mut(&region_id)
     }
 }

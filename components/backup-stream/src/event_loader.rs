@@ -1,12 +1,12 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Duration};
 
 use engine_traits::{KvEngine, CF_DEFAULT, CF_WRITE};
 
 use futures::executor::block_on;
 use raftstore::{
-    coprocessor::{ObserveHandle, RegionInfoProvider},
+    coprocessor::RegionInfoProvider,
     router::RaftStoreRouter,
     store::{fsm::ChangeObserver, Callback, SignificantMsg},
 };
@@ -17,15 +17,18 @@ use tikv::storage::{
     txn::{EntryBatch, TxnEntry, TxnEntryScanner},
     Snapshot, Statistics,
 };
-use tikv_util::{box_err, time::Instant, warn};
+use tikv_util::{box_err, time::Instant, warn, worker::Scheduler};
 use txn_types::{Key, Lock, TimeStamp};
 
 use crate::{
     annotate, debug,
+    endpoint::ObserveOp,
     errors::{ContextualResultExt, Error, Result},
     router::ApplyEvent,
     subscription_track::{SubscriptionTracer, TwoPhaseResolver},
+    try_send,
     utils::{self, RegionPager},
+    Task,
 };
 use crate::{
     metrics,
@@ -135,6 +138,7 @@ pub struct InitialDataLoader<E, R, RT> {
     //       method `async (KvEvent) -> Result<()>`?
     sink: Router,
     tracing: SubscriptionTracer,
+    scheduler: Scheduler<Task>,
 
     _engine: PhantomData<E>,
 }
@@ -145,12 +149,19 @@ where
     R: RegionInfoProvider + Clone + 'static,
     RT: RaftStoreRouter<E>,
 {
-    pub fn new(router: RT, regions: R, sink: Router, tracing: SubscriptionTracer) -> Self {
+    pub fn new(
+        router: RT,
+        regions: R,
+        sink: Router,
+        tracing: SubscriptionTracer,
+        sched: Scheduler<Task>,
+    ) -> Self {
         Self {
             router,
             regions,
             sink,
             tracing,
+            scheduler: sched,
             _engine: PhantomData,
         }
     }
@@ -187,6 +198,7 @@ where
                     if !can_retry {
                         break;
                     }
+                    std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
             }
@@ -283,11 +295,13 @@ where
             }
             stats.add_statistics(&stat);
             let sink = self.sink.clone();
-            metrics::INCREMENTAL_SCAN_SIZE.observe(events.size() as f64);
+            let event_size = events.size();
+            let sched = self.scheduler.clone();
+            metrics::INCREMENTAL_SCAN_SIZE.observe(event_size as f64);
+            metrics::HEAP_MEMORY.add(event_size as _);
             join_handles.push(tokio::spawn(async move {
-                if let Err(err) = sink.on_events(events).await {
-                    warn!("failed to send event to sink"; "err" => %err);
-                }
+                utils::handle_on_event_result(&sched, sink.on_events(events).await);
+                metrics::HEAP_MEMORY.sub(event_size as _);
             }));
         }
     }
@@ -314,7 +328,10 @@ where
                     warn!("failed to join task."; "err" => %err);
                 }
             }
-            if let Err(err) = Self::with_resolver_by(&tr, region_id, |r| Ok(r.phase_one_done())) {
+            if let Err(err) = Self::with_resolver_by(&tr, region_id, |r| {
+                r.phase_one_done();
+                Ok(())
+            }) {
                 err.report(format_args!(
                     "failed to finish phase 1 for region {:?}",
                     region_id
@@ -326,14 +343,8 @@ where
     }
 
     /// initialize a range: it simply scan the regions with leader role and send them to [`initialize_region`].
-    pub fn initialize_range(
-        &self,
-        start_key: Vec<u8>,
-        end_key: Vec<u8>,
-        start_ts: TimeStamp,
-    ) -> Result<Statistics> {
+    pub fn initialize_range(&self, start_key: Vec<u8>, end_key: Vec<u8>) -> Result<()> {
         let mut pager = RegionPager::scan_from(self.regions.clone(), start_key, end_key);
-        let mut total_stat = StatisticsSummary::default();
         loop {
             let regions = pager.next_page(8)?;
             debug!("scanning for entries in region."; "regions" => ?regions);
@@ -341,17 +352,19 @@ where
                 break;
             }
             for r in regions {
-                let handle = ObserveHandle::new();
-                self.tracing
-                    .register_region(&r.region, handle.clone(), Some(start_ts));
-                let region_id = r.region.get_id();
-                let snap = self.observe_over_with_retry(&r.region, move || {
-                    ChangeObserver::from_pitr(region_id, handle.clone())
-                })?;
-                let stat = self.do_initial_scan(&r.region, start_ts, snap)?;
-                total_stat.add_statistics(&stat);
+                // Note: Even we did the initial scanning, and blocking resolved ts from advancing,
+                //       if the next_backup_ts was updated in some extreme condition, there is still little chance to lost data:
+                //       For example, if a region cannot elect the leader for long time. (say, net work partition)
+                //       At that time, we have nowhere to record the lock status of this region.
+                try_send!(
+                    self.scheduler,
+                    Task::ModifyObserve(ObserveOp::Start {
+                        region: r.region,
+                        needs_initial_scanning: true
+                    })
+                );
             }
         }
-        Ok(total_stat.stat)
+        Ok(())
     }
 }

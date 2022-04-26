@@ -527,6 +527,7 @@ mod test {
         test_util::init_log_for_test();
         let suite = super::Suite::new("fatal_error", 3);
         suite.must_register_task(1, "test_fatal_error");
+        std::thread::sleep(Duration::from_secs(2));
         let (victim, endpoint) = suite.endpoints.iter().next().unwrap();
         endpoint
             .scheduler()

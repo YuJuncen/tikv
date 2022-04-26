@@ -142,6 +142,14 @@ impl Error {
         }
     }
 
+    /// add some context to the error.
+    pub fn context(self, msg: impl Display) -> Self {
+        Self::Contextual {
+            inner_error: Box::new(self),
+            context: msg.to_string(),
+        }
+    }
+
     fn kind(&self) -> &'static str {
         self.error_code().code
     }
