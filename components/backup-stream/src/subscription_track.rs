@@ -26,6 +26,7 @@ impl std::fmt::Debug for RegionSubscription {
         f.debug_tuple("RegionSubscription")
             .field(&self.meta.get_id())
             .field(&self.handle)
+            .field(&self.resolver)
             .finish()
     }
 }
@@ -60,6 +61,7 @@ impl RegionSubscription {
 impl SubscriptionTracer {
     /// clear the current `SubscriptionTracer`.
     pub fn clear(&self) {
+        info!("clearing all observed regions");
         self.0.retain(|_, v| {
             v.stop_observing();
             TRACK_REGION.with_label_values(&["dec"]).inc();
@@ -109,11 +111,13 @@ impl SubscriptionTracer {
                 .0
                 .iter()
                 .min_by_key(|r| r.value().resolver.resolved_ts());
+            let region_id = far_resolver.as_ref().map(|r| *r.key()).unwrap_or_default();
             warn!("log backup resolver ts advancing too slow";
             "far_resolver" => %{match far_resolver {
                 Some(r) => format!("{:?}", r.value().resolver),
                 None => "BUG[NoResolverButResolvedTSDoesNotAdvance]".to_owned()
             }},
+            "region" => %region_id,
             "gap" => ?Duration::from_millis(gap),
             );
         }
@@ -134,7 +138,7 @@ impl SubscriptionTracer {
             Some(o) => {
                 TRACK_REGION.with_label_values(&["dec"]).inc();
                 o.1.stop_observing();
-                info!("stop listen stream from store"; "observer" => ?o.1, "region_id"=> %region_id);
+                info!("stop listen stream from store"; "observer" => ?o, "region_id"=> %region_id);
                 true
             }
             None => {
@@ -184,6 +188,7 @@ impl SubscriptionTracer {
                 exists = true;
                 !o.is_observing()
             })
+            .map(|o| info!("stop observing stale region"; "sub" => ?o))
             .is_none();
         exists && still_observing
     }
@@ -317,7 +322,8 @@ impl TwoPhaseResolver {
         for lock in std::mem::take(&mut self.future_locks).into_iter() {
             self.handle_future_lock(lock);
         }
-        self.stable_ts = None
+        self.stable_ts = None;
+        assert!(self.future_locks.is_empty());
     }
 }
 

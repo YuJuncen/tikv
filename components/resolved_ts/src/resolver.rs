@@ -4,6 +4,7 @@ use std::{cmp, collections::BTreeMap, sync::Arc};
 
 use collections::{HashMap, HashSet};
 use raftstore::store::RegionReadProgress;
+use tikv_util::time::Instant;
 use txn_types::TimeStamp;
 
 use crate::metrics::RTS_RESOLVED_FAIL_ADVANCE_VEC;
@@ -14,6 +15,7 @@ pub struct Resolver {
     region_id: u64,
     // key -> start_ts
     locks_by_key: HashMap<Arc<[u8]>, TimeStamp>,
+    locks_meta: HashMap<Arc<[u8]>, TimeStamp>,
     // start_ts -> locked keys.
     lock_ts_heap: BTreeMap<TimeStamp, HashSet<Arc<[u8]>>>,
     // The timestamps that guarantees no more commit will happen before.
@@ -43,6 +45,16 @@ impl std::fmt::Debug for Resolver {
                     .collect::<Vec<_>>()
             ));
             dt.field(&format_args!("far_lock_ts={:?}", ts));
+            dt.field(&format_args!(
+                "metas={:?}",
+                keys.iter()
+                    .filter_map(|k| self.locks_meta.get(k).map(|i| format!(
+                        "{}@{:?}",
+                        log_wrappers::Value::key(k),
+                        i
+                    )))
+                    .collect::<Vec<_>>()
+            ));
         }
 
         dt.finish()
@@ -67,6 +79,7 @@ impl Resolver {
             tracked_index: 0,
             min_ts: TimeStamp::zero(),
             stopped: false,
+            locks_meta: Default::default(),
         }
     }
 
@@ -116,6 +129,10 @@ impl Resolver {
         );
         let key: Arc<[u8]> = key.into_boxed_slice().into();
         self.locks_by_key.insert(key.clone(), start_ts);
+        self.locks_meta.insert(
+            key.clone(),
+            TimeStamp::compose(TimeStamp::physical_now(), 42),
+        );
         self.lock_ts_heap.entry(start_ts).or_default().insert(key);
     }
 
@@ -129,6 +146,7 @@ impl Resolver {
             debug!("untrack a lock that was not tracked before"; "key" => &log_wrappers::Value::key(key));
             return;
         };
+        self.locks_meta.remove(key);
         debug!(
             "untrack lock {}@{}, region {}",
             &log_wrappers::Value::key(key),
