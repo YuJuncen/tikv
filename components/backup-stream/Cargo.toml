@@ -18,7 +18,7 @@ chrono = "0.4"
 concurrency_manager = { path = "../concurrency_manager" }
 crossbeam = "0.8"
 crossbeam-channel = "0.5"
-dashmap = "5"
+dashmap = "5.3"
 engine_rocks = { path = "../engine_rocks", default-features = false }
 engine_traits = { path = "../engine_traits", default-features = false }
 error_code = { path = "../error_code" }
