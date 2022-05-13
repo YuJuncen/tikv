@@ -83,7 +83,7 @@ impl ApplyEvents {
     pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut TwoPhaseResolver) -> Self {
         let region_id = cmd.region_id;
         let mut result = vec![];
-        for req in cmd
+        for (req, idx) in cmd
             .cmds
             .into_iter()
             .filter(|cmd| {
@@ -100,7 +100,12 @@ impl ApplyEvents {
                     true
                 }
             })
-            .flat_map(|mut cmd| cmd.request.take_requests().into_iter())
+            .flat_map(|mut cmd| {
+                cmd.request
+                    .take_requests()
+                    .into_iter()
+                    .map(move |x| (x, cmd.index))
+            })
         {
             let cmd_type = req.get_cmd_type();
 
@@ -124,13 +129,13 @@ impl ApplyEvents {
                         }) {
                             Ok(lock) => {
                                 if utils::should_track_lock(&lock) {
-                                    resolver.track_lock(lock.ts, key)
+                                    resolver.track_lock(lock.ts, key, Some(idx))
                                 }
                             }
                             Err(err) => err.report(format!("region id = {}", region_id)),
                         }
                     }
-                    CmdType::Delete => resolver.untrack_lock(&key),
+                    CmdType::Delete => resolver.untrack_lock(&key, Some(idx)),
                     _ => {}
                 }
                 continue;

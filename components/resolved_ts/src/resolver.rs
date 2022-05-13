@@ -15,7 +15,7 @@ pub struct Resolver {
     region_id: u64,
     // key -> start_ts
     locks_by_key: HashMap<Arc<[u8]>, TimeStamp>,
-    locks_meta: HashMap<Arc<[u8]>, TimeStamp>,
+    locks_meta: HashMap<Arc<[u8]>, (TimeStamp, u64)>,
     // start_ts -> locked keys.
     lock_ts_heap: BTreeMap<TimeStamp, HashSet<Arc<[u8]>>>,
     // The timestamps that guarantees no more commit will happen before.
@@ -131,7 +131,10 @@ impl Resolver {
         self.locks_by_key.insert(key.clone(), start_ts);
         self.locks_meta.insert(
             key.clone(),
-            TimeStamp::compose(TimeStamp::physical_now(), 42),
+            (
+                TimeStamp::compose(TimeStamp::physical_now(), 42),
+                index.unwrap_or_default(),
+            ),
         );
         self.lock_ts_heap.entry(start_ts).or_default().insert(key);
     }
@@ -143,7 +146,7 @@ impl Resolver {
         let start_ts = if let Some(start_ts) = self.locks_by_key.remove(key) {
             start_ts
         } else {
-            debug!("untrack a lock that was not tracked before"; "key" => &log_wrappers::Value::key(key));
+            warn!("untrack a lock that was not tracked before"; "key" => &log_wrappers::Value::key(key));
             return;
         };
         self.locks_meta.remove(key);

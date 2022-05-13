@@ -237,21 +237,23 @@ pub struct TwoPhaseResolver {
 }
 
 enum FutureLock {
-    Lock(Vec<u8>, TimeStamp),
-    Unlock(Vec<u8>),
+    Lock(Vec<u8>, TimeStamp, Option<u64>),
+    Unlock(Vec<u8>, Option<u64>),
 }
 
 impl std::fmt::Debug for FutureLock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Lock(arg0, arg1) => f
+            Self::Lock(arg0, arg1, idx) => f
                 .debug_tuple("Lock")
                 .field(&format_args!("{}", utils::redact(arg0)))
                 .field(arg1)
+                .field(idx)
                 .finish(),
-            Self::Unlock(arg0) => f
+            Self::Unlock(arg0, idx) => f
                 .debug_tuple("Unlock")
                 .field(&format_args!("{}", utils::redact(arg0)))
+                .field(idx)
                 .finish(),
         }
     }
@@ -269,27 +271,28 @@ impl TwoPhaseResolver {
         self.resolver.track_lock(start_ts, key, None)
     }
 
-    pub fn track_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>) {
+    pub fn track_lock(&mut self, start_ts: TimeStamp, key: Vec<u8>, idx: Option<u64>) {
         if self.in_phase_one() {
-            self.future_locks.push(FutureLock::Lock(key, start_ts));
+            self.future_locks.push(FutureLock::Lock(key, start_ts, idx));
             return;
         }
-        self.resolver.track_lock(start_ts, key, None)
+        self.resolver.track_lock(start_ts, key, idx)
     }
 
-    pub fn untrack_lock(&mut self, key: &[u8]) {
+    pub fn untrack_lock(&mut self, key: &[u8], idx: Option<u64>) {
         // If we are still in phase one, tracking all unpaired locks.
         if self.in_phase_one() {
-            self.future_locks.push(FutureLock::Unlock(key.to_owned()));
+            self.future_locks
+                .push(FutureLock::Unlock(key.to_owned(), idx));
             return;
         }
-        self.resolver.untrack_lock(key, None)
+        self.resolver.untrack_lock(key, idx)
     }
 
     fn handle_future_lock(&mut self, lock: FutureLock) {
         match lock {
-            FutureLock::Lock(key, ts) => self.resolver.track_lock(ts, key, None),
-            FutureLock::Unlock(key) => self.resolver.untrack_lock(&key, None),
+            FutureLock::Lock(key, ts, idx) => self.resolver.track_lock(ts, key, idx),
+            FutureLock::Unlock(key, idx) => self.resolver.untrack_lock(&key, idx),
         }
     }
 
