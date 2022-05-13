@@ -515,7 +515,6 @@ where
                             "failed to register backup stream task {} to router: ranges not found",
                             task.info.get_name()
                         ));
-                        // TODO build a error handle mechanism #error 5
                     }
                 }
             });
@@ -525,13 +524,14 @@ where
     pub fn on_unregister(&self, task: &str) {
         let router = self.range_router.clone();
 
+        // for now, we support one concurrent task only.
+        // so simply clear all info would be fine.
+        self.observer.ranges.wl().clear();
+        self.subs.clear();
+
         self.pool.block_on(async move {
             router.unregister_task(task).await;
         });
-        // for now, we support one concurrent task only.
-        // so simply clear all info would be fine.
-        self.subs.clear();
-        self.observer.ranges.wl().clear();
     }
 
     /// try advance the resolved ts by the pd tso.
@@ -767,6 +767,10 @@ where
                 err,
             } => {
                 info!("retry observe region"; "region" => %region.get_id(), "err" => %err);
+                // No need for retrying observe canceled.
+                if err.error_code() == error_code::backup_stream::OBSERVE_CANCELED {
+                    return;
+                }
                 match self.retry_observe(region, handle) {
                     Ok(()) => {}
                     Err(e) => {
@@ -834,11 +838,8 @@ where
                 .inc();
             return Ok(());
         }
-        if new_region_info
-            .as_ref()
-            .map(|r| r.role != StateRole::Leader)
-            .unwrap_or(true)
-        {
+        let new_region_info = new_region_info.unwrap();
+        if new_region_info.role != StateRole::Leader {
             metrics::SKIP_RETRY.with_label_values(&["not-leader"]).inc();
             return Ok(());
         }
@@ -871,6 +872,7 @@ where
             Task::ChangeConfig(_) => {
                 warn!("change config online isn't supported for now.")
             }
+            Task::Sync(cb) => cb(),
         }
     }
 
@@ -923,6 +925,8 @@ pub enum Task {
     ForceFlush(String),
     /// FatalError pauses the task and set the error.
     FatalError(String, Box<Error>),
+    /// Run the callback when see this message.
+    Sync(Box<dyn FnOnce() + Send>),
 }
 
 #[derive(Debug)]
@@ -973,6 +977,7 @@ impl fmt::Debug for Task {
             Self::FatalError(task, err) => {
                 f.debug_tuple("FatalError").field(task).field(err).finish()
             }
+            Self::Sync(_) => f.debug_tuple("Sync").finish(),
         }
     }
 }
