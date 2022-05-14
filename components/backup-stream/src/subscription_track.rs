@@ -1,23 +1,38 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
 
 use dashmap::{mapref::one::RefMut, DashMap};
+use futures::executor::block_on;
 use kvproto::metapb::Region;
 use raftstore::coprocessor::*;
 use resolved_ts::Resolver;
-use tikv_util::{info, warn};
+use tikv_util::{info, warn, HandyRwLock};
 use txn_types::TimeStamp;
 
-use crate::{debug, metrics::TRACK_REGION, utils};
+use crate::{
+    debug,
+    metrics::TRACK_REGION,
+    utils::{self, Slot, SlotMap},
+};
 
 /// A utility to tracing the regions being subscripted.
-#[derive(Clone, Default, Debug)]
-pub struct SubscriptionTracer(Arc<DashMap<u64, RegionSubscription>>);
+#[derive(Clone, Debug)]
+pub struct SubscriptionTracer(Arc<RwLock<HashMap<u64, Mutex<RegionSubscription>>>>);
+
+impl Default for SubscriptionTracer {
+    fn default() -> Self {
+        Self(Default::default())
+    }
+}
 
 pub struct RegionSubscription {
     pub meta: Region,
-    handle: ObserveHandle,
+    pub(crate) handle: ObserveHandle,
     resolver: TwoPhaseResolver,
 }
 
@@ -62,8 +77,8 @@ impl SubscriptionTracer {
     /// clear the current `SubscriptionTracer`.
     pub fn clear(&self) {
         info!("clearing all observed regions");
-        self.0.retain(|_, v| {
-            v.stop_observing();
+        self.0.wl().retain(|_, v| {
+            v.get_mut().unwrap().stop_observing();
             TRACK_REGION.with_label_values(&["dec"]).inc();
             false
         });
@@ -81,21 +96,22 @@ impl SubscriptionTracer {
     ) {
         info!("start listen stream from store"; "observer" => ?handle, "region_id" => %region.get_id());
         TRACK_REGION.with_label_values(&["inc"]).inc();
-        if let Some(o) = self.0.insert(
+        if let Some(o) = self.0.wl().insert(
             region.get_id(),
-            RegionSubscription::new(region.clone(), handle, start_ts),
+            Mutex::new(RegionSubscription::new(region.clone(), handle, start_ts)),
         ) {
             TRACK_REGION.with_label_values(&["dec"]).inc();
             warn!("register region which is already registered"; "region_id" => %region.get_id());
-            o.stop_observing();
+            o.into_inner().unwrap().stop_observing();
         }
     }
 
     /// try advance the resolved ts with the min ts of in-memory locks.
     pub fn resolve_with(&self, min_ts: TimeStamp) -> TimeStamp {
         self.0
+            .wl()
             .iter_mut()
-            .map(|mut s| s.resolver.resolve(min_ts))
+            .map(|mut s| s.1.lock().unwrap().resolver.resolve(min_ts))
             .min()
             // If there isn't any region observed, the `min_ts` can be used as resolved ts safely.
             .unwrap_or(min_ts)
@@ -107,14 +123,14 @@ impl SubscriptionTracer {
         if gap >= 10 * 60 * 1000
         /* 10 mins */
         {
-            let far_resolver = self
-                .0
+            let r = self.0.rl();
+            let far_resolver = r
                 .iter()
-                .min_by_key(|r| r.value().resolver.resolved_ts());
-            let region_id = far_resolver.as_ref().map(|r| *r.key()).unwrap_or_default();
+                .min_by_key(|r| r.1.lock().unwrap().resolver().resolved_ts());
+            let region_id = far_resolver.as_ref().map(|r| *r.0).unwrap_or_default();
             warn!("log backup resolver ts advancing too slow";
             "far_resolver" => %{match far_resolver {
-                Some(r) => format!("{:?}", r.value().resolver),
+                Some(r) => format!("{:?}", r.1.lock().unwrap().resolver),
                 None => "BUG[NoResolverButResolvedTSDoesNotAdvance]".to_owned()
             }},
             "region" => %region_id,
@@ -131,9 +147,7 @@ impl SubscriptionTracer {
         if_cond: impl FnOnce(&RegionSubscription, &Region) -> bool,
     ) -> bool {
         let region_id = region.get_id();
-        let remove_result = self
-            .0
-            .remove_if(&region_id, |_, old_region| if_cond(old_region, region));
+        let remove_result = self.remove_if(&region_id, |_, old_region| if_cond(old_region, region));
         match remove_result {
             Some(o) => {
                 TRACK_REGION.with_label_values(&["dec"]).inc();
@@ -154,15 +168,16 @@ impl SubscriptionTracer {
     ///
     /// Whether the status can be updated internally without deregister-and-register.
     pub fn try_update_region(&self, new_region: &Region) -> bool {
-        let mut sub = match self.get_subscription_of(new_region.get_id()) {
-            Some(sub) => sub,
-            None => {
-                warn!("backup stream observer refreshing void subscription."; "new_region" => ?new_region);
-                return true;
-            }
-        };
+        self.with_subscription_of(new_region.get_id(), |sub| {
+            let sub = match sub {
+                Some(sub) => sub,
+                None => {
+                    warn!("backup stream observer refreshing void subscription."; "new_region" => ?new_region);
+                    return true;
+                }
+            };
 
-        let mut subscription = sub.value_mut();
+        let mut subscription = sub;
 
         let old_epoch = subscription.meta.get_region_epoch();
         let new_epoch = new_region.get_region_epoch();
@@ -172,6 +187,7 @@ impl SubscriptionTracer {
         }
 
         false
+        })
     }
 
     /// check whether the region_id should be observed by this observer.
@@ -181,7 +197,6 @@ impl SubscriptionTracer {
         // The region traced, check it whether is still be observing,
         // if not, remove it.
         let still_observing = self
-            .0
             // Assuming this closure would be called iff the key exists.
             // So we can elide a `contains` check.
             .remove_if(&region_id, |_, o| {
@@ -193,11 +208,54 @@ impl SubscriptionTracer {
         exists && still_observing
     }
 
-    pub fn get_subscription_of(
+    pub fn with_subscription_of<T>(
         &self,
         region_id: u64,
-    ) -> Option<RefMut<'_, u64, RegionSubscription>> {
-        self.0.get_mut(&region_id)
+        f: impl FnOnce(Option<&mut RegionSubscription>) -> T,
+    ) -> T {
+        let r = self.0.rl();
+        match r.get(&region_id) {
+            None => f(None),
+            Some(lock) => {
+                let mut l = lock.lock().unwrap();
+                f(Some(&mut *l))
+            }
+        }
+    }
+
+    fn remove_if(
+        &self,
+        key: &u64,
+        f: impl FnOnce(u64, &RegionSubscription) -> bool,
+    ) -> Option<(u64, RegionSubscription)> {
+        let mut w = self.0.wl();
+        if let Some(k) = w.get(key) {
+            if f(*key, &*k.lock().unwrap()) {
+                drop(k);
+                return w.remove(key).map(|x| (*key, x.into_inner().unwrap()));
+            }
+        }
+        None
+    }
+}
+
+pub struct SubscriptionBorrow<'a> {
+    key: u64,
+    guard: std::sync::MutexGuard<'a, RegionSubscription>,
+    outer_guard: std::sync::RwLockReadGuard<'a, HashMap<u64, Mutex<RegionSubscription>>>,
+}
+
+impl<'a> SubscriptionBorrow<'a> {
+    pub fn key(&self) -> u64 {
+        self.key
+    }
+
+    pub fn value(&self) -> &RegionSubscription {
+        &*self.guard
+    }
+
+    pub fn value_mut(&mut self) -> &mut RegionSubscription {
+        &mut *self.guard
     }
 }
 

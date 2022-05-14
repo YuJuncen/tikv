@@ -209,6 +209,7 @@ where
                     return Ok(s);
                 }
                 Err(e) => {
+                    e.report(format!("during registering to region {}", region.id));
                     let can_retry = match e.without_context() {
                         Error::RaftRequest(pbe) => {
                             !(pbe.has_epoch_not_match()
@@ -300,30 +301,31 @@ where
         f: impl FnOnce(&mut TwoPhaseResolver) -> Result<T>,
     ) -> Result<T> {
         let region_id = region.get_id();
-        let mut v = tracing
-            .get_subscription_of(region_id)
-            .ok_or_else(|| Error::Other(box_err!("observer for region {} canceled", region_id)))
-            .and_then(|v| {
-                raftstore::store::util::compare_region_epoch(
-                    region.get_region_epoch(),
-                    &v.value().meta,
-                    // No need for checking conf version because conf change won't cancel the observation.
-                    false,
-                    true,
-                    false,
-                )?;
-                Ok(v)
-            })
-            .map_err(|err| Error::Contextual {
-                // Both when we cannot find the region in the track and
-                // the epoch has changed means that we should cancel the current turn of initial scanning.
-                inner_error: Box::new(Error::ObserveCanceled(
-                    region_id,
-                    region.get_region_epoch().clone(),
-                )),
-                context: format!("{}", err),
-            })?;
-        f(v.value_mut().resolver())
+        tracing.with_subscription_of(region_id, |r| {
+            let v = r
+                .ok_or_else(|| Error::Other(box_err!("observer for region {} canceled", region_id)))
+                .and_then(|v| {
+                    raftstore::store::util::compare_region_epoch(
+                        region.get_region_epoch(),
+                        &v.meta,
+                        // No need for checking conf version because conf change won't cancel the observation.
+                        false,
+                        true,
+                        false,
+                    )?;
+                    Ok(v)
+                })
+                .map_err(|err| Error::Contextual {
+                    // Both when we cannot find the region in the track and
+                    // the epoch has changed means that we should cancel the current turn of initial scanning.
+                    inner_error: Box::new(Error::ObserveCanceled(
+                        region_id,
+                        region.get_region_epoch().clone(),
+                    )),
+                    context: format!("{}", err),
+                })?;
+            f(v.resolver())
+        })
     }
 
     fn scan_and_async_send(

@@ -159,7 +159,7 @@ impl Resolver {
 
         let entry = self.lock_ts_heap.get_mut(&start_ts);
         if let Some(locked_keys) = entry {
-            locked_keys.remove(key);
+            assert!(locked_keys.remove(key));
             if locked_keys.is_empty() {
                 self.lock_ts_heap.remove(&start_ts);
             }

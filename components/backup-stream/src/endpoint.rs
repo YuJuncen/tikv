@@ -354,17 +354,28 @@ where
     fn backup_batch(&self, batch: CmdBatch) {
         let mut sw = StopWatch::new();
         let region_id = batch.region_id;
-        let mut resolver = match self.subs.get_subscription_of(region_id) {
-            Some(rts) => rts,
-            None => {
-                warn!("BUG: the region isn't registered (no resolver found) but sent to backup_batch."; "region_id" => %region_id);
-                return;
-            }
-        };
+        let kvs =  self.subs.with_subscription_of(region_id, |sub| {
+            let resolver = match sub {
+                Some(sub) => {
+                    if batch.pitr_id != sub.handle.id {
+                        warn!("stale command"; "region_id" => %region_id, "now" => ?sub.handle.id, "remote" => ?batch.pitr_id);
+                        return None
+                    }
+                    sub 
+                },
+                None => {
+                    warn!("BUG: the region isn't registered (no resolver found) but sent to backup_batch."; "region_id" => %region_id);
+                    return None;
+                }
+            };
+            Some(ApplyEvents::from_cmd_batch(batch, resolver.resolver(), &self.engine))
+        });
+        if kvs.is_none() {
+            return;
+        }
+        let kvs = kvs.unwrap();
         let sched = self.scheduler.clone();
 
-        let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut().resolver(), &self.engine);
-        drop(resolver);
         if kvs.len() == 0 {
             return;
         }
