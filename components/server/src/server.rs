@@ -860,6 +860,7 @@ impl<ER: RaftEngine> TiKvServer<ER> {
                 self.router.clone(),
                 self.pd_client.clone(),
                 self.concurrency_manager.clone(),
+                self.engines.as_ref().unwrap().engines.kv.clone(),
             );
             backup_stream_worker.start(backup_stream_endpoint);
             self.to_stop.push(backup_stream_worker);

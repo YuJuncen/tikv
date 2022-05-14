@@ -57,15 +57,16 @@ pub struct Endpoint<S: MetaStore + 'static, R, E, RT, PDC> {
     pool: Runtime,
     store_id: u64,
     regions: R,
-    engine: PhantomData<E>,
     router: RT,
     pd_client: Arc<PDC>,
     subs: SubscriptionTracer,
     concurrency_manager: ConcurrencyManager,
     initial_scan_memory_quota: PendingMemoryQuota,
     scan_pool: ScanPool,
+    engine: E,
 }
 
+#[cfg(test)]
 impl<S, R, E, RT, PDC> Endpoint<S, R, E, RT, PDC>
 where
     R: RegionInfoProvider + 'static + Clone,
@@ -151,6 +152,7 @@ where
         router: RT,
         pd_client: Arc<PDC>,
         concurrency_manager: ConcurrencyManager,
+        engine: E,
     ) -> Endpoint<EtcdStore, R, E, RT, PDC> {
         crate::metrics::STREAM_ENABLED.inc();
         let pool = create_tokio_runtime(config.io_threads, "backup-stream")
@@ -202,7 +204,7 @@ where
             pool,
             store_id,
             regions: accessor,
-            engine: PhantomData,
+            engine,
             router,
             pd_client,
             subs: Default::default(),
@@ -361,7 +363,7 @@ where
         };
         let sched = self.scheduler.clone();
 
-        let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut().resolver());
+        let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut().resolver(), &self.engine);
         drop(resolver);
         if kvs.len() == 0 {
             return;

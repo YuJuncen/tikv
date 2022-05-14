@@ -14,7 +14,10 @@ use std::{
     time::Duration,
 };
 
-use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use chrono::Local;
+use engine_traits::{
+    CfName, KvEngine, Mutable, WriteBatch, WriteOptions, CF_DEFAULT, CF_LOCK, CF_WRITE,
+};
 use external_storage::{BackendConfig, UnpinReader};
 use external_storage_export::{create_storage, ExternalStorage};
 use futures::io::Cursor;
@@ -80,9 +83,14 @@ impl ApplyEvents {
     /// At the same time, advancing status of the `Resolver` by those keys.
     /// Note: the resolved ts cannot be advanced if there is no command,
     ///       maybe we also need to update resolved_ts when flushing?
-    pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut TwoPhaseResolver) -> Self {
+    pub fn from_cmd_batch<DE: KvEngine>(
+        cmd: CmdBatch,
+        resolver: &mut TwoPhaseResolver,
+        debug_engine: &DE,
+    ) -> Self {
         let region_id = cmd.region_id;
         let mut result = vec![];
+        let mut wb = debug_engine.write_batch();
         for (req, idx) in cmd
             .cmds
             .into_iter()
@@ -129,13 +137,50 @@ impl ApplyEvents {
                         }) {
                             Ok(lock) => {
                                 if utils::should_track_lock(&lock) {
-                                    resolver.track_lock(lock.ts, key, Some(idx))
+                                    let phn = TimeStamp::physical_now();
+                                    resolver.track_lock(lock.ts, key.clone(), Some(idx));
+                                    let key = Key::from_encoded(key)
+                                        .append_ts(TimeStamp::compose(phn, 0));
+                                    let mut real_key = Vec::with_capacity(key.len() + 1);
+                                    real_key.push(b'?');
+                                    real_key.extend_from_slice(key.as_encoded().as_slice());
+                                    wb.put_cf(
+                                        CF_DEFAULT,
+                                        &real_key,
+                                        format!(
+                                            "at raft index {}; ts = {}; now = {}",
+                                            idx,
+                                            lock.ts,
+                                            Local::now(),
+                                        )
+                                        .as_bytes(),
+                                    )
+                                    .unwrap();
                                 }
                             }
                             Err(err) => err.report(format!("region id = {}", region_id)),
                         }
                     }
-                    CmdType::Delete => resolver.untrack_lock(&key, Some(idx)),
+                    CmdType::Delete => {
+                        let phn = TimeStamp::physical_now();
+                        resolver.untrack_lock(&key, Some(idx));
+                        let key = Key::from_encoded(key).append_ts(TimeStamp::compose(phn, 42));
+                        let mut real_key = Vec::with_capacity(key.len() + 1);
+                        real_key.push(b'!');
+                        real_key.extend_from_slice(key.as_encoded().as_slice());
+                        wb.put_cf(
+                            CF_DEFAULT,
+                            &real_key,
+                            format!(
+                                "at raft index {}; ts(phy @ unlock) = {}; now = {}",
+                                idx,
+                                phn,
+                                Local::now()
+                            )
+                            .as_bytes(),
+                        )
+                        .unwrap();
+                    }
                     _ => {}
                 }
                 continue;
@@ -152,6 +197,11 @@ impl ApplyEvents {
             }
             result.push(item);
         }
+        let mut wo = WriteOptions::new();
+        wo.set_sync(false);
+        wb.write_opt(&wo)
+            .map_err(|err| annotate!("error during writing debug info {}", err))
+            .unwrap();
         Self {
             events: result,
             region_id,
