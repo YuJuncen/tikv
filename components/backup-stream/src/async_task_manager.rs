@@ -94,15 +94,19 @@ where
     RT: RaftStoreRouter<E> + 'static,
 {
     let (tx, rx) = crossbeam::channel::bounded(MESSAGE_BUFFER_SIZE);
-    let pool = create_scan_pool(number);
+    let pool = Arc::new(create_scan_pool(number));
     for _ in 0..number {
         let init = init.clone();
         let rx = rx.clone();
+        let pool_handle = pool.clone();
         pool.spawn(move |_: &mut YatpHandle<'_>| {
             tikv_alloc::add_thread_memory_accessor();
             let _io_guard = file_system::WithIOType::new(file_system::IOType::Replication);
             scan_executor_loop(init, rx);
             tikv_alloc::remove_thread_memory_accessor();
+            // This won't make background thread deadlock,
+            // because `shutdown` won't join the handle if the target of which is current thread.
+            drop(pool_handle);
         })
     }
     tx
