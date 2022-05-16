@@ -3,6 +3,7 @@
 #![feature(assert_matches)]
 #![feature(test)]
 
+mod async_task_manager;
 pub mod config;
 mod endpoint;
 pub mod errors;
