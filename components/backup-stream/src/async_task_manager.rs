@@ -283,14 +283,15 @@ where
                 metrics::INITIAL_SCAN_REASON
                     .with_label_values(&["region-changed"])
                     .inc();
-                if let Err(e) = self
-                    .observe_over_with_initial_data_from_checkpoint(
+                let r = async {
+                    Result::Ok(self.observe_over_with_initial_data_from_checkpoint(
                         region,
-                        for_task,
+                        self.get_last_checkpoint_of(&for_task).await?,
                         handle.clone(),
-                    )
-                    .await
-                {
+                    ))
+                }
+                .await;
+                if let Err(e) = r {
                     try_send!(
                         self.scheduler,
                         Task::ModifyObserve(ObserveOp::NotifyFailToStartObserve {
@@ -304,9 +305,8 @@ where
         }
     }
 
-    async fn start_observe(&self, region: Region) {
-        let handle = ObserveHandle::new();
-        let result = match self.find_task_by_region(&region) {
+    async fn try_start_observe(&self, region: &Region, handle: ObserveHandle) -> Result<()> {
+        match self.find_task_by_region(&region) {
             None => {
                 warn!(
                     "the region {:?} is register to no task but being observed (start_key = {}; end_key = {}; task_stat = {:?}): maybe stale, aborting",
@@ -315,20 +315,30 @@ where
                     utils::redact(&region.get_end_key()),
                     self.range_router
                 );
-                return;
             }
 
             Some(for_task) => {
-                self.observe_over_with_initial_data_from_checkpoint(
-                    &region,
-                    for_task,
-                    handle.clone(),
-                )
-                .await
+                let tso = self.get_last_checkpoint_of(&for_task).await?;
+                // We should set the local checkpoint to the newly added task ASAP,
+                // or once the original leader store of this region get rid of the slow-progress region,
+                // it may advance the global checkpoint unexpectlly.
+                // NOTE: maybe `spawn` here?
+                self.get_meta_client()
+                    .set_local_task_checkpoint(&for_task, tso.into_inner())
+                    .await?;
+                self.observe_over_with_initial_data_from_checkpoint(&region, tso, handle.clone());
             }
-        };
+        }
+        Ok(())
+    }
 
-        if let Err(err) = result {
+    fn get_meta_client(&self) -> &MetadataClient<S> {
+        self.meta_cli.as_ref().unwrap()
+    }
+
+    async fn start_observe(&self, region: Region) {
+        let handle = ObserveHandle::new();
+        if let Err(err) = self.try_start_observe(&region, handle.clone()).await {
             try_send!(
                 self.scheduler,
                 Task::ModifyObserve(ObserveOp::NotifyFailToStartObserve {
@@ -391,14 +401,18 @@ where
         Ok(())
     }
 
-    async fn observe_over_with_initial_data_from_checkpoint(
+    async fn get_last_checkpoint_of(&self, task: &str) -> Result<TimeStamp> {
+        let meta_cli = self.meta_cli.as_ref().unwrap().clone();
+        let last_checkpoint = TimeStamp::new(meta_cli.global_progress_of_task(task).await?);
+        Ok(last_checkpoint)
+    }
+
+    fn observe_over_with_initial_data_from_checkpoint(
         &self,
         region: &Region,
-        task: String,
+        last_checkpoint: TimeStamp,
         handle: ObserveHandle,
-    ) -> Result<()> {
-        let meta_cli = self.meta_cli.as_ref().unwrap().clone();
-        let last_checkpoint = TimeStamp::new(meta_cli.global_progress_of_task(&task).await?);
+    ) {
         self.subs
             .register_region(region, handle.clone(), Some(last_checkpoint));
 
@@ -417,7 +431,6 @@ where
                 region.get_id()
             ));
         }
-        Ok(())
     }
 
     fn find_task_by_region(&self, r: &Region) -> Option<String> {

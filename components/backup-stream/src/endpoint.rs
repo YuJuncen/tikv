@@ -1,9 +1,6 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    convert::AsRef, fmt, marker::PhantomData, path::PathBuf, sync::Arc,
-    time::Duration,
-};
+use std::{convert::AsRef, fmt, marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
 
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::KvEngine;
@@ -15,7 +12,6 @@ use kvproto::{
 };
 use online_config::ConfigChange;
 use pd_client::PdClient;
-
 use raftstore::{
     coprocessor::{CmdBatch, ObserveHandle, RegionInfoProvider},
     router::RaftStoreRouter,
@@ -35,7 +31,6 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 use txn_types::TimeStamp;
-
 
 use super::metrics::HANDLE_EVENT_DURATION_HISTOGRAM;
 use crate::{
@@ -710,7 +705,7 @@ where
                 Error::from(err).report("failed to update service safe point!");
                 // don't give up?
             }
-            if let Err(err) = meta_cli.step_task(&task, rts).await {
+            if let Err(err) = meta_cli.set_local_task_checkpoint(&task, rts).await {
                 err.report(format!("on flushing task {}", task));
                 // we can advance the progress at next time.
                 // return early so we won't be mislead by the metrics.
