@@ -99,17 +99,30 @@ impl MetaKey {
         ranges
     }
 
-    /// The key of next backup ts of some region in some store.
-    pub fn next_backup_ts_of(name: &str, store_id: u64) -> Self {
-        let base = Self::next_backup_ts(name);
-        let mut buf = bytes::BytesMut::from(base.0.as_slice());
-        buf.put_u64(store_id);
-        Self(buf.to_vec())
-    }
-
     // The prefix for next backup ts.
     pub fn next_backup_ts(name: &str) -> Self {
         Self(format!("{}{}/{}/", PREFIX, PATH_NEXT_BACKUP_TS, name).into_bytes())
+    }
+
+    /// The key of next backup ts of some region in some store.
+    pub fn next_backup_ts_of(name: &str, store_id: u64) -> Self {
+        Self(
+            format!(
+                "{}{}/{}/store/{}",
+                PREFIX, PATH_NEXT_BACKUP_TS, name, store_id
+            )
+            .into_bytes(),
+        )
+    }
+
+    pub fn next_bakcup_ts_of_region(name: &str, region_id: u64) -> Self {
+        Self(
+            format!(
+                "{}{}/{}/region/{}",
+                PREFIX, PATH_NEXT_BACKUP_TS, name, region_id
+            )
+            .into_bytes(),
+        )
     }
 
     pub fn pause_prefix_len() -> usize {
@@ -129,8 +142,7 @@ impl MetaKey {
         Self(format!("{}{}/{}/{}", PREFIX, PATH_LAST_ERROR, name, store).into_bytes())
     }
 
-    /// return the key that keeps the range [self, self.next()) contains only
-    /// `self`.
+    /// return the key that keeps the range [self, self.next()) contains only `self`.
     pub fn next(&self) -> Self {
         let mut next = self.clone();
         next.0.push(0);
