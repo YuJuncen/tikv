@@ -15,4 +15,4 @@ pub mod router;
 mod subscription_track;
 mod utils;
 
-pub use endpoint::{Endpoint, Task};
+pub use endpoint::{Endpoint, ObserveOp, Task};
