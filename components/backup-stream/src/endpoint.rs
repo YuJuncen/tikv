@@ -69,6 +69,8 @@ pub struct Endpoint<S, R, E, RT, PDC> {
     concurrency_manager: ConcurrencyManager,
     initial_scan_memory_quota: PendingMemoryQuota,
     region_operator: RegionSubscriptionManager<S, R, PDC>,
+    failover_time: Option<Instant>,
+    config: BackupStreamConfig,
 }
 
 impl<S, R, E, RT, PDC> Endpoint<S, R, E, RT, PDC>
@@ -150,6 +152,8 @@ where
             concurrency_manager,
             initial_scan_memory_quota,
             region_operator,
+            failover_time: None,
+            config,
         }
     }
 }
@@ -228,6 +232,8 @@ where
             if task.is_paused {
                 continue;
             }
+            // We have meet task upon store start, we must in a failover.
+            scheduler.schedule(Task::MarkFailover(Instant::now()))?;
             // move task to schedule
             scheduler.schedule(Task::WatchTask(TaskOp::AddTask(task)))?;
         }
@@ -622,7 +628,7 @@ where
     async fn try_resolve(
         cm: &ConcurrencyManager,
         pd_client: Arc<PDC>,
-        resolvers: SubscriptionTracer,
+        resolvers: &SubscriptionTracer,
     ) -> TimeStamp {
         let pd_tso = pd_client
             .get_tso()
@@ -637,6 +643,29 @@ where
         ts
     }
 
+    /// Make a guard for checking whether we can flush the checkpoint ts.
+    fn make_flush_guard(&self) -> impl FnOnce() -> bool + Send {
+        let failover = self.failover_time;
+        let flush_duration = self.config.max_flush_interval;
+        move || {
+            let in_flight = crate::observer::IN_FLIGHT_START_OBSERVE_MESSAGE.load(Ordering::SeqCst);
+            if in_flight > 0 {
+                warn!("inflight leader detected, skipping advancing resolved ts"; "in_flight" => %in_flight);
+                return false;
+            }
+            if failover
+                .as_ref()
+                .map(|failover_t| failover_t.saturating_elapsed() < flush_duration.0 * 2)
+                .unwrap_or(false)
+            {
+                warn!("during failover, skipping advancing resolved ts"; 
+                    "failover_time_ago" => ?failover.map(|failover_t| failover_t.saturating_elapsed()));
+                return false;
+            }
+            true
+        }
+    }
+
     async fn flush_for_task(
         task: String,
         store_id: u64,
@@ -645,16 +674,28 @@ where
         resolvers: SubscriptionTracer,
         meta_cli: MetadataClient<S>,
         concurrency_manager: ConcurrencyManager,
+        custom_flush_guard: impl FnOnce() -> bool,
     ) {
         let start = Instant::now_coarse();
+        // We collect and set fresh regions before doing resolving,
+        // so we make sure every fresh subscription getting normal will be considered to the checkpoint ts.
+        let fresh_regions = resolvers.collect_fresh_subs();
         // NOTE: Maybe push down the resolve step to the router?
         //       Or if there are too many duplicated `Flush` command, we may do some useless works.
-        let new_rts = Self::try_resolve(&concurrency_manager, pd_cli.clone(), resolvers).await;
+        let new_rts = Self::try_resolve(&concurrency_manager, pd_cli.clone(), &resolvers).await;
         #[cfg(feature = "failpoints")]
         fail::fail_point!("delay_on_flush");
         metrics::FLUSH_DURATION
             .with_label_values(&["resolve_by_now"])
             .observe(start.saturating_elapsed_secs());
+        let removal = resolvers.collect_removal_subs();
+        let checkpoints = removal
+            .iter()
+            .map(|sub| (&sub.meta, sub.resolver.resolved_ts()))
+            .collect::<Vec<_>>();
+        if let Err(err) = meta_cli.upload_region_checkpoint(&task, &checkpoints).await {
+            err.report("failed to upload region checkpoint");
+        }
         if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
             info!("flushing and refreshing checkpoint ts.";
                 "checkpoint_ts" => %rts,
@@ -664,11 +705,11 @@ where
                 // We cannot advance the resolved ts for now.
                 return;
             }
-            let in_flight = crate::observer::IN_FLIGHT_START_OBSERVE_MESSAGE.load(Ordering::SeqCst);
-            if in_flight > 0 {
-                warn!("inflight leader detected, skipping advancing resolved ts"; "in_flight" => %in_flight);
+            concurrency_manager.update_max_ts(TimeStamp::new(rts));
+            if !custom_flush_guard() {
                 return;
             }
+
             if let Err(err) = pd_cli
                 .update_service_safe_point(
                     format!("backup-stream-{}-{}", task, store_id),
@@ -692,7 +733,13 @@ where
                 // Currently, we only support one task at the same time,
                 // so use the task as label would be ok.
                 .with_label_values(&[task.as_str()])
-                .set(rts as _)
+                .set(rts as _);
+            if let Err(err) = meta_cli
+                .clear_region_checkpoint(&task, fresh_regions.as_slice())
+                .await
+            {
+                err.report(format!("on clearing the checkpoint for task {}", task));
+            }
         }
     }
 
@@ -702,11 +749,12 @@ where
         let pd_cli = self.pd_client.clone();
         let resolvers = self.subs.clone();
         let cm = self.concurrency_manager.clone();
+        let g = self.make_flush_guard();
         self.pool.spawn(async move {
             let info = router.get_task_info(&task).await;
             // This should only happen in testing, it would be to unwrap...
             let _ = info.unwrap().set_flushing_status_cas(false, true);
-            Self::flush_for_task(task, store_id, router, pd_cli, resolvers, cli, cm).await;
+            Self::flush_for_task(task, store_id, router, pd_cli, resolvers, cli, cm, g).await;
         });
     }
 
@@ -716,8 +764,9 @@ where
         let pd_cli = self.pd_client.clone();
         let resolvers = self.subs.clone();
         let cm = self.concurrency_manager.clone();
+        let g = self.make_flush_guard();
         self.pool.spawn(Self::flush_for_task(
-            task, store_id, router, pd_cli, resolvers, cli, cm,
+            task, store_id, router, pd_cli, resolvers, cli, cm, g,
         ));
     }
 
@@ -728,8 +777,8 @@ where
         self.pool.block_on(self.region_operator.request(op));
     }
 
-    pub fn run_task(&self, task: Task) {
-        debug!("run backup stream task"; "task" => ?task);
+    pub fn run_task(&mut self, task: Task) {
+        debug!("run backup stream task"; "task" => ?task, "store_id" => %self.store_id);
         let now = Instant::now_coarse();
         let label = task.label();
         defer! {
@@ -757,6 +806,7 @@ where
                     });
                 }
             }
+            Task::MarkFailover(t) => self.failover_time = Some(t),
         }
     }
 
@@ -809,6 +859,7 @@ pub enum Task {
         // This returns `true`.
         Box<dyn FnMut(&Router) -> bool + Send>,
     ),
+    MarkFailover(Instant),
 }
 
 #[derive(Debug)]
@@ -856,6 +907,10 @@ impl fmt::Debug for Task {
                 f.debug_tuple("FatalError").field(task).field(err).finish()
             }
             Self::Sync(..) => f.debug_tuple("Sync").finish(),
+            Self::MarkFailover(t) => f
+                .debug_tuple("MarkFailover")
+                .field(&format_args!("{:?} ago", t.saturating_elapsed()))
+                .finish(),
         }
     }
 }
@@ -888,6 +943,7 @@ impl Task {
             Task::ForceFlush(_) => "force_flush",
             Task::FatalError(..) => "fatal_error",
             Task::Sync(..) => "sync",
+            Task::MarkFailover(_) => "mark_failover",
         }
     }
 }

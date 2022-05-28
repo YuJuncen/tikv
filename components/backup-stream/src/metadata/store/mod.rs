@@ -4,8 +4,7 @@ pub mod slash_etc;
 pub use slash_etc::SlashEtcStore;
 
 pub mod etcd;
-pub mod lazy_etcd;
-use std::{future::Future, pin::Pin};
+use std::{future::Future, pin::Pin, time::Duration};
 
 use async_trait::async_trait;
 pub use etcd::EtcdStore;
@@ -28,20 +27,30 @@ impl Transaction {
         self.ops
     }
 
-    fn put(mut self, kv: KeyValue) -> Self {
-        self.ops.push(TransactionOp::Put(kv));
+    pub fn put(mut self, kv: KeyValue) -> Self {
+        self.ops.push(TransactionOp::Put(kv, PutOption::default()));
         self
     }
 
-    fn delete(mut self, keys: Keys) -> Self {
+    pub fn put_opt(mut self, kv: KeyValue, opt: PutOption) -> Self {
+        self.ops.push(TransactionOp::Put(kv, opt));
+        self
+    }
+
+    pub fn delete(mut self, keys: Keys) -> Self {
         self.ops.push(TransactionOp::Delete(keys));
         self
     }
 }
 
+#[derive(Default, Debug)]
+pub struct PutOption {
+    pub ttl: Duration,
+}
+
 #[derive(Debug)]
 pub enum TransactionOp {
-    Put(KeyValue),
+    Put(KeyValue, PutOption),
     Delete(Keys),
 }
 

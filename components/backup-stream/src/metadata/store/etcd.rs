@@ -1,22 +1,31 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{pin::Pin, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use etcd_client::{
-    DeleteOptions, EventType, GetOptions, SortOrder, SortTarget, Txn, TxnOp, WatchOptions,
+    Client, DeleteOptions, EventType, GetOptions, PutOptions, SortOrder, SortTarget, Txn, TxnOp,
+    WatchOptions,
 };
 use futures::StreamExt;
 use tikv_util::warn;
 use tokio::sync::Mutex;
 use tokio_stream::Stream;
 
-use super::{GetExtra, GetResponse, Keys, KvChangeSubscription, KvEventType, MetaStore, Snapshot};
+use super::{
+    GetExtra, GetResponse, Keys, KvChangeSubscription, KvEventType, MetaStore, Snapshot,
+    TransactionOp,
+};
 use crate::{
     errors::Result,
     metadata::{
         keys::{KeyValue, MetaKey},
-        store::{KvEvent, Subscription},
+        store::{KvEvent, Subscription}, metrics::METADATA_KEY_OPERATION,
     },
 };
 // Can we get rid of the mutex? (which means, we must use a singleton client.)
@@ -137,30 +146,81 @@ impl MetaStore for EtcdStore {
     }
 
     async fn txn(&self, t: super::Transaction) -> Result<()> {
-        self.0.lock().await.txn(t.into()).await?;
+        let mut cli = self.0.lock().await;
+        let txns = Self::make_txn(&mut cli, t).await?;
+        for txn in txns {
+            cli.txn(txn).await?;
+        }
         Ok(())
     }
 }
 
-impl From<super::Transaction> for Txn {
-    fn from(etcd_txn: super::Transaction) -> Txn {
-        let txn = Txn::default();
-        txn.and_then(
-            etcd_txn
-                .into_ops()
-                .into_iter()
-                .map(|op| match op {
-                    super::TransactionOp::Put(mut pair) => {
-                        TxnOp::put(pair.take_key(), pair.take_value(), None)
-                    }
-                    super::TransactionOp::Delete(rng) => {
-                        let mut opt = DeleteOptions::new();
-                        let key = prepare_opt!(opt, rng);
-                        TxnOp::delete(key, Some(opt))
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
+impl EtcdStore {
+    fn collect_leases_needed(txn: &super::Transaction) -> HashSet<Duration> {
+        txn.ops
+            .iter()
+            .filter_map(|op| match op {
+                TransactionOp::Put(_, opt) if opt.ttl.as_secs() > 0 => Some(opt.ttl),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn make_leases(
+        cli: &mut Client,
+        needed: HashSet<Duration>,
+    ) -> Result<HashMap<Duration, i64>> {
+        let mut map = HashMap::with_capacity(needed.len());
+        for lease_time in needed {
+            let lease_id = cli.lease_grant(lease_time.as_secs() as _, None).await?.id();
+            map.insert(lease_time, lease_id);
+        }
+        Ok(map)
+    }
+
+    fn partition_txns(mut txn: super::Transaction, leases: HashMap<Duration, i64>) -> Vec<Txn> {
+        txn.ops.chunks_mut(128)
+            .map(|txn| Txn::default().and_then(txn.iter_mut().map(|op| match op {
+                TransactionOp::Put(key, opt) => {
+                    let opts = if opt.ttl.as_secs() > 0 {
+                        let lease = leases.get(&opt.ttl);
+                        match lease {
+                            None => {
+                                warn!("lease not found, the request key may not have a ttl"; "dur" => ?opt.ttl);
+                                None
+                            } 
+                            Some(lease_id) => {
+                                Some(PutOptions::new().with_lease(*lease_id))
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    TxnOp::put(key.take_key(), key.take_value(), opts)
+                },
+                TransactionOp::Delete(rng) => {
+                    let rng = std::mem::replace(rng, Keys::Key(MetaKey(vec![])));
+                    let mut opt = DeleteOptions::new();
+                    let key = prepare_opt!(opt, rng);
+                    TxnOp::delete(key, Some(opt))
+                },
+            }).collect::<Vec<_>>()))
+            .collect()
+    }
+
+    async fn make_txn(cli: &mut Client, etcd_txn: super::Transaction) -> Result<Vec<Txn>> {
+        let (put_cnt, delete_cnt) = etcd_txn.ops.iter().fold((0, 0), |(p, d), item| {
+            match item {
+                TransactionOp::Put(_, _) => (p+1, d),
+                TransactionOp::Delete(_) => (p, d+1),
+            }
+        });
+        METADATA_KEY_OPERATION.with_label_values(&["put"]).inc_by(put_cnt);
+        METADATA_KEY_OPERATION.with_label_values(&["del"]).inc_by(delete_cnt);
+        let needed_leases = Self::collect_leases_needed(&etcd_txn);
+        let leases = Self::make_leases(cli, needed_leases).await?;
+        let txns = Self::partition_txns(etcd_txn, leases);
+        Ok(txns)
     }
 }
 

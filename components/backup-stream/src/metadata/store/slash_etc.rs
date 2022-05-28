@@ -190,7 +190,7 @@ impl MetaStore for SlashEtcStore {
         let mut data = self.lock().await;
         for op in txn.into_ops() {
             match op {
-                super::TransactionOp::Put(kv) => data.set(kv).await?,
+                super::TransactionOp::Put(kv, _) => data.set(kv).await?,
                 super::TransactionOp::Delete(range) => data.delete(range).await?,
             }
         }
