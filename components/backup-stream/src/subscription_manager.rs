@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crossbeam::channel::{Receiver as SyncReceiver, Sender as SyncSender};
 use engine_traits::KvEngine;
-use error_code::ErrorCodeExt;
+use error_code::{backup_stream::OBSERVE_CANCELED, ErrorCodeExt};
 use futures::Future;
 use kvproto::metapb::Region;
 use pd_client::PdClient;
@@ -75,7 +75,9 @@ where
     while let Ok(cmd) = cmds.recv() {
         let region_id = cmd.region.get_id();
         if let Err(err) = cmd.exec_by(init.clone()) {
-            err.report(format!("during initial scanning of region {}", region_id));
+            if err.error_code() != OBSERVE_CANCELED {
+                err.report(format!("during initial scanning of region {}", region_id));
+            }
         }
     }
 }
@@ -223,10 +225,10 @@ where
                         .inc();
                 }
                 ObserveOp::Stop { ref region } => {
-                    self.subs.deregister_region(region, |_, _| true);
+                    self.subs.deregister_region_if(region, |_, _| true);
                 }
                 ObserveOp::CheckEpochAndStop { ref region } => {
-                    self.subs.deregister_region(region, |old, new| {
+                    self.subs.deregister_region_if(region, |old, new| {
                         raftstore::store::util::compare_region_epoch(
                             old.meta.get_region_epoch(),
                             new,
@@ -271,7 +273,7 @@ where
         let need_refresh_all = !self.subs.try_update_region(region);
 
         if need_refresh_all {
-            let canceled = self.subs.deregister_region(region, |_, _| true);
+            let canceled = self.subs.deregister_region_if(region, |_, _| true);
             let handle = ObserveHandle::new();
             if canceled {
                 let for_task = self.find_task_by_region(region).unwrap_or_else(|| {
@@ -381,7 +383,7 @@ where
             metrics::SKIP_RETRY.with_label_values(&["not-leader"]).inc();
             return Ok(());
         }
-        let removed = self.subs.deregister_region(&region, |old, _| {
+        let removed = self.subs.deregister_region_if(&region, |old, _| {
             let should_remove = old.handle().id == handle.id;
             if !should_remove {
                 warn!("stale retry command"; "region" => ?region, "handle" => ?handle, "old_handle" => ?old.handle());
@@ -407,6 +409,19 @@ where
         Ok(last_checkpoint)
     }
 
+    fn spawn_scan(&self, cmd: ScanCmd) {
+        // we should not spawn initial scanning tasks to the tokio blocking pool
+        // beacuse it is also used for converting sync File I/O to async. (for now!)
+        // In that condition, if we blocking for some resouces(for example, the `MemoryQuota`)
+        // at the block threads, we may meet some ghosty deadlock.
+        let s = self.scan_pool_handle.send(cmd);
+        if let Err(err) = s {
+            let region_id = err.0.region.get_id();
+            annotate!(err, "BUG: scan_pool closed")
+                .report(format!("during initial scanning for region {}", region_id));
+        }
+    }
+
     fn observe_over_with_initial_data_from_checkpoint(
         &self,
         region: &Region,
@@ -415,22 +430,11 @@ where
     ) {
         self.subs
             .register_region(region, handle.clone(), Some(last_checkpoint));
-
-        // we should not spawn initial scanning tasks to the tokio blocking pool
-        // beacuse it is also used for converting sync File I/O to async. (for now!)
-        // In that condition, if we blocking for some resouces(for example, the `MemoryQuota`)
-        // at the block threads, we may meet some ghosty deadlock.
-        let s = self.scan_pool_handle.send(ScanCmd {
+        self.spawn_scan(ScanCmd {
             region: region.clone(),
             handle,
             last_checkpoint,
-        });
-        if let Err(err) = s {
-            annotate!(err, "BUG: scan_pool closed").report(format!(
-                "during initial scanning for region {}",
-                region.get_id()
-            ));
-        }
+        })
     }
 
     fn find_task_by_region(&self, r: &Region) -> Option<String> {

@@ -4,17 +4,21 @@ use std::{
     borrow::Borrow,
     collections::{hash_map::RandomState, BTreeMap, HashMap},
     ops::{Bound, RangeBounds},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
 use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
-use futures::{channel::mpsc, executor::block_on, StreamExt};
+use futures::{channel::mpsc, executor::block_on, Future, StreamExt};
 use kvproto::raft_cmdpb::{CmdType, Request};
 use raft::StateRole;
 use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
 use tikv::storage::CfStatistics;
-use tikv_util::{box_err, time::Instant, warn, worker::Scheduler, Either};
-use tokio::sync::{Mutex, RwLock};
+use tikv_util::{box_err, defer, time::Instant, warn, worker::Scheduler, Either};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use txn_types::{Key, Lock, LockType};
 
 use crate::{
@@ -398,6 +402,58 @@ pub fn should_track_lock(l: &Lock) -> bool {
         // (i.e. won't break the integration of data between [Lock.start_ts, get_ts()))
         // it is safe for ignoring them and advancing resolved_ts.
         LockType::Lock | LockType::Pessimistic => false,
+    }
+}
+
+pub struct CallbackWaitGroup {
+    running: AtomicUsize,
+    on_finish_all: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
+}
+
+impl CallbackWaitGroup {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            running: AtomicUsize::new(0),
+            on_finish_all: std::sync::Mutex::default(),
+        })
+    }
+
+    fn upload_done(&self) {
+        let last = self.running.fetch_sub(1, Ordering::SeqCst);
+        if last == 1 {
+            self.on_finish_all
+                .lock()
+                .unwrap()
+                .drain(..)
+                .for_each(|x| x())
+        }
+    }
+
+    /// wait until all running tasks done.
+    /// returns the remaining running tasks.
+    pub async fn wait(&self, timeout: Duration) -> usize {
+        // Fast path: no uploading.
+        if self.running.load(Ordering::SeqCst) == 0 {
+            return 0;
+        }
+
+        let (tx, rx) = oneshot::channel();
+        self.on_finish_all.lock().unwrap().push(Box::new(move || {
+            // The waiter may timed out.
+            let _ = tx.send(());
+        }));
+        let delay = tokio::time::timeout(timeout, rx);
+        let _ = delay.await;
+        self.running.load(Ordering::SeqCst)
+    }
+
+    /// spawn a new async task.
+    pub async fn spawn(&self, f: impl Future<Output = ()>) {
+        self.running.fetch_add(1, Ordering::SeqCst);
+        defer! {
+            self.upload_done()
+        }
+        f.await
     }
 }
 
