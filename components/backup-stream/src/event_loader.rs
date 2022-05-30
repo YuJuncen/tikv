@@ -236,6 +236,10 @@ where
                         | Error::RaftStore(raftstore::Error::NotLeader(..)) => false,
                         _ => true,
                     };
+                    e.report(format_args!(
+                        "during getting initial snapshot for region {:?}; can retry = {}",
+                        region, can_retry
+                    ));
                     last_err = match last_err {
                         None => Some(e),
                         Some(err) => Some(Error::Contextual {
@@ -391,6 +395,7 @@ where
         region: &Region,
         start_ts: TimeStamp,
         snap: impl Snapshot,
+        on_finish: impl FnOnce() + Send + 'static,
     ) -> Result<Statistics> {
         let _guard = self.handle.enter();
         // It is ok to sink more data than needed. So scan to +inf TS for convenance.
@@ -420,6 +425,7 @@ where
                     region_id
                 ));
             }
+            on_finish()
         });
         stats
     }
@@ -440,9 +446,7 @@ where
                 //       At that time, we have nowhere to record the lock status of this region.
                 let success = try_send!(
                     self.scheduler,
-                    Task::ModifyObserve(ObserveOp::Start {
-                        region: r.region,
-                    })
+                    Task::ModifyObserve(ObserveOp::Start { region: r.region })
                 );
                 if success {
                     crate::observer::IN_FLIGHT_START_OBSERVE_MESSAGE.fetch_add(1, Ordering::SeqCst);

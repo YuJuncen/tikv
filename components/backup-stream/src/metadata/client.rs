@@ -73,12 +73,13 @@ impl PartialEq for MetadataEvent {
 pub enum CheckpointProvider {
     Store(u64),
     Region { id: u64, version: u64 },
+    Task,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Checkpoint {
     pub provider: CheckpointProvider,
-    pub checkpoint: TimeStamp,
+    pub ts: TimeStamp,
 }
 
 impl Checkpoint {
@@ -89,7 +90,7 @@ impl Checkpoint {
                 Ok(Checkpoint {
                     // The V1 checkpoint, maybe fill the store id?
                     provider: CheckpointProvider::Store(0),
-                    checkpoint: TimeStamp::new(parse_ts_from_bytes(kv.1.as_slice())?),
+                    ts: TimeStamp::new(parse_ts_from_bytes(kv.1.as_slice())?),
                 })
             }
         }
@@ -141,7 +142,7 @@ impl Checkpoint {
         let checkpoint = TimeStamp::new(parse_ts_from_bytes(checkpoint_ts)?);
         Ok(Self {
             provider,
-            checkpoint,
+            ts: checkpoint,
         })
     }
 
@@ -156,7 +157,7 @@ impl Checkpoint {
         let provider = CheckpointProvider::Region { id, version };
         Ok(Self {
             provider,
-            checkpoint,
+            ts: checkpoint,
         })
     }
 }
@@ -511,25 +512,40 @@ impl<Store: MetaStore> MetadataClient<Store> {
         Ok(checkpoints)
     }
 
-    /// get the global progress (the min next_backup_ts among all stores).
-    pub async fn global_progress_of_task(&self, task_name: &str) -> Result<u64> {
-        let global_ts = match self
+    async fn get_task_start_ts_checkpoint(&self, task_name: &str) -> Result<Checkpoint> {
+        let task = self
+            .get_task(task_name)
+            .await?
+            .ok_or_else(|| Error::NoSuchTask {
+                task_name: task_name.to_owned(),
+            })?;
+        Ok(Checkpoint {
+            ts: TimeStamp::new(task.info.start_ts),
+            provider: CheckpointProvider::Task,
+        })
+    }
+
+    pub async fn global_checkpoint_of_task(&self, task_name: &str) -> Result<Checkpoint> {
+        let cp = match self
             .checkpoints_of(task_name)
             .await?
             .iter()
-            .min_by_key(|cp| cp.checkpoint)
+            .min_by_key(|cp| cp.ts)
         {
-            Some(cp) => cp.checkpoint.into_inner(),
-            None => {
-                let task = self.get_task(task_name).await?;
-                task.ok_or_else(|| Error::NoSuchTask {
-                    task_name: task_name.to_owned(),
-                })?
-                .info
-                .start_ts
-            }
+            Some(cp) => cp.clone(),
+            None => self.get_task_start_ts_checkpoint(task_name).await?,
         };
-        Ok(global_ts)
+        Ok(cp)
+    }
+
+    /// get the global progress (the min next_backup_ts among all stores).
+    pub async fn global_progress_of_task(&self, task_name: &str) -> Result<u64> {
+        let ts = self
+            .global_checkpoint_of_task(task_name)
+            .await?
+            .ts
+            .into_inner();
+        Ok(ts)
     }
 
     /// insert a task with ranges into the metadata store.
@@ -594,17 +610,25 @@ impl<Store: MetaStore> MetadataClient<Store> {
         self.meta_store.txn(txn).await
     }
 
-    pub async fn get_region_checkpoint(
-        &self,
-        task: &str,
-        region: &Region,
-    ) -> Result<Option<Checkpoint>> {
+    pub async fn get_region_checkpoint(&self, task: &str, region: &Region) -> Result<Checkpoint> {
         let key = MetaKey::next_bakcup_ts_of_region(task, region);
         let s = self.meta_store.snapshot().await?;
         let r = s.get(Keys::Key(key.clone())).await?;
         match r.len() {
-            0 => Ok(None),
-            _ => Ok(Some(Checkpoint::from_kv(&r[0])?)),
+            0 => {
+                let global_cp = self
+                    .checkpoints_of(task)
+                    .await?
+                    .into_iter()
+                    .filter(|cp| !matches!(cp.provider, CheckpointProvider::Region { .. }))
+                    .min_by_key(|cp| cp.ts);
+                let cp = match global_cp {
+                    None => self.get_task_start_ts_checkpoint(task).await?,
+                    Some(cp) => cp,
+                };
+                Ok(cp)
+            }
+            _ => Ok(Checkpoint::from_kv(&r[0])?),
         }
     }
 }
@@ -650,6 +674,7 @@ mod test {
                     MetaKey::next_bakcup_ts_of_region("test", &r)
                 }
                 CheckpointProvider::Store(id) => MetaKey::next_backup_ts_of("test", id),
+                Task => unreachable!(),
             };
             let checkpoint = c.checkpoint;
             let cp_bytes = checkpoint.to_be_bytes();
@@ -659,7 +684,7 @@ mod test {
                 parsed,
                 Checkpoint {
                     provider: c.provider,
-                    checkpoint: TimeStamp::new(c.checkpoint),
+                    ts: TimeStamp::new(c.checkpoint),
                 }
             );
         }

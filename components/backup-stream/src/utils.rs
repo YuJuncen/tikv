@@ -12,7 +12,7 @@ use std::{
 };
 
 use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
-use futures::{channel::mpsc, executor::block_on, Future, StreamExt};
+use futures::{channel::mpsc, executor::block_on, Future, FutureExt, StreamExt};
 use kvproto::raft_cmdpb::{CmdType, Request};
 use raft::StateRole;
 use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
@@ -23,6 +23,7 @@ use txn_types::{Key, Lock, LockType};
 
 use crate::{
     errors::{Error, Result},
+    metadata::store::BoxFuture,
     Task,
 };
 
@@ -418,7 +419,7 @@ impl CallbackWaitGroup {
         })
     }
 
-    fn upload_done(&self) {
+    fn work_done(&self) {
         let last = self.running.fetch_sub(1, Ordering::SeqCst);
         if last == 1 {
             self.on_finish_all
@@ -430,11 +431,10 @@ impl CallbackWaitGroup {
     }
 
     /// wait until all running tasks done.
-    /// returns the remaining running tasks.
-    pub async fn wait(&self, timeout: Duration) -> usize {
+    pub fn wait(&self) -> BoxFuture<()> {
         // Fast path: no uploading.
         if self.running.load(Ordering::SeqCst) == 0 {
-            return 0;
+            return Box::pin(futures::future::ready(()));
         }
 
         let (tx, rx) = oneshot::channel();
@@ -442,24 +442,41 @@ impl CallbackWaitGroup {
             // The waiter may timed out.
             let _ = tx.send(());
         }));
-        let delay = tokio::time::timeout(timeout, rx);
-        let _ = delay.await;
-        self.running.load(Ordering::SeqCst)
+        // try to acquire the lock again.
+        if self.running.load(Ordering::SeqCst) == 0 {
+            return Box::pin(futures::future::ready(()));
+        }
+        Box::pin(rx.map(|_| ()))
     }
 
-    /// spawn a new async task.
-    pub async fn spawn(&self, f: impl Future<Output = ()>) {
+    /// make a work, as long as the return value held, mark a work in the group is running.
+    pub fn work(self: Arc<Self>) -> Work {
         self.running.fetch_add(1, Ordering::SeqCst);
-        defer! {
-            self.upload_done()
-        }
-        f.await
+        Work(self)
+    }
+}
+
+pub struct Work(Arc<CallbackWaitGroup>);
+
+impl Drop for Work {
+    fn drop(&mut self) {
+        self.0.work_done();
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::utils::SegmentMap;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use futures::executor::block_on;
+
+    use crate::utils::{CallbackWaitGroup, SegmentMap};
 
     #[test]
     fn test_segment_tree() {
@@ -482,5 +499,68 @@ mod test {
         assert!(!tree.is_overlapping((&9, &10)));
         assert!(tree.is_overlapping((&2, &10)));
         assert!(tree.is_overlapping((&0, &9999999)));
+    }
+
+    #[test]
+    fn test_wait_group() {
+        #[derive(Debug)]
+        struct Case {
+            bg_task: usize,
+            repeat: usize,
+        }
+
+        fn run_case(c: Case) {
+            for i in 0..c.repeat {
+                let wg = CallbackWaitGroup::new();
+                let cnt = Arc::new(AtomicUsize::new(c.bg_task));
+                for _ in 0..c.bg_task {
+                    let cnt = cnt.clone();
+                    let work = wg.clone().work();
+                    tokio::spawn(async move {
+                        cnt.fetch_sub(1, Ordering::SeqCst);
+                        drop(work);
+                    });
+                }
+                let _ = block_on(tokio::time::timeout(Duration::from_secs(20), wg.wait())).unwrap();
+                assert_eq!(cnt.load(Ordering::SeqCst), 0, "{:?}@{}", c, i);
+            }
+        }
+
+        let cases = [
+            Case {
+                bg_task: 200000,
+                repeat: 1,
+            },
+            Case {
+                bg_task: 65535,
+                repeat: 1,
+            },
+            Case {
+                bg_task: 512,
+                repeat: 1,
+            },
+            Case {
+                bg_task: 2,
+                repeat: 100000,
+            },
+            Case {
+                bg_task: 1,
+                repeat: 100000,
+            },
+            Case {
+                bg_task: 0,
+                repeat: 1,
+            },
+        ];
+
+        let pool = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()
+            .unwrap();
+        let _guard = pool.handle().enter();
+        for case in cases {
+            run_case(case)
+        }
     }
 }

@@ -1,9 +1,12 @@
-use std::sync::Arc;
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 use crossbeam::channel::{Receiver as SyncReceiver, Sender as SyncSender};
 use engine_traits::KvEngine;
 use error_code::{backup_stream::OBSERVE_CANCELED, ErrorCodeExt};
-use futures::Future;
+use futures::{Future, FutureExt};
 use kvproto::metapb::Region;
 use pd_client::PdClient;
 use raft::StateRole;
@@ -27,7 +30,9 @@ use crate::{
     observer::BackupStreamObserver,
     router::Router,
     subscription_track::SubscriptionTracer,
-    try_send, utils, Task,
+    try_send,
+    utils::{self, CallbackWaitGroup, Work},
+    Task,
 };
 
 type ScanPool = yatp::ThreadPool<yatp::task::callback::TaskCell>;
@@ -37,6 +42,7 @@ struct ScanCmd {
     region: Region,
     handle: ObserveHandle,
     last_checkpoint: TimeStamp,
+    work: Work,
 }
 
 impl ScanCmd {
@@ -51,13 +57,14 @@ impl ScanCmd {
             region,
             handle,
             last_checkpoint,
+            work,
         } = self;
         let begin = Instant::now_coarse();
         let region_id = region.get_id();
         let snap = init.observe_over_with_retry(&region, move || {
             ChangeObserver::from_pitr(region_id, handle.clone())
         })?;
-        let stat = init.do_initial_scan(&region, last_checkpoint, snap)?;
+        let stat = init.do_initial_scan(&region, last_checkpoint, snap, move || drop(work))?;
         info!("initial scanning of leader transforming finished!"; "takes" => ?begin.saturating_elapsed(), "region" => %region.get_id(), "from_ts" => %last_checkpoint);
         utils::record_cf_stat("lock", &stat.lock);
         utils::record_cf_stat("write", &stat.write);
@@ -73,12 +80,21 @@ where
     RT: RaftStoreRouter<E>,
 {
     while let Ok(cmd) = cmds.recv() {
+        metrics::PENDING_INITIAL_SCAN_LEN
+            .with_label_values(&["queuing"])
+            .dec();
+        metrics::PENDING_INITIAL_SCAN_LEN
+            .with_label_values(&["executing"])
+            .inc();
         let region_id = cmd.region.get_id();
         if let Err(err) = cmd.exec_by(init.clone()) {
             if err.error_code() != OBSERVE_CANCELED {
                 err.report(format!("during initial scanning of region {}", region_id));
             }
         }
+        metrics::PENDING_INITIAL_SCAN_LEN
+            .with_label_values(&["executing"])
+            .dec();
     }
 }
 
@@ -133,6 +149,7 @@ pub struct RegionSubscriptionManager<S, R, PDC> {
 
     messenger: Sender<ObserveOp>,
     scan_pool_handle: SyncSender<ScanCmd>,
+    scans: Arc<CallbackWaitGroup>,
 }
 
 impl<S, R, PDC> Clone for RegionSubscriptionManager<S, R, PDC>
@@ -153,6 +170,7 @@ where
             subs: self.subs.clone(),
             messenger: self.messenger.clone(),
             scan_pool_handle: self.scan_pool_handle.clone(),
+            scans: CallbackWaitGroup::new(),
         }
     }
 }
@@ -198,6 +216,7 @@ where
             subs: initial_loader.tracing.clone(),
             messenger: tx,
             scan_pool_handle,
+            scans: CallbackWaitGroup::new(),
         };
         let fut = op.clone().region_operator_loop(rx);
         (op, fut)
@@ -213,6 +232,11 @@ where
         }
     }
 
+    /// wait initial scanning get finished.
+    pub fn wait(&self, timeout: Duration) -> impl Future<Output = bool> + Send + 'static {
+        tokio::time::timeout(timeout, self.scans.wait()).map(|result| result.is_err())
+    }
+
     /// the handler loop.
     async fn region_operator_loop(self, mut message_box: Receiver<ObserveOp>) {
         while let Some(op) = message_box.recv().await {
@@ -223,12 +247,13 @@ where
                     metrics::INITIAL_SCAN_REASON
                         .with_label_values(&["leader-changed"])
                         .inc();
+                    crate::observer::IN_FLIGHT_START_OBSERVE_MESSAGE.fetch_sub(1, Ordering::SeqCst);
                 }
                 ObserveOp::Stop { ref region } => {
                     self.subs.deregister_region_if(region, |_, _| true);
                 }
-                ObserveOp::CheckEpochAndStop { ref region } => {
-                    self.subs.deregister_region_if(region, |old, new| {
+                ObserveOp::Destroy { ref region } => {
+                    let stopped = self.subs.deregister_region_if(region, |old, new| {
                         raftstore::store::util::compare_region_epoch(
                             old.meta.get_region_epoch(),
                             new,
@@ -239,6 +264,9 @@ where
                         .map_err(|err| warn!("check epoch and stop failed."; "err" => %err))
                         .is_ok()
                     });
+                    if stopped {
+                        self.subs.destroy_stopped_region(region.get_id());
+                    }
                 }
                 ObserveOp::RefreshResolver { ref region } => self.refresh_resolver(&region).await,
                 ObserveOp::NotifyFailToStartObserve {
@@ -288,7 +316,7 @@ where
                 let r = async {
                     Result::Ok(self.observe_over_with_initial_data_from_checkpoint(
                         region,
-                        self.get_last_checkpoint_of(&for_task).await?,
+                        self.get_last_checkpoint_of(&for_task, region).await?,
                         handle.clone(),
                     ))
                 }
@@ -320,22 +348,11 @@ where
             }
 
             Some(for_task) => {
-                let tso = self.get_last_checkpoint_of(&for_task).await?;
-                // We should set the local checkpoint to the newly added task ASAP,
-                // or once the original leader store of this region get rid of the slow-progress region,
-                // it may advance the global checkpoint unexpectlly.
-                // NOTE: maybe `spawn` here?
-                self.get_meta_client()
-                    .set_local_task_checkpoint(&for_task, tso.into_inner())
-                    .await?;
+                let tso = self.get_last_checkpoint_of(&for_task, region).await?;
                 self.observe_over_with_initial_data_from_checkpoint(&region, tso, handle.clone());
             }
         }
         Ok(())
-    }
-
-    fn get_meta_client(&self) -> &MetadataClient<S> {
-        &self.meta_cli
     }
 
     async fn start_observe(&self, region: Region) {
@@ -403,13 +420,17 @@ where
         Ok(())
     }
 
-    async fn get_last_checkpoint_of(&self, task: &str) -> Result<TimeStamp> {
-        let meta_cli = self.get_meta_client();
-        let last_checkpoint = TimeStamp::new(meta_cli.global_progress_of_task(task).await?);
-        Ok(last_checkpoint)
+    async fn get_last_checkpoint_of(&self, task: &str, region: &Region) -> Result<TimeStamp> {
+        let meta_cli = self.meta_cli.as_ref().unwrap().clone();
+        let cp = meta_cli.get_region_checkpoint(task, region).await?;
+        info!("got region checkpoint"; "region_id" => %region.get_id(), "checkpoint" => ?cp);
+        Ok(cp.ts)
     }
 
     fn spawn_scan(&self, cmd: ScanCmd) {
+        metrics::PENDING_INITIAL_SCAN_LEN
+            .with_label_values(&["queuing"])
+            .inc();
         // we should not spawn initial scanning tasks to the tokio blocking pool
         // beacuse it is also used for converting sync File I/O to async. (for now!)
         // In that condition, if we blocking for some resouces(for example, the `MemoryQuota`)
@@ -434,6 +455,7 @@ where
             region: region.clone(),
             handle,
             last_checkpoint,
+            work: self.scans.clone().work(),
         })
     }
 

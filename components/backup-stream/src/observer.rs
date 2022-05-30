@@ -172,7 +172,7 @@ impl RegionChangeObserver for BackupStreamObserver {
             RegionChangeEvent::Destroy => {
                 try_send!(
                     self.scheduler,
-                    Task::ModifyObserve(ObserveOp::CheckEpochAndStop {
+                    Task::ModifyObserve(ObserveOp::Destroy {
                         region: ctx.region().clone(),
                     })
                 );

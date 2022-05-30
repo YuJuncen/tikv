@@ -11,7 +11,7 @@ use std::{
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::KvEngine;
 use error_code::ErrorCodeExt;
-use futures::FutureExt;
+use futures::{Future, FutureExt};
 use kvproto::{
     brpb::{StreamBackupError, StreamBackupTaskInfo},
     metapb::Region,
@@ -648,11 +648,6 @@ where
         let failover = self.failover_time;
         let flush_duration = self.config.max_flush_interval;
         move || {
-            let in_flight = crate::observer::IN_FLIGHT_START_OBSERVE_MESSAGE.load(Ordering::SeqCst);
-            if in_flight > 0 {
-                warn!("inflight leader detected, skipping advancing resolved ts"; "in_flight" => %in_flight);
-                return false;
-            }
             if failover
                 .as_ref()
                 .map(|failover_t| failover_t.saturating_elapsed() < flush_duration.0 * 2)
@@ -674,9 +669,11 @@ where
         resolvers: SubscriptionTracer,
         meta_cli: MetadataClient<S>,
         concurrency_manager: ConcurrencyManager,
-        custom_flush_guard: impl FnOnce() -> bool,
+        flush_if: impl FnOnce() -> bool,
+        flush_after: impl Future<Output = ()>,
     ) {
         let start = Instant::now_coarse();
+        flush_after.await;
         // We collect and set fresh regions before doing resolving,
         // so we make sure every fresh subscription getting normal will be considered to the checkpoint ts.
         let fresh_regions = resolvers.collect_fresh_subs();
@@ -706,7 +703,7 @@ where
                 return;
             }
             concurrency_manager.update_max_ts(TimeStamp::new(rts));
-            if !custom_flush_guard() {
+            if !flush_if() {
                 return;
             }
 
@@ -750,11 +747,23 @@ where
         let resolvers = self.subs.clone();
         let cm = self.concurrency_manager.clone();
         let g = self.make_flush_guard();
+        let flush_guard = futures::future::ready(());
         self.pool.spawn(async move {
             let info = router.get_task_info(&task).await;
             // This should only happen in testing, it would be to unwrap...
             let _ = info.unwrap().set_flushing_status_cas(false, true);
-            Self::flush_for_task(task, store_id, router, pd_cli, resolvers, cli, cm, g).await;
+            Self::flush_for_task(
+                task,
+                store_id,
+                router,
+                pd_cli,
+                resolvers,
+                cli,
+                cm,
+                g,
+                flush_guard,
+            )
+            .await;
         });
     }
 
@@ -764,9 +773,25 @@ where
         let pd_cli = self.pd_client.clone();
         let resolvers = self.subs.clone();
         let cm = self.concurrency_manager.clone();
-        let g = self.make_flush_guard();
-        self.pool.spawn(Self::flush_for_task(
-            task, store_id, router, pd_cli, resolvers, cli, cm, g,
+        let flush_if = self.make_flush_guard();
+        let _h = self.pool.handle().enter();
+        let now = Instant::now();
+        let flush_after = self
+            .region_operator
+            .wait(Duration::from_secs(10))
+            .map(move |timedout| {
+                info!("waiting for initial scanning done!"; "take" => ?now.saturating_elapsed(), "timedout" => %timedout)
+            });
+        tokio::spawn(Self::flush_for_task(
+            task,
+            store_id,
+            router,
+            pd_cli,
+            resolvers,
+            cli,
+            cm,
+            flush_if,
+            flush_after,
         ));
     }
 
@@ -878,7 +903,11 @@ pub enum ObserveOp {
     Stop {
         region: Region,
     },
-    CheckEpochAndStop {
+    /// Destroy the region subscription.
+    /// Unlike `Stop`, this will assume the region would never go back.
+    /// For now, the effect of "never go back" is that we won't try to hint other store
+    /// the checkpoint ts of this region.
+    Destroy {
         region: Region,
     },
     RefreshResolver {
@@ -936,7 +965,7 @@ impl Task {
             Task::ModifyObserve(o) => match o {
                 ObserveOp::Start { .. } => "modify_observe.start",
                 ObserveOp::Stop { .. } => "modify_observe.stop",
-                ObserveOp::CheckEpochAndStop { .. } => "modify_observe.check_epoch_and_stop",
+                ObserveOp::Destroy { .. } => "modify_observe.check_epoch_and_stop",
                 ObserveOp::RefreshResolver { .. } => "modify_observe.refresh_resolver",
                 ObserveOp::NotifyFailToStartObserve { .. } => "modify_observe.retry",
             },

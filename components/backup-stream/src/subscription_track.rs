@@ -158,6 +158,12 @@ impl SubscriptionTracer {
         }
     }
 
+    /// destroy subscription if the subscription is stopped.
+    pub fn destroy_stopped_region(&self, region_id: u64) {
+        self.0
+            .remove_if(&region_id, |_, sub| sub.state == SubscriptionState::Removal);
+    }
+
     /// try to mark a region no longer be tracked by this observer.
     /// returns whether success (it failed if the region hasn't been observed when calling this.)
     pub fn deregister_region_if(

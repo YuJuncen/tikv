@@ -141,4 +141,10 @@ lazy_static! {
         &["task"]
     )
     .unwrap();
+    pub static ref PENDING_INITIAL_SCAN_LEN: IntGaugeVec = register_int_gauge_vec!(
+        "pending_initial_scan",
+        "The pending initial scan",
+        &["stage"]
+    )
+    .unwrap();
 }
