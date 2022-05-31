@@ -25,6 +25,7 @@ use crate::{
     endpoint::ObserveOp,
     errors::{Error, Result},
     event_loader::InitialDataLoader,
+    future,
     metadata::{store::MetaStore, MetadataClient},
     metrics,
     observer::BackupStreamObserver,
@@ -199,7 +200,7 @@ where
         meta_cli: MetadataClient<S>,
         pd_client: Arc<PDC>,
         scan_pool_size: usize,
-    ) -> (Self, impl Future<Output = ()> + Send + 'static)
+    ) -> (Self, future![()])
     where
         E: KvEngine,
         RT: RaftStoreRouter<E> + 'static,
@@ -233,7 +234,7 @@ where
     }
 
     /// wait initial scanning get finished.
-    pub fn wait(&self, timeout: Duration) -> impl Future<Output = bool> + Send + 'static {
+    pub fn wait(&self, timeout: Duration) -> future![bool] {
         tokio::time::timeout(timeout, self.scans.wait()).map(|result| result.is_err())
     }
 
@@ -288,6 +289,17 @@ where
                             );
                         }
                     }
+                }
+                ObserveOp::ResolveRegions { callback, min_ts } => {
+                    let now = Instant::now();
+                    let timedout = self.wait(Duration::from_secs(30)).await;
+                    if timedout {
+                        warn!("waiting for initial scanning done timed out, forcing progress(with risk of data loss)!"; 
+                            "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
+                    }
+                    let rts = self.subs.resolve_with(min_ts);
+                    self.subs.warn_if_gap_too_huge(rts);
+                    callback(rts);
                 }
             }
         }

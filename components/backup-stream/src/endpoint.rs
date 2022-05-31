@@ -11,7 +11,7 @@ use std::{
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::KvEngine;
 use error_code::ErrorCodeExt;
-use futures::{Future, FutureExt};
+use futures::{future::BoxFuture, Future, FutureExt};
 use kvproto::{
     brpb::{StreamBackupError, StreamBackupTaskInfo},
     metapb::Region,
@@ -34,6 +34,7 @@ use tikv_util::{
 use tokio::{
     io::Result as TokioResult,
     runtime::{Handle, Runtime},
+    sync::oneshot,
 };
 use tokio_stream::StreamExt;
 use txn_types::TimeStamp;
@@ -42,14 +43,18 @@ use super::metrics::HANDLE_EVENT_DURATION_HISTOGRAM;
 use crate::{
     errors::{Error, Result},
     event_loader::{InitialDataLoader, PendingMemoryQuota},
-    metadata::{store::MetaStore, MetadataClient, MetadataEvent, StreamTask},
+    future,
+    metadata::{
+        store::{EtcdStore, MetaStore},
+        MetadataClient, MetadataEvent, StreamTask,
+    },
     metrics::{self, TaskStatus},
     observer::BackupStreamObserver,
     router::{ApplyEvents, Router, FLUSH_STORAGE_INTERVAL},
     subscription_manager::RegionSubscriptionManager,
     subscription_track::SubscriptionTracer,
     try_send,
-    utils::{self, StopWatch},
+    utils::{self, CallbackWaitGroup, StopWatch, Work},
 };
 
 const SLOW_EVENT_THRESHOLD: f64 = 120.0;
@@ -383,7 +388,7 @@ where
         Some(kvs)
     }
 
-    fn backup_batch(&self, batch: CmdBatch) {
+    fn backup_batch(&self, batch: CmdBatch, work: Work) {
         let mut sw = StopWatch::new();
 
         let router = self.range_router.clone();
@@ -413,7 +418,8 @@ where
             }
             HANDLE_EVENT_DURATION_HISTOGRAM
                 .with_label_values(&["save_to_temp_file"])
-                .observe(time_cost)
+                .observe(time_cost);
+            drop(work)
         });
     }
 
@@ -639,7 +645,6 @@ where
         let min_ts = cm.global_min_lock_ts().unwrap_or(TimeStamp::max());
         let tso = Ord::min(pd_tso, min_ts);
         let ts = resolvers.resolve_with(tso);
-        resolvers.warn_if_gap_too_huge(ts);
         ts
     }
 
@@ -661,6 +666,38 @@ where
         }
     }
 
+    fn prepare_min_ts(&self) -> future![TimeStamp] {
+        let pd_cli = self.pd_client.clone();
+        let cm = self.concurrency_manager.clone();
+        async move {
+            let pd_tso = pd_cli
+                .get_tso()
+                .await
+                .map_err(|err| Error::from(err).report("failed to get tso from pd"))
+                .unwrap_or_default();
+            let min_ts = cm.global_min_lock_ts().unwrap_or(TimeStamp::max());
+            let tso = Ord::min(pd_tso, min_ts);
+            tso
+        }
+    }
+
+    fn get_resolved_ts(&self) -> future![TimeStamp] {
+        let get_min_ts = self.prepare_min_ts();
+        let (tx, rx) = oneshot::channel();
+        let op = self.region_operator.clone();
+        async move {
+            let min_ts = get_min_ts.await;
+            let req = ObserveOp::ResolveRegions {
+                callback: Box::new(move |ts| {
+                    let _ = tx.send(ts);
+                }),
+                min_ts,
+            };
+            op.request(req).await;
+            rx.await.expect("BUG: resolve regions dropped tx")
+        }
+    }
+
     async fn flush_for_task(
         task: String,
         store_id: u64,
@@ -670,16 +707,15 @@ where
         meta_cli: MetadataClient<S>,
         concurrency_manager: ConcurrencyManager,
         flush_if: impl FnOnce() -> bool,
-        flush_after: impl Future<Output = ()>,
+        get_rts: impl Future<Output = TimeStamp>,
     ) {
         let start = Instant::now_coarse();
-        flush_after.await;
         // We collect and set fresh regions before doing resolving,
         // so we make sure every fresh subscription getting normal will be considered to the checkpoint ts.
         let fresh_regions = resolvers.collect_fresh_subs();
         // NOTE: Maybe push down the resolve step to the router?
         //       Or if there are too many duplicated `Flush` command, we may do some useless works.
-        let new_rts = Self::try_resolve(&concurrency_manager, pd_cli.clone(), &resolvers).await;
+        let new_rts = get_rts.await;
         #[cfg(feature = "failpoints")]
         fail::fail_point!("delay_on_flush");
         metrics::FLUSH_DURATION
@@ -747,7 +783,7 @@ where
         let resolvers = self.subs.clone();
         let cm = self.concurrency_manager.clone();
         let g = self.make_flush_guard();
-        let flush_guard = futures::future::ready(());
+        let flush_guard = self.get_resolved_ts();
         self.pool.spawn(async move {
             let info = router.get_task_info(&task).await;
             // This should only happen in testing, it would be to unwrap...
@@ -775,13 +811,7 @@ where
         let cm = self.concurrency_manager.clone();
         let flush_if = self.make_flush_guard();
         let _h = self.pool.handle().enter();
-        let now = Instant::now();
-        let flush_after = self
-            .region_operator
-            .wait(Duration::from_secs(10))
-            .map(move |timedout| {
-                info!("waiting for initial scanning done!"; "take" => ?now.saturating_elapsed(), "timedout" => %timedout)
-            });
+        let flush_guard = self.get_resolved_ts();
         tokio::spawn(Self::flush_for_task(
             task,
             store_id,
@@ -791,7 +821,7 @@ where
             cli,
             cm,
             flush_if,
-            flush_after,
+            flush_guard,
         ));
     }
 
@@ -836,9 +866,11 @@ where
     }
 
     pub fn do_backup(&self, events: Vec<CmdBatch>) {
+        let wg = CallbackWaitGroup::new();
         for batch in events {
-            self.backup_batch(batch)
+            self.backup_batch(batch, wg.clone().work());
         }
+        self.pool.block_on(wg.wait())
     }
 }
 
@@ -895,7 +927,6 @@ pub enum TaskOp {
     ResumeTask(String),
 }
 
-#[derive(Debug)]
 pub enum ObserveOp {
     Start {
         region: Region,
@@ -918,6 +949,38 @@ pub enum ObserveOp {
         handle: ObserveHandle,
         err: Box<Error>,
     },
+    ResolveRegions {
+        callback: Box<dyn FnOnce(TimeStamp) + 'static + Send>,
+        min_ts: TimeStamp,
+    },
+}
+
+impl std::fmt::Debug for ObserveOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Start { region } => f.debug_struct("Start").field("region", region).finish(),
+            Self::Stop { region } => f.debug_struct("Stop").field("region", region).finish(),
+            Self::Destroy { region } => f.debug_struct("Destroy").field("region", region).finish(),
+            Self::RefreshResolver { region } => f
+                .debug_struct("RefreshResolver")
+                .field("region", region)
+                .finish(),
+            Self::NotifyFailToStartObserve {
+                region,
+                handle,
+                err,
+            } => f
+                .debug_struct("NotifyFailToStartObserve")
+                .field("region", region)
+                .field("handle", handle)
+                .field("err", err)
+                .finish(),
+            Self::ResolveRegions { .. } => f
+                .debug_struct("ResolveRegions")
+                .field("callback", &format_args!("fn (TimeStamp) -> {{ .. }}"))
+                .finish(),
+        }
+    }
 }
 
 impl fmt::Debug for Task {
@@ -965,9 +1028,10 @@ impl Task {
             Task::ModifyObserve(o) => match o {
                 ObserveOp::Start { .. } => "modify_observe.start",
                 ObserveOp::Stop { .. } => "modify_observe.stop",
-                ObserveOp::Destroy { .. } => "modify_observe.check_epoch_and_stop",
+                ObserveOp::Destroy { .. } => "modify_observe.destroy",
                 ObserveOp::RefreshResolver { .. } => "modify_observe.refresh_resolver",
                 ObserveOp::NotifyFailToStartObserve { .. } => "modify_observe.retry",
+                ObserveOp::ResolveRegions { .. } => "modify_observe.resolve",
             },
             Task::ForceFlush(_) => "force_flush",
             Task::FatalError(..) => "fatal_error",

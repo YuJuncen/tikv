@@ -230,7 +230,8 @@ where
                         Error::RaftRequest(pbe) => {
                             !(pbe.has_epoch_not_match()
                                 || pbe.has_not_leader()
-                                || pbe.get_message().contains("stale observe id"))
+                                || pbe.get_message().contains("stale observe id")
+                                || pbe.has_region_not_found())
                         }
                         Error::RaftStore(raftstore::Error::RegionNotFound(_))
                         | Error::RaftStore(raftstore::Error::NotLeader(..)) => false,
