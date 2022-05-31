@@ -132,6 +132,8 @@ impl SubscriptionTracer {
     pub fn resolve_with(&self, min_ts: TimeStamp) -> TimeStamp {
         self.0
             .iter_mut()
+            // Don't advance the checkpoint ts of removed region.
+            .filter(|s| s.state != SubscriptionState::Removal)
             .map(|mut s| s.resolver.resolve(min_ts))
             .min()
             // If there isn't any region observed, the `min_ts` can be used as resolved ts safely.
@@ -386,7 +388,18 @@ impl TwoPhaseResolver {
         for lock in std::mem::take(&mut self.future_locks).into_iter() {
             self.handle_future_lock(lock);
         }
-        self.stable_ts = None
+        let ts = self.stable_ts.take();
+        match ts {
+            Some(ts) => {
+                // advance the internal resolver.
+                // the start ts of initial scanning would be a safe ts for min ts
+                // -- because is used to be a resolved ts.
+                self.resolver.resolve(ts);
+            }
+            None => {
+                warn!("BUG: a two-phase resolver is executing phase_one_done when not in phase one"; "resolver" => ?self)
+            }
+        }
     }
 }
 

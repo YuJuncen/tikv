@@ -396,6 +396,25 @@ impl<Store: MetaStore> MetadataClient<Store> {
         Ok(())
     }
 
+    pub async fn get_local_task_checkpoint(&self, task_name: &str) -> Result<TimeStamp> {
+        let now = Instant::now();
+        defer! {
+            super::metrics::METADATA_OPERATION_LATENCY.with_label_values(&["task_step"]).observe(now.saturating_elapsed().as_secs_f64())
+        }
+        let snap = self.meta_store.snapshot().await?;
+        let ts = snap
+            .get(Keys::Key(MetaKey::next_backup_ts_of(
+                task_name,
+                self.store_id,
+            )))
+            .await?;
+
+        match ts.as_slice() {
+            [ts, ..] => Ok(TimeStamp::new(parse_ts_from_bytes(ts.value())?)),
+            [] => Ok(self.get_task_start_ts_checkpoint(task_name).await?.ts),
+        }
+    }
+
     /// get all target ranges of some task.
     pub async fn ranges_of_task(
         &self,

@@ -12,12 +12,12 @@ use std::{
 };
 
 use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
-use futures::{channel::mpsc, executor::block_on, Future, FutureExt, StreamExt};
+use futures::{channel::mpsc, executor::block_on, FutureExt, StreamExt};
 use kvproto::raft_cmdpb::{CmdType, Request};
 use raft::StateRole;
 use raftstore::{coprocessor::RegionInfoProvider, RegionInfo};
 use tikv::storage::CfStatistics;
-use tikv_util::{box_err, defer, time::Instant, warn, worker::Scheduler, Either};
+use tikv_util::{box_err, time::Instant, warn, worker::Scheduler, Either};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use txn_types::{Key, Lock, LockType};
 

@@ -6,7 +6,7 @@ use std::{
 use crossbeam::channel::{Receiver as SyncReceiver, Sender as SyncSender};
 use engine_traits::KvEngine;
 use error_code::{backup_stream::OBSERVE_CANCELED, ErrorCodeExt};
-use futures::{Future, FutureExt};
+use futures::{FutureExt};
 use kvproto::metapb::Region;
 use pd_client::PdClient;
 use raft::StateRole;

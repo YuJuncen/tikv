@@ -121,16 +121,16 @@ async fn test_progress() -> Result<()> {
     let cli = test_meta_cli();
     let task = simple_task("simple_1");
     cli.insert_task_with_range(&task, &[]).await?;
-    let progress = cli.progress_of_task(&task.info.name).await?;
+    let progress = cli.global_progress_of_task(&task.info.name).await?;
     assert_eq!(progress, task.info.start_ts);
     cli.set_local_task_checkpoint(&task.info.name, 42).await?;
-    let progress = cli.progress_of_task(&task.info.name).await?;
+    let progress = cli.global_progress_of_task(&task.info.name).await?;
     assert_eq!(progress, 42);
     cli.set_local_task_checkpoint(&task.info.name, 43).await?;
-    let progress = cli.progress_of_task(&task.info.name).await?;
+    let progress = cli.global_progress_of_task(&task.info.name).await?;
     assert_eq!(progress, 43);
     let other_store = MetadataClient::new(cli.meta_store.clone(), 43);
-    let progress = other_store.progress_of_task(&task.info.name).await?;
+    let progress = other_store.global_progress_of_task(&task.info.name).await?;
     assert_eq!(progress, task.info.start_ts);
 
     Ok(())

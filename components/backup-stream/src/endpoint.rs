@@ -4,14 +4,14 @@ use std::{
     fmt,
     marker::PhantomData,
     path::PathBuf,
-    sync::{atomic::Ordering, Arc},
+    sync::{Arc},
     time::Duration,
 };
 
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::KvEngine;
 use error_code::ErrorCodeExt;
-use futures::{future::BoxFuture, Future, FutureExt};
+use futures::{FutureExt};
 use kvproto::{
     brpb::{StreamBackupError, StreamBackupTaskInfo},
     metapb::Region,
@@ -45,7 +45,7 @@ use crate::{
     event_loader::{InitialDataLoader, PendingMemoryQuota},
     future,
     metadata::{
-        store::{EtcdStore, MetaStore},
+        store::{MetaStore},
         MetadataClient, MetadataEvent, StreamTask,
     },
     metrics::{self, TaskStatus},
@@ -683,10 +683,9 @@ where
         let meta_cli = self.meta_client.clone();
         let pd_cli = self.pd_client.clone();
         let resolvers = self.subs.clone();
-        let cm = self.concurrency_manager.clone();
         let get_rts = self.get_resolved_ts(min_ts);
         let store_id = self.store_id;
-        let flush_if = self.make_flush_guard();
+        let can_advance = self.make_flush_guard();
         async move {
             let new_rts = get_rts.await;
             #[cfg(feature = "failpoints")]
@@ -706,9 +705,20 @@ where
                     // We cannot advance the resolved ts for now.
                     return Ok(());
                 }
-                cm.update_max_ts(TimeStamp::new(rts));
-                if !flush_if() {
-                    return Ok(());
+                if !can_advance() {
+                    let cp_now =
+                        meta_cli
+                            .get_local_task_checkpoint(&task)
+                            .await
+                            .context(format_args!(
+                                "during checking whether we should skip advencing ts to {}.",
+                                rts
+                            ))?;
+                    // if we need to roll back checkpoint ts, don't prevent it.
+                    if rts >= cp_now.into_inner() {
+                        info!("skipping advance checkpoint."; "rts" => %rts, "old_rts" => %cp_now);
+                        return Ok(());
+                    }
                 }
 
                 if let Err(err) = pd_cli
