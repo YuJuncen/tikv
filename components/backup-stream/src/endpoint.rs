@@ -41,7 +41,7 @@ use txn_types::TimeStamp;
 
 use super::metrics::HANDLE_EVENT_DURATION_HISTOGRAM;
 use crate::{
-    errors::{Error, Result},
+    errors::{ContextualResultExt, Error, Result},
     event_loader::{InitialDataLoader, PendingMemoryQuota},
     future,
     metadata::{
@@ -630,24 +630,6 @@ where
         self.pool.block_on(router.unregister_task(task))
     }
 
-    /// try advance the resolved ts by the pd tso.
-    async fn try_resolve(
-        cm: &ConcurrencyManager,
-        pd_client: Arc<PDC>,
-        resolvers: &SubscriptionTracer,
-    ) -> TimeStamp {
-        let pd_tso = pd_client
-            .get_tso()
-            .await
-            .map_err(|err| Error::from(err).report("failed to get tso from pd"))
-            .unwrap_or_default();
-        cm.update_max_ts(pd_tso);
-        let min_ts = cm.global_min_lock_ts().unwrap_or(TimeStamp::max());
-        let tso = Ord::min(pd_tso, min_ts);
-        let ts = resolvers.resolve_with(tso);
-        ts
-    }
-
     /// Make a guard for checking whether we can flush the checkpoint ts.
     fn make_flush_guard(&self) -> impl FnOnce() -> bool + Send {
         let failover = self.failover_time;
@@ -681,12 +663,10 @@ where
         }
     }
 
-    fn get_resolved_ts(&self) -> future![TimeStamp] {
-        let get_min_ts = self.prepare_min_ts();
+    fn get_resolved_ts(&self, min_ts: TimeStamp) -> future![TimeStamp] {
         let (tx, rx) = oneshot::channel();
         let op = self.region_operator.clone();
         async move {
-            let min_ts = get_min_ts.await;
             let req = ObserveOp::ResolveRegions {
                 callback: Box::new(move |ts| {
                     let _ = tx.send(ts);
@@ -698,131 +678,101 @@ where
         }
     }
 
-    async fn flush_for_task(
-        task: String,
-        store_id: u64,
-        router: Router,
-        pd_cli: Arc<PDC>,
-        resolvers: SubscriptionTracer,
-        meta_cli: MetadataClient<S>,
-        concurrency_manager: ConcurrencyManager,
-        flush_if: impl FnOnce() -> bool,
-        get_rts: impl Future<Output = TimeStamp>,
-    ) {
-        let start = Instant::now_coarse();
-        // We collect and set fresh regions before doing resolving,
-        // so we make sure every fresh subscription getting normal will be considered to the checkpoint ts.
-        let fresh_regions = resolvers.collect_fresh_subs();
-        // NOTE: Maybe push down the resolve step to the router?
-        //       Or if there are too many duplicated `Flush` command, we may do some useless works.
-        let new_rts = get_rts.await;
-        #[cfg(feature = "failpoints")]
-        fail::fail_point!("delay_on_flush");
-        metrics::FLUSH_DURATION
-            .with_label_values(&["resolve_by_now"])
-            .observe(start.saturating_elapsed_secs());
-        let removal = resolvers.collect_removal_subs();
-        let checkpoints = removal
-            .iter()
-            .map(|sub| (&sub.meta, sub.resolver.resolved_ts()))
-            .collect::<Vec<_>>();
-        if let Err(err) = meta_cli.upload_region_checkpoint(&task, &checkpoints).await {
-            err.report("failed to upload region checkpoint");
-        }
-        if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
-            info!("flushing and refreshing checkpoint ts.";
-                "checkpoint_ts" => %rts,
-                "task" => %task,
-            );
-            if rts == 0 {
-                // We cannot advance the resolved ts for now.
-                return;
-            }
-            concurrency_manager.update_max_ts(TimeStamp::new(rts));
-            if !flush_if() {
-                return;
-            }
-
-            if let Err(err) = pd_cli
-                .update_service_safe_point(
-                    format!("backup-stream-{}-{}", task, store_id),
-                    TimeStamp::new(rts),
-                    // Add a service safe point for 30 mins (6x the default flush interval).
-                    // It would probably be safe.
-                    Duration::from_secs(1800),
-                )
-                .await
-            {
-                Error::from(err).report("failed to update service safe point!");
-                // don't give up?
-            }
-            if let Err(err) = meta_cli.set_local_task_checkpoint(&task, rts).await {
-                err.report(format!("on flushing task {}", task));
-                // we can advance the progress at next time.
-                // return early so we won't be mislead by the metrics.
-                return;
-            }
-            metrics::STORE_CHECKPOINT_TS
-                // Currently, we only support one task at the same time,
-                // so use the task as label would be ok.
-                .with_label_values(&[task.as_str()])
-                .set(rts as _);
-            if let Err(err) = meta_cli
-                .clear_region_checkpoint(&task, fresh_regions.as_slice())
-                .await
-            {
-                err.report(format!("on clearing the checkpoint for task {}", task));
-            }
-        }
-    }
-
-    pub fn on_force_flush(&self, task: String, store_id: u64) {
+    fn do_flush(&self, task: String, min_ts: TimeStamp) -> future![Result<()>] {
         let router = self.range_router.clone();
-        let cli = self.meta_client.clone();
+        let meta_cli = self.meta_client.clone();
         let pd_cli = self.pd_client.clone();
         let resolvers = self.subs.clone();
         let cm = self.concurrency_manager.clone();
-        let g = self.make_flush_guard();
-        let flush_guard = self.get_resolved_ts();
-        self.pool.spawn(async move {
-            let info = router.get_task_info(&task).await;
+        let get_rts = self.get_resolved_ts(min_ts);
+        let store_id = self.store_id;
+        let flush_if = self.make_flush_guard();
+        async move {
+            let new_rts = get_rts.await;
+            #[cfg(feature = "failpoints")]
+            fail::fail_point!("delay_on_flush");
+            let fresh_regions = resolvers.collect_fresh_subs();
+            let removal = resolvers.collect_removal_subs();
+            let checkpoints = removal
+                .iter()
+                .map(|sub| (&sub.meta, sub.resolver.resolved_ts()))
+                .collect::<Vec<_>>();
+            if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
+                info!("flushing and refreshing checkpoint ts.";
+                    "checkpoint_ts" => %rts,
+                    "task" => %task,
+                );
+                if rts == 0 {
+                    // We cannot advance the resolved ts for now.
+                    return Ok(());
+                }
+                cm.update_max_ts(TimeStamp::new(rts));
+                if !flush_if() {
+                    return Ok(());
+                }
+
+                if let Err(err) = pd_cli
+                    .update_service_safe_point(
+                        format!("backup-stream-{}-{}", task, store_id),
+                        TimeStamp::new(rts),
+                        // Add a service safe point for 30 mins (6x the default flush interval).
+                        // It would probably be safe.
+                        Duration::from_secs(1800),
+                    )
+                    .await
+                {
+                    Error::from(err).report("failed to update service safe point!");
+                    // don't give up?
+                }
+                // Optionally upload the region checkpoint.
+                // Unless in some exteme condition, skipping upload the region checkpoint won't lead to data loss.
+                if let Err(err) = meta_cli.upload_region_checkpoint(&task, &checkpoints).await {
+                    err.report("failed to upload region checkpoint");
+                }
+                // we can advance the progress at next time.
+                // return early so we won't be mislead by the metrics.
+                meta_cli
+                    .set_local_task_checkpoint(&task, rts)
+                    .await
+                    .context(format_args!("on flushing task {}", task))?;
+
+                // Currently, we only support one task at the same time,
+                // so use the task as label would be ok.
+                metrics::STORE_CHECKPOINT_TS
+                    .with_label_values(&[task.as_str()])
+                    .set(rts as _);
+                meta_cli
+                    .clear_region_checkpoint(&task, fresh_regions.as_slice())
+                    .await
+                    .context(format_args!("on clearing the checkpoint for task {}", task))?;
+            }
+            Ok(())
+        }
+    }
+
+    pub fn on_force_flush(&self, task: String) {
+        self.pool.block_on(async move {
+            let info = self.range_router.get_task_info(&task).await;
             // This should only happen in testing, it would be to unwrap...
             let _ = info.unwrap().set_flushing_status_cas(false, true);
-            Self::flush_for_task(
-                task,
-                store_id,
-                router,
-                pd_cli,
-                resolvers,
-                cli,
-                cm,
-                g,
-                flush_guard,
-            )
-            .await;
+            let mts = self.prepare_min_ts().await;
+            try_send!(self.scheduler, Task::FlushWithMinTs(task, mts));
         });
     }
 
-    pub fn on_flush(&self, task: String, store_id: u64) {
-        let router = self.range_router.clone();
-        let cli = self.meta_client.clone();
-        let pd_cli = self.pd_client.clone();
-        let resolvers = self.subs.clone();
-        let cm = self.concurrency_manager.clone();
-        let flush_if = self.make_flush_guard();
-        let _h = self.pool.handle().enter();
-        let flush_guard = self.get_resolved_ts();
-        tokio::spawn(Self::flush_for_task(
-            task,
-            store_id,
-            router,
-            pd_cli,
-            resolvers,
-            cli,
-            cm,
-            flush_if,
-            flush_guard,
-        ));
+    pub fn on_flush(&self, task: String) {
+        self.pool.block_on(async move {
+            let mts = self.prepare_min_ts().await;
+            try_send!(self.scheduler, Task::FlushWithMinTs(task, mts));
+        })
+    }
+
+    fn on_flush_with_min_ts(&self, task: String, min_ts: TimeStamp) {
+        self.pool.spawn(self.do_flush(task, min_ts).map(|r| {
+            if let Err(err) = r {
+                err.report("during updating flush status")
+            }
+        }));
     }
 
     /// Modify observe over some region.
@@ -843,9 +793,9 @@ where
         match task {
             Task::WatchTask(op) => self.handle_watch_task(op),
             Task::BatchEvent(events) => self.do_backup(events),
-            Task::Flush(task) => self.on_flush(task, self.store_id),
+            Task::Flush(task) => self.on_flush(task),
             Task::ModifyObserve(op) => self.on_modify_observe(op),
-            Task::ForceFlush(task) => self.on_force_flush(task, self.store_id),
+            Task::ForceFlush(task) => self.on_force_flush(task),
             Task::FatalError(task, err) => self.on_fatal_error(task, err),
             Task::ChangeConfig(_) => {
                 warn!("change config online isn't supported for now.")
@@ -862,6 +812,7 @@ where
                 }
             }
             Task::MarkFailover(t) => self.failover_time = Some(t),
+            Task::FlushWithMinTs(task, min_ts) => self.on_flush_with_min_ts(task, min_ts),
         }
     }
 
@@ -899,8 +850,6 @@ pub enum Task {
     WatchTask(TaskOp),
     BatchEvent(Vec<CmdBatch>),
     ChangeConfig(ConfigChange),
-    /// Flush the task with name.
-    Flush(String),
     /// Change the observe status of some region.
     ModifyObserve(ObserveOp),
     /// Convert status of some task into `flushing` and do flush then.
@@ -916,7 +865,16 @@ pub enum Task {
         // This returns `true`.
         Box<dyn FnMut(&Router) -> bool + Send>,
     ),
+    /// Mark the store as a failover store.
+    /// This would prevent store from updating its checkpoint ts for a while.
+    /// Because we are not sure whether the regions in the store have new leader --
+    /// we keep a safe checkpoint so they can choose a safe `from_ts` for initial scanning.
     MarkFailover(Instant),
+    /// Flush the task with name.
+    Flush(String),
+    /// Execute the flush with the calculated `min_ts`.
+    /// This is an internal command only issued by the `Flush` task.
+    FlushWithMinTs(String, TimeStamp),
 }
 
 #[derive(Debug)]
@@ -1003,6 +961,11 @@ impl fmt::Debug for Task {
                 .debug_tuple("MarkFailover")
                 .field(&format_args!("{:?} ago", t.saturating_elapsed()))
                 .finish(),
+            Self::FlushWithMinTs(arg0, arg1) => f
+                .debug_tuple("FlushWithMinTs")
+                .field(arg0)
+                .field(arg1)
+                .finish(),
         }
     }
 }
@@ -1037,6 +1000,7 @@ impl Task {
             Task::FatalError(..) => "fatal_error",
             Task::Sync(..) => "sync",
             Task::MarkFailover(_) => "mark_failover",
+            Task::FlushWithMinTs(..) => "flush_with_min_ts",
         }
     }
 }

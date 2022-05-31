@@ -433,7 +433,7 @@ where
     }
 
     async fn get_last_checkpoint_of(&self, task: &str, region: &Region) -> Result<TimeStamp> {
-        let meta_cli = self.meta_cli.as_ref().unwrap().clone();
+        let meta_cli = self.meta_cli.clone();
         let cp = meta_cli.get_region_checkpoint(task, region).await?;
         info!("got region checkpoint"; "region_id" => %region.get_id(), "checkpoint" => ?cp);
         Ok(cp.ts)
