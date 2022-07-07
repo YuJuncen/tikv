@@ -414,12 +414,13 @@ where
         on_finish: impl FnOnce() + Send + 'static,
     ) -> Result<Statistics> {
         let _guard = self.handle.enter();
-        // It is ok to sink more data than needed. So scan to +inf TS for convenance.
-        let event_loader = EventLoader::load_from(snap, start_ts, TimeStamp::max(), region)?;
         let tr = self.tracing.clone();
         let region_id = region.get_id();
 
         let mut join_handles = Vec::with_capacity(8);
+
+        // It is ok to sink more data than needed. So scan to +inf TS for convenance.
+        let event_loader = EventLoader::load_from(snap, start_ts, TimeStamp::max(), region)?;
         let stats = self.scan_and_async_send(region, event_loader, &mut join_handles);
 
         // we should mark phase one as finished whether scan successed.

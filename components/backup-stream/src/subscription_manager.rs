@@ -36,7 +36,7 @@ use crate::{
     metadata::{store::MetaStore, CheckpointProvider, MetadataClient},
     metrics,
     observer::BackupStreamObserver,
-    router::Router,
+    router::{Router, TaskSelector},
     subscription_track::SubscriptionTracer,
     try_send,
     utils::{self, CallbackWaitGroup, Work},
@@ -370,13 +370,21 @@ where
                     if err.error_code() == error_code::backup_stream::OBSERVE_CANCELED {
                         return;
                     }
+                    let (start, end) = (
+                        region.get_start_key().to_owned(),
+                        region.get_end_key().to_owned(),
+                    );
                     match self.retry_observe(region, handle).await {
                         Ok(()) => {}
                         Err(e) => {
-                            self.fatal(
-                                e,
-                                format!("While retring to observe region, origin error is {}", err),
+                            let msg = Task::FatalError(
+                                TaskSelector::ByRange(start, end),
+                                Box::new(Error::Contextual {
+                                    context: format!("retry meet error, origin error is {}", err),
+                                    inner_error: Box::new(e),
+                                }),
                             );
+                            try_send!(self.scheduler, msg);
                         }
                     }
                 }
@@ -384,7 +392,7 @@ where
                     let now = Instant::now();
                     let timedout = self.wait(Duration::from_secs(30)).await;
                     if timedout {
-                        warn!("waiting for initial scanning done timed out, forcing progress(with risk of data loss)!"; 
+                        warn!("waiting for initial scanning done timed out, forcing progress!"; 
                             "take" => ?now.saturating_elapsed(), "timedout" => %timedout);
                     }
                     let cps = self.subs.resolve_with(min_ts);
@@ -397,10 +405,6 @@ where
                 }
             }
         }
-    }
-
-    fn fatal(&self, err: Error, message: String) {
-        try_send!(self.scheduler, Task::FatalError(message, Box::new(err)));
     }
 
     async fn refresh_resolver(&self, region: &Region) {
@@ -539,7 +543,7 @@ where
     async fn get_last_checkpoint_of(&self, task: &str, region: &Region) -> Result<TimeStamp> {
         let meta_cli = self.meta_cli.clone();
         let cp = meta_cli.get_region_checkpoint(task, region).await?;
-        info!("got region checkpoint"; "region_id" => %region.get_id(), "checkpoint" => ?cp);
+        debug!("got region checkpoint"; "region_id" => %region.get_id(), "checkpoint" => ?cp);
         if matches!(cp.provider, CheckpointProvider::Global) {
             metrics::STORE_CHECKPOINT_TS
                 .with_label_values(&[task])
