@@ -45,7 +45,7 @@ use crate::{
 
 type ScanPool = yatp::ThreadPool<yatp::task::callback::TaskCell>;
 
-const INITIAL_SCAN_FAILURE_MAX_RETRY_TIME: usize = 3;
+const INITIAL_SCAN_FAILURE_MAX_RETRY_TIME: usize = 10;
 
 /// a request for doing initial scanning.
 struct ScanCmd {
@@ -169,12 +169,17 @@ impl ScanCmd {
     }
 
     /// execute the command, when meeting error, retrying.
-    fn exec_by_with_retry(self, init: impl InitialScan) {
+    fn exec_by_with_retry(self, init: impl InitialScan, cancel: &AtomicBool) {
         let mut retry_time = INITIAL_SCAN_FAILURE_MAX_RETRY_TIME;
         loop {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
             match self.exec_by(init.clone()) {
                 Err(err) if should_retry(&err) && retry_time > 0 => {
-                    // NOTE: maybe back off here? (but blocking this thread may stick the process.)
+                    // NOTE: blocking this thread may stick the process.
+                    // Maybe spawn a task to tokio and reschedule the task then?
+                    std::thread::sleep(Duration::from_millis(500));
                     warn!("meet retryable error"; "err" => %err, "retry_time" => retry_time);
                     retry_time -= 1;
                     continue;
@@ -209,7 +214,7 @@ fn scan_executor_loop(
         metrics::PENDING_INITIAL_SCAN_LEN
             .with_label_values(&["executing"])
             .inc();
-        cmd.exec_by_with_retry(init.clone());
+        cmd.exec_by_with_retry(init.clone(), &canceled);
         metrics::PENDING_INITIAL_SCAN_LEN
             .with_label_values(&["executing"])
             .dec();

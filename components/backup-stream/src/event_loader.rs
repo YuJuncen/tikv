@@ -254,8 +254,8 @@ where
                     last_err = match last_err {
                         None => Some(e),
                         Some(err) => Some(Error::Contextual {
-                            context: format!("and error {}", e),
-                            inner_error: Box::new(err),
+                            context: format!("and error {}", err),
+                            inner_error: Box::new(e),
                         }),
                     };
 
