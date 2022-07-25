@@ -1096,7 +1096,7 @@ impl StreamTaskInfo {
                 .observe(sw.lap().as_secs_f64());
 
             // flush log file to storage.
-            self.flush_log().await?;
+            self.flush_log_2().await?;
 
             let file_size_vec = metadata_info
                 .files
