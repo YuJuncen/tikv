@@ -36,6 +36,7 @@ fail = { version = "0.5", optional = true }
 file_system = { path = "../file_system" }
 futures = "0.3"
 
+zip = { version = "0.6", default-features = false, features = ["deflate"]}
 grpcio = { version = "0.10", default-features = false, features = ["openssl-vendored", "protobuf-codec"] }
 hex = "0.4"
 kvproto = { git = "https://github.com/pingcap/kvproto.git" }
@@ -64,6 +65,7 @@ tonic = "0.5"
 txn_types = { path = "../txn_types", default-features = false }
 uuid = "0.8"
 yatp = { git = "https://github.com/tikv/yatp.git", branch = "master" }
+tempfile = "3.0"
 
 [dev-dependencies]
 async-trait = "0.1"
@@ -72,7 +74,6 @@ grpcio = { version = "0.10", default-features = false, features = ["openssl-vend
 hex = "0.4"
 rand = "0.8.0"
 tempdir = "0.3"
-tempfile = "3.0"
 test_raftstore = { path = "../test_raftstore", default-features = false }
 test_util = { path = "../test_util", default-features = false }
 url = "2"

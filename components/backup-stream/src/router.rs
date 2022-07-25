@@ -43,6 +43,7 @@ use tokio::{
 };
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use txn_types::{Key, Lock, TimeStamp, WriteRef};
+use zip::{write::FileOptions, ZipWriter};
 
 use super::errors::Result;
 use crate::{
@@ -747,7 +748,7 @@ pub struct StreamTaskInfo {
     /// The temporary file index. Both meta (m prefixed keys) and data (t prefixed keys).
     files: SlotMap<TempFileKey, DataFile>,
     /// flushing_files contains files pending flush.
-    flushing_files: RwLock<Vec<(TempFileKey, Slot<DataFile>, DataFileInfo)>>,
+    flushing_files: RwLock<Vec<(TempFileKey, DataFile, DataFileInfo)>>,
     /// last_flush_ts represents last time this task flushed to storage.
     last_flush_time: AtomicPtr<Instant>,
     /// flush_interval represents the tick interval of flush, setting by users.
@@ -775,8 +776,13 @@ impl Drop for StreamTaskInfo {
             .get_mut()
             .drain(..)
             .map(|(a, b, _)| (a, b))
-            .chain(self.files.get_mut().drain())
-            .map(|(_, f)| f.into_inner().local_path)
+            .chain(
+                self.files
+                    .get_mut()
+                    .drain()
+                    .map(|(a, b)| (a, b.into_inner())),
+            )
+            .map(|(_, f)| f.local_path)
             .map(std::fs::remove_file)
             .partition(|r| r.is_ok());
         info!("stream task info dropped, removing temp files"; "success" => %success.len(), "failure" => %failed.len())
@@ -879,10 +885,10 @@ impl StreamTaskInfo {
 
     /// Flush all template files and generate corresponding metadata.
     pub async fn generate_metadata(&self, store_id: u64) -> Result<MetadataInfo> {
-        let w = self.flushing_files.read().await;
+        let mut w = self.flushing_files.write().await;
         // Let's flush all files first...
-        futures::future::join_all(w.iter().map(|(_, f, _)| async move {
-            let file = &mut f.lock().await.inner;
+        futures::future::join_all(w.iter_mut().map(|(_, f, _)| async move {
+            let file = &mut f.inner;
             file.flush().await?;
             file.get_ref().sync_all().await?;
             Result::Ok(())
@@ -943,14 +949,13 @@ impl StreamTaskInfo {
             // we cannot re-calculate it in retry.
             // TODO refactor move_to_flushing_files and generate_metadata
             let file_meta = v.lock().await.generate_metadata(&k, store_id)?;
-            fw.push((k, v, file_meta));
+            fw.push((k, v.into_inner(), file_meta));
         }
         Ok(self)
     }
 
     pub async fn clear_flushing_files(&self) {
-        for (_, v, _) in self.flushing_files.write().await.drain(..) {
-            let data_file = v.lock().await;
+        for (_, data_file, _) in self.flushing_files.write().await.drain(..) {
             debug!("removing data file"; "size" => %data_file.file_size, "name" => %data_file.local_path.display());
             self.total_size
                 .fetch_sub(data_file.file_size, Ordering::SeqCst);
@@ -963,30 +968,29 @@ impl StreamTaskInfo {
 
     async fn flush_log_file_to(
         storage: Arc<dyn ExternalStorage>,
-        file: &Mutex<DataFile>,
+        local_path: &Path,
+        remote_path: &str,
     ) -> Result<()> {
-        let data_file = file.lock().await;
         // to do: limiter to storage
         let limiter = Limiter::builder(std::f64::INFINITY).build();
-        let reader = File::open(data_file.local_path.clone()).await?;
+        let reader = File::open(local_path.clone()).await?;
         let stat = reader.metadata().await?;
         let reader = UnpinReader(Box::new(limiter.limit(reader.compat())));
-        let filepath = &data_file.storage_path;
         // Once we cannot get the stat of the file, use 4K I/O.
         let est_len = stat.len().max(4096);
 
-        let ret = storage.write(filepath, reader, est_len).await;
+        let ret = storage.write(remote_path, reader, est_len).await;
         match ret {
             Ok(_) => {
                 debug!(
                     "backup stream flush success";
-                    "tmp file" => ?data_file.local_path,
-                    "storage file" => ?filepath,
+                    "tmp file" => ?local_path,
+                    "storage file" => ?remote_path,
                 );
             }
             Err(e) => {
                 warn!("backup stream flush failed";
-                    "file" => ?data_file.local_path,
+                    "file" => ?local_path,
                     "est_len" => ?est_len,
                     "err" => ?e,
                 );
@@ -1002,12 +1006,41 @@ impl StreamTaskInfo {
         let files = self.flushing_files.write().await;
 
         for batch_files in files.chunks(FLUSH_LOG_CONCURRENT_BATCH_COUNT) {
-            let futs = batch_files
-                .iter()
-                .map(|(_, v, _)| Self::flush_log_file_to(storage.clone(), v));
+            let futs = batch_files.iter().map(|(_, v, _)| {
+                Self::flush_log_file_to(storage.clone(), &v.local_path, &v.storage_path)
+            });
             futures::future::try_join_all(futs).await?;
         }
 
+        Ok(())
+    }
+
+    pub async fn flush_log_2(&self) -> Result<()> {
+        let files = self.flushing_files.write().await;
+        let mut path_to_files = HashMap::new();
+        for (_, file, _) in files.iter() {
+            let p = Path::new(&file.storage_path).to_owned();
+            let file_name = p
+                .file_name()
+                .ok_or(Error::Other(box_err!("bad storage path {}", p.display())))?;
+            let file_path = p
+                .parent()
+                .ok_or(Error::Other(box_err!("bad storage path {}", p.display())))?;
+            if !path_to_files.contains_key(file_path) {
+                let temp = tempfile::tempfile_in(&self.temp_dir)?;
+                path_to_files.insert(file_path.to_owned(), ZipWriter::new(temp));
+            }
+
+            let mut zipper = path_to_files.get_mut(file_path).unwrap();
+            zipper
+                .start_file(
+                    file_name.to_string_lossy().to_owned(),
+                    FileOptions::default(),
+                )
+                .map_err(|err| annotate!(err, "during writing zip file"))?;
+            let mut local_file = std::fs::File::open(&file.local_path)?;
+            std::io::copy(&mut local_file, &mut zipper)?;
+        }
         Ok(())
     }
 
