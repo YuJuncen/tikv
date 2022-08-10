@@ -111,6 +111,12 @@ where
         concurrency_manager: ConcurrencyManager,
     ) -> Self {
         crate::metrics::STREAM_ENABLED.inc();
+        #[cfg(not(tokio_unstable))]
+        compile_error!(
+            r#"tokio_unstable not enabled, please compile with `RUSTFLAGS="--cfg tokio_unstable" make <target>`"#
+        );
+
+        console_subscriber::init();
         let pool = create_tokio_runtime((config.num_threads / 2).max(1), "backup-stream")
             .expect("failed to create tokio runtime for backup stream worker.");
 
