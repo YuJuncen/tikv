@@ -6,7 +6,7 @@ use kvproto::{
     brpb::{StreamBackupError, StreamBackupTaskInfo},
     metapb::Region,
 };
-use tikv_util::{defer, time::Instant, warn};
+use tikv_util::{defer, info, time::Instant, warn};
 use tokio_stream::StreamExt;
 use txn_types::TimeStamp;
 
@@ -631,7 +631,7 @@ impl<Store: MetaStore> MetadataClient<Store> {
     /// get the global progress (the min next_backup_ts among all stores).
     pub async fn global_progress_of_task(&self, task_name: &str) -> Result<u64> {
         let cp = self.global_checkpoint_of_task(task_name).await?;
-        debug!("getting global progress of task"; "checkpoint" => ?cp);
+        info!("getting global progress of task"; "checkpoint" => ?cp);
         let ts = cp.ts.into_inner();
         Ok(ts)
     }
