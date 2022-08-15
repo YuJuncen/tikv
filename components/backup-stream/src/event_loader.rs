@@ -6,7 +6,9 @@ use std::{
     time::Duration,
 };
 
-use engine_traits::{IterOptions, KvEngine, Snapshot, CF_DEFAULT, CF_WRITE, DATA_KEY_PREFIX_LEN};
+use engine_traits::{
+    IterOptions, KvEngine, Snapshot, CF_DEFAULT, CF_LOCK, CF_WRITE, DATA_KEY_PREFIX_LEN,
+};
 use futures::executor::block_on;
 use kvproto::{kvrpcpb::ExtraOp, metapb::Region, raft_cmdpb::CmdType};
 use raftstore::{
@@ -31,7 +33,7 @@ use tokio::{
     runtime::Handle,
     sync::{OwnedSemaphorePermit, Semaphore},
 };
-use txn_types::{Key, Lock, TimeStamp};
+use txn_types::{Key, Lock, TimeStamp, WriteRef};
 
 use crate::{
     annotate, debug,
@@ -108,25 +110,41 @@ impl<S: Snapshot> EventLoader<S> {
 
         if let Ok(start_key) = Key::from_encoded_slice(r.get_start_key()).into_raw() {
             if let Ok(tid) = decode_table_id(&start_key) {
-                let key_2590 = Key::from_raw(&encode_row_key(tid, 2590)).into_encoded();
-                let key_2591 = Key::from_raw(&encode_row_key(tid, 2591)).into_encoded();
-                let s = KeyBuilder::from_vec(key_2590, DATA_KEY_PREFIX_LEN, 0);
-                let e = KeyBuilder::from_vec(key_2591, DATA_KEY_PREFIX_LEN, 0);
-                let iter_opts = IterOptions::new(Some(s), Some(e), false);
-                let mut iter = snapshot.iter_cf(CF_WRITE, iter_opts).unwrap();
-                let mut version_count = 0;
-                let mut latest_version = 0;
-                let mut valid = iter.seek_to_first().unwrap();
-                while valid {
-                    if latest_version == 0 {
-                        let (user_key, commit_ts) = Key::split_on_ts_for(iter.key()).unwrap();
-                        latest_version = commit_ts.into_inner();
-                        info!("initial scanning meet 2590 in snapshot"; "region_id" => %r.id, "table" => %tid, "commit_ts" => %commit_ts, "encoded_key" => %utils::redact(&user_key));
+                let scan_2590 = |cf: &str| {
+                    let key_2590 = Key::from_raw(&encode_row_key(tid, 2590)).into_encoded();
+                    let key_2591 = Key::from_raw(&encode_row_key(tid, 2591)).into_encoded();
+                    let s = KeyBuilder::from_vec(key_2590, DATA_KEY_PREFIX_LEN, 0);
+                    let e = KeyBuilder::from_vec(key_2591, DATA_KEY_PREFIX_LEN, 0);
+                    let iter_opts = IterOptions::new(Some(s), Some(e), false);
+                    let mut iter = snapshot.iter_cf(cf, iter_opts).unwrap();
+                    let mut version_count = 0;
+                    let mut latest_version = 0;
+                    let mut valid = iter.seek_to_first().unwrap();
+                    while valid {
+                        if latest_version == 0 {
+                            let (user_key, commit_ts) = Key::split_on_ts_for(iter.key()).unwrap();
+                            let value = iter.value();
+                            let extra: Box<dyn std::fmt::Debug> = match cf {
+                                CF_LOCK => {
+                                    let lock = Lock::parse(value);
+                                    Box::new(lock.ok())
+                                }
+                                CF_WRITE => {
+                                    let w = WriteRef::parse(value);
+                                    Box::new(w.ok().map(|x| x.to_owned()))
+                                }
+                                _ => Box::new(format!("unknown CF {}", cf)),
+                            };
+                            latest_version = commit_ts.into_inner();
+                            info!("initial scanning meet 2590 in snapshot"; "value" => ?extra, "region_id" => %r.id, "table" => %tid, "commit_ts" => %commit_ts, "encoded_key" => %utils::redact(&user_key));
+                        }
+                        version_count += 1;
+                        valid = iter.next().unwrap();
                     }
-                    version_count += 1;
-                    valid = iter.next().unwrap();
-                }
-                info!("initial scanning"; "region_id" => %r.id, "table" => %tid, "commit_ts" => %latest_version, "version_count" => %version_count);
+                    info!("initial scanning"; "region_id" => %r.id, "table" => %tid, "commit_ts" => %latest_version, "version_count" => %version_count, "cf" => %cf);
+                };
+                scan_2590(CF_LOCK);
+                scan_2590(CF_WRITE);
             }
         } else {
             info!("initial scanning with invalid encoded start key"; "region_id" => r.id);
