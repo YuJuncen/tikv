@@ -95,7 +95,7 @@ impl<S: Snapshot> EventLoader<S> {
         let region_id = region.get_id();
         let apply_index = snapshot.get_apply_index().unwrap_or(0);
         let r = snapshot.get_region().clone();
-        let scanner = ScannerBuilder::new(snapshot, to_ts)
+        let scanner = ScannerBuilder::new(snapshot.clone(), to_ts)
             .fill_cache(false)
             .build_delta_scanner(from_ts, ExtraOp::Noop)
             .map_err(|err| Error::Txn(err.into()))
@@ -120,12 +120,12 @@ impl<S: Snapshot> EventLoader<S> {
                 while valid {
                     if latest_version == 0 {
                         let (_, commit_ts) = Key::split_on_ts_for(iter.key()).unwrap();
-                        latest_version = commit_ts;
+                        latest_version = commit_ts.into_inner();
                     }
                     version_count += 1;
                     valid = iter.next().unwrap();
                 }
-                info!("initial scanning"; "region_id" => r.id, "table" => tid, "commit_ts" => latest_version, "version_count" => version_count);
+                info!("initial scanning"; "region_id" => %r.id, "table" => %tid, "commit_ts" => %latest_version, "version_count" => %version_count);
             }
         } else {
             info!("initial scanning with invalid encoded start key"; "region_id" => r.id);

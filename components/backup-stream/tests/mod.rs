@@ -30,6 +30,7 @@ use pd_client::PdClient;
 use tempdir::TempDir;
 use test_raftstore::{new_server_cluster, Cluster, ServerCluster};
 use test_util::retry;
+use tidb_query_datatype::codec::data_type::ChunkedVec;
 use tikv::config::BackupStreamConfig;
 use tikv_util::{
     codec::{
@@ -315,6 +316,19 @@ impl Suite {
             ));
         }
         inserted
+    }
+
+    fn commit_keys(&mut self, keys: Vec<Vec<u8>>, start_ts: TimeStamp, commit_ts: TimeStamp) {
+        let mut region_keys = HashMap::<u64, Vec<Vec<u8>>>::new();
+        for k in keys {
+            let enc_key = Key::from_raw(&k).into_encoded();
+            let region = self.cluster.get_region_id(&enc_key);
+            region_keys.entry(region).or_default().push(k);
+        }
+
+        for (region, keys) in region_keys {
+            self.must_kv_commit(region, keys, start_ts, commit_ts);
+        }
     }
 
     fn just_commit_a_key(&mut self, key: Vec<u8>, start_ts: TimeStamp, commit_ts: TimeStamp) {
@@ -603,10 +617,13 @@ mod test {
         errors::Error, metadata::MetadataClient, router::TaskSelector, GetCheckpointResult,
         RegionCheckpointOperation, RegionSet, Task,
     };
+    use pd_client::PdClient;
     use tikv_util::{box_err, defer, info, HandyRwLock};
-    use txn_types::TimeStamp;
+    use txn_types::{Key, TimeStamp};
 
-    use crate::{make_record_key, make_split_key_at_record, run_async_test, SuiteBuilder};
+    use crate::{
+        make_record_key, make_split_key_at_record, mutation, run_async_test, SuiteBuilder,
+    };
 
     #[test]
     fn basic() {
@@ -644,6 +661,46 @@ mod test {
             suite.check_for_write_records(
                 suite.flushed_files.path(),
                 round1.union(&round2).map(Vec::as_slice),
+            );
+        });
+        suite.cluster.shutdown();
+    }
+
+    #[test]
+    fn with_split_txn() {
+        test_util::init_log_for_test();
+        let mut suite = super::SuiteBuilder::new_named("with_split")
+            .use_v3()
+            .build();
+        run_async_test(async {
+            let start_ts = suite.cluster.pd_client.get_tso().await.unwrap();
+            let keys = (1..1024).map(|i| make_record_key(1, i)).collect::<Vec<_>>();
+            suite.must_register_task(1, "test_with_split");
+            suite.must_kv_prewrite(
+                1,
+                keys.clone()
+                    .into_iter()
+                    .map(|k| mutation(k, b"hello, world".to_vec()))
+                    .collect(),
+                make_record_key(1, 29),
+                start_ts,
+            );
+            let commit_ts = suite.cluster.pd_client.get_tso().await.unwrap();
+            suite.must_split(&make_record_key(1, 512));
+            suite.commit_keys(keys.clone(), start_ts, commit_ts);
+            suite.force_flush_files("test_with_split");
+            suite.wait_for_flush();
+            let keys_encoded = keys
+                .iter()
+                .map(|v| {
+                    Key::from_raw(v.as_slice())
+                        .append_ts(commit_ts)
+                        .into_encoded()
+                })
+                .collect::<Vec<_>>();
+            suite.check_for_write_records(
+                suite.flushed_files.path(),
+                keys_encoded.iter().map(Vec::as_slice),
             );
         });
         suite.cluster.shutdown();

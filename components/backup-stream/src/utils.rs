@@ -71,21 +71,26 @@ pub fn cf_name(s: &str) -> CfName {
 pub fn cmd_2590(batch: &[CmdBatch]) {
     for cb in batch {
         for cmd in cb.cmds.iter() {
+            let mut triggered = false;
             for req in cmd.request.get_requests() {
                 if let Some((key, cf)) = key_of_request(req) {
-                    _2590(
+                    triggered |= _2590(
                         format_args!("cmd_batch:{}:{:?}", cmd.index, cb.level),
                         cf,
                         key,
                         cb.region_id,
-                    )
+                    );
                 }
+            }
+            if triggered {
+                let err = cmd.response.get_header().get_error();
+                info!("meet 2590 at cmd"; "err" => ?err, "index" => %cmd.index, "region_id" => %cb.region_id);
             }
         }
     }
 }
 
-pub fn _2590(ctx: impl Display, cf: &str, key: &[u8], region_id: u64) {
+pub fn _2590(ctx: impl Display, cf: &str, key: &[u8], region_id: u64) -> bool {
     let mut decoded = key.to_vec();
     let ts = if cf == CF_LOCK {
         TimeStamp::zero()
@@ -95,14 +100,18 @@ pub fn _2590(ctx: impl Display, cf: &str, key: &[u8], region_id: u64) {
     };
     decode_bytes_in_place(&mut decoded, false)
         .unwrap_or_else(|_| panic!("meet key cannot be decoded {}", redact(&key)));
+    let mut triggered = false;
     if let Ok(2590) = decode_int_handle(&decoded) {
         let tbl_id = decode_table_id(&decoded).unwrap_or_default();
         info!("2590 meet"; "table" => %tbl_id, "key" => %redact(&decoded), "ctx" => %ctx, "cf" => %cf, "ts" => ts, "region_id" => %region_id);
+        triggered = true;
     }
     if let Ok(2589) = decode_int_handle(&decoded) {
         let tbl_id = decode_table_id(&decoded).unwrap_or_default();
         info!("2589 meet"; "table" => %tbl_id, "key" => %redact(&decoded), "ctx" => %ctx, "cf" => %cf, "ts" => ts, "region_id" => %region_id);
+        triggered = true;
     }
+    triggered
 }
 
 pub fn redact(key: &impl AsRef<[u8]>) -> log_wrappers::Value<'_> {
