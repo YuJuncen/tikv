@@ -247,13 +247,6 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
                     None
                 };
 
-                if let Some(w) = w_key {
-                    _2590("read_next:write", CF_WRITE, w, 0);
-                }
-                if let Some(l) = l_key {
-                    _2590("read_next:lock", CF_LOCK, l, 0);
-                }
-
                 // `res` is `(current_user_key_slice, has_write, has_lock)`
                 let res = match (w_key, l_key) {
                     (None, None) => {
@@ -298,6 +291,7 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
                 // the key or its clones without reallocation.
                 (Key::from_encoded_slice(res.0), res.1, res.2)
             };
+            _2590("read_next:current_user_key", CF_LOCK, res.0, 0);
 
             if has_lock {
                 if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
