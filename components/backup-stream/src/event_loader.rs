@@ -97,7 +97,7 @@ impl<S: Snapshot> EventLoader<S> {
         let r = snapshot.get_region().clone();
         let scanner = ScannerBuilder::new(snapshot.clone(), to_ts)
             .fill_cache(false)
-            .build_delta_scanner(from_ts, true)
+            .build_delta_scanner(from_ts, ExtraOp::Noop)
             .map_err(|err| Error::Txn(err.into()))
             .context(format_args!(
                 "failed to create entry scanner from_ts = {}, to_ts = {}, region = {}",
