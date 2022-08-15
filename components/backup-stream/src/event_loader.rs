@@ -111,10 +111,10 @@ impl<S: Snapshot> EventLoader<S> {
         if let Ok(start_key) = Key::from_encoded_slice(r.get_start_key()).into_raw() {
             if let Ok(tid) = decode_table_id(&start_key) {
                 let scan_2590 = |cf: &str| {
-                    let key_2590 = Key::from_raw(&encode_row_key(tid, 2590)).into_encoded();
-                    let key_2591 = Key::from_raw(&encode_row_key(tid, 2591)).into_encoded();
-                    let s = KeyBuilder::from_vec(key_2590, DATA_KEY_PREFIX_LEN, 0);
-                    let e = KeyBuilder::from_vec(key_2591, DATA_KEY_PREFIX_LEN, 0);
+                    let key_2589 = Key::from_raw(&encode_row_key(tid, 2589)).into_encoded();
+                    let key_2592 = Key::from_raw(&encode_row_key(tid, 2592)).into_encoded();
+                    let s = KeyBuilder::from_vec(key_2589, DATA_KEY_PREFIX_LEN, 0);
+                    let e = KeyBuilder::from_vec(key_2592, DATA_KEY_PREFIX_LEN, 0);
                     let iter_opts = IterOptions::new(Some(s), Some(e), false);
                     let mut iter = snapshot.iter_cf(cf, iter_opts).unwrap();
                     let mut version_count = 0;
