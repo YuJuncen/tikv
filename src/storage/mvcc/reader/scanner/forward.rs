@@ -55,6 +55,7 @@ pub trait ScanPolicy<S: Snapshot> {
     fn output_size(&mut self, output: &Self::Output) -> usize;
 }
 
+#[derive(Debug)]
 pub enum HandleRes<T> {
     Return(T),
     Skip(Key),
@@ -151,7 +152,10 @@ pub fn _2590(ctx: impl Display, cf: &str, key: &[u8], region_id: u64) -> bool {
     triggered
 }
 
-impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
+impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P>
+where
+    P::Output: std::fmt::Debug,
+{
     pub fn new(
         cfg: ScannerConfig<S>,
         lock_cursor: Option<Cursor<S::Iter>>,
@@ -231,6 +235,7 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
             //
             // `has_lock` indicates whether `current_user_key` has a corresponding `lock`. If
             // there is one, it is what current lock cursor pointing to.
+            let mut has_2590 = false;
             let (mut current_user_key, has_write, has_lock) = {
                 let w_key = if self.cursors.write.valid()? {
                     Some(self.cursors.write.key(&mut self.statistics.write))
@@ -247,15 +252,18 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
                     None
                 };
                 if let Some(w) = w_key {
-                    _2590("read_next:write", CF_WRITE, w, 0);
+                    has_2590 |= _2590("read_next:write", CF_WRITE, w, 0);
                 }
                 if let Some(l) = l_key {
-                    _2590("read_next:lock", CF_LOCK, l, 0);
+                    has_2590 |= _2590("read_next:lock", CF_LOCK, l, 0);
                 }
                 // `res` is `(current_user_key_slice, has_write, has_lock)`
                 let res = match (w_key, l_key) {
                     (None, None) => {
                         // Both cursors yield `None`: we know that there is nothing remaining.
+                        if has_2590 {
+                            info!("early return: end of iteration. (aha, impossible.)");
+                        }
                         return Ok(None);
                     }
                     (None, Some(k)) => {
@@ -302,17 +310,27 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
                 current_user_key.as_encoded().as_slice(),
                 0,
             );
+            if has_2590 {
+                info!("[2590] post checking current key!"; "current_encoded_key" => %hex::encode(&current_user_key));
+            }
 
             if has_lock {
                 if self.met_newer_ts_data == NewerTsCheckState::NotMetYet {
                     self.met_newer_ts_data = NewerTsCheckState::Met;
                 }
-                current_user_key = match self.scan_policy.handle_lock(
+                let result = self.scan_policy.handle_lock(
                     current_user_key,
                     &mut self.cfg,
                     &mut self.cursors,
                     &mut self.statistics,
-                )? {
+                )?;
+                if has_2590 {
+                    info!("[2590] handle_lock";
+                        "current_encoded_key" => %current_user_key,
+                        "result" => ?result
+                    );
+                }
+                current_user_key = match result {
                     HandleRes::Return(output) => {
                         self.statistics.processed_size += self.scan_policy.output_size(&output);
                         return Ok(Some(output));
@@ -324,12 +342,19 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
             if has_write {
                 let is_current_user_key = self.move_write_cursor_to_ts(&current_user_key)?;
                 if is_current_user_key {
-                    if let HandleRes::Return(output) = self.scan_policy.handle_write(
+                    let result = self.scan_policy.handle_write(
                         current_user_key,
                         &mut self.cfg,
                         &mut self.cursors,
                         &mut self.statistics,
-                    )? {
+                    )?;
+                    if has_2590 {
+                        info!("[2590] handle_write";
+                            "current_encoded_key" => %current_user_key,
+                            "result" => ?result
+                        );
+                    }
+                    if let HandleRes::Return(output) = result {
                         self.statistics.write.processed_keys += 1;
                         self.statistics.processed_size += self.scan_policy.output_size(&output);
                         resource_metering::record_read_keys(1);
