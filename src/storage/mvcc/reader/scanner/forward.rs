@@ -1,9 +1,9 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]
-use std::{borrow::Cow, cmp::Ordering};
+use std::{borrow::Cow, cmp::Ordering, fmt::Display};
 
-use engine_traits::CF_DEFAULT;
+use engine_traits::{CF_DEFAULT, CF_LOCK, CF_WRITE};
 use kvproto::kvrpcpb::{ExtraOp, IsolationLevel};
 use txn_types::{Key, Lock, LockType, OldValue, TimeStamp, Value, WriteRef, WriteType};
 
@@ -125,6 +125,32 @@ pub struct ForwardScanner<S: Snapshot, P: ScanPolicy<S>> {
     met_newer_ts_data: NewerTsCheckState,
 }
 
+pub fn _2590(ctx: impl Display, cf: &str, key: &[u8], region_id: u64) -> bool {
+    use tidb_query_datatype::codec::table::*;
+    use tikv_util::codec::bytes::*;
+    let mut decoded = key.to_vec();
+    let ts = if cf == CF_LOCK {
+        TimeStamp::zero()
+    } else {
+        Key::decode_ts_from(&decoded)
+            .unwrap_or_else(|_| panic!("meet key without TS {}", hex::encode(&key)))
+    };
+    decode_bytes_in_place(&mut decoded, false)
+        .unwrap_or_else(|_| panic!("meet key cannot be decoded {}", hex::encode(&key)));
+    let mut triggered = false;
+    if let Ok(2590) = decode_int_handle(&decoded) {
+        let tbl_id = decode_table_id(&decoded).unwrap_or_default();
+        info!("2590 meet"; "table" => %tbl_id, "key" => %hex::encode(&decoded), "ctx" => %ctx, "cf" => %cf, "ts" => ts, "region_id" => %region_id);
+        triggered = true;
+    }
+    if let Ok(2589) = decode_int_handle(&decoded) {
+        let tbl_id = decode_table_id(&decoded).unwrap_or_default();
+        info!("2589 meet"; "table" => %tbl_id, "key" => %hex::encode(&decoded), "ctx" => %ctx, "cf" => %cf, "ts" => ts, "region_id" => %region_id);
+        triggered = true;
+    }
+    triggered
+}
+
 impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
     pub fn new(
         cfg: ScannerConfig<S>,
@@ -220,6 +246,13 @@ impl<S: Snapshot, P: ScanPolicy<S>> ForwardScanner<S, P> {
                 } else {
                     None
                 };
+
+                if let Some(w) = w_key {
+                    _2590("read_next:write", CF_WRITE, w, 0);
+                }
+                if let Some(l) = l_key {
+                    _2590("read_next:lock", CF_LOCK, l, 0);
+                }
 
                 // `res` is `(current_user_key_slice, has_write, has_lock)`
                 let res = match (w_key, l_key) {
@@ -676,6 +709,12 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
         if cfg.isolation_level == IsolationLevel::Rc {
             return Ok(HandleRes::Skip(current_user_key));
         }
+        _2590(
+            "delta:handle_lock",
+            CF_LOCK,
+            current_user_key.as_encoded().as_slice(),
+            0,
+        );
         // TODO: Skip pessimistic locks.
         let lock_value = cursors
             .lock
@@ -685,6 +724,12 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
             .to_owned();
         let lock = Lock::parse(&lock_value)?;
         let result = if lock.ts > cfg.ts {
+            _2590(
+                format_args!("delta:skip_ts:{}", lock.ts),
+                CF_LOCK,
+                current_user_key.as_encoded().as_slice(),
+                0,
+            );
             Ok(HandleRes::Skip(current_user_key))
         } else {
             let load_default_res = if lock.lock_type == LockType::Put && lock.short_value.is_none()
@@ -720,6 +765,12 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
                     statistics,
                 )?;
             }
+            _2590(
+                "delta:prewrite",
+                CF_LOCK,
+                current_user_key.as_encoded().as_slice(),
+                0,
+            );
             load_default_res.map(|default| {
                 HandleRes::Return(TxnEntry::Prewrite {
                     default,
@@ -743,12 +794,20 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
     ) -> Result<HandleRes<Self::Output>> {
         loop {
             let write_value = cursors.write.value(&mut statistics.write);
-            let commit_ts = Key::decode_ts_from(cursors.write.key(&mut statistics.write))?;
+            let key = cursors.write.key(&mut statistics.write);
+            _2590("delta:handle_write", CF_WRITE, key, 0);
+            let commit_ts = Key::decode_ts_from(key)?;
 
             // commit_ts > cfg.ts never happens since the ForwardScanner will skip those greater
             // versions.
 
             if commit_ts <= self.from_ts {
+                _2590(
+                    format_args!("delta:skip_ts:{}", commit_ts),
+                    CF_WRITE,
+                    key,
+                    0,
+                );
                 cursors.move_write_cursor_to_next_user_key(&current_user_key, statistics)?;
                 return Ok(HandleRes::Skip(current_user_key));
             }
@@ -766,6 +825,12 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
             };
 
             if write_type == WriteType::Rollback || write_type == WriteType::Lock {
+                _2590(
+                    format_args!("delta:search_next:{:?}", write_type),
+                    CF_WRITE,
+                    key,
+                    0,
+                );
                 // Skip it and try the next record.
                 cursors.write.next(&mut statistics.write);
                 if !cursors.write.valid()? {
@@ -817,6 +882,7 @@ impl<S: Snapshot> ScanPolicy<S> for DeltaEntryPolicy {
                 )?;
             }
 
+            _2590("delta:commit", CF_WRITE, &write.0, 0);
             let res = Ok(HandleRes::Return(TxnEntry::Commit {
                 default,
                 write,
