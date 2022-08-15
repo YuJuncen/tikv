@@ -17,7 +17,7 @@ use raftstore::{
 use tidb_query_datatype::codec::table::{decode_table_id, encode_row_key};
 use tikv::storage::{
     kv::StatisticsSummary,
-    mvcc::{DeltaScanner, ScannerBuilder},
+    mvcc::{DeltaScanner, EntryScanner, ScannerBuilder},
     txn::{EntryBatch, TxnEntry, TxnEntryScanner},
     Statistics,
 };
@@ -77,7 +77,7 @@ impl PendingMemoryQuota {
 
 /// EventLoader transforms data from the snapshot into ApplyEvent.
 pub struct EventLoader<S: Snapshot> {
-    scanner: DeltaScanner<RegionSnapshot<S>>,
+    scanner: EntryScanner<RegionSnapshot<S>>,
     // pooling the memory.
     entry_batch: EntryBatch,
     region_id: u64,
@@ -97,7 +97,7 @@ impl<S: Snapshot> EventLoader<S> {
         let r = snapshot.get_region().clone();
         let scanner = ScannerBuilder::new(snapshot.clone(), to_ts)
             .fill_cache(false)
-            .build_delta_scanner(from_ts, ExtraOp::Noop)
+            .build_entry_scanner(from_ts, true)
             .map_err(|err| Error::Txn(err.into()))
             .context(format_args!(
                 "failed to create entry scanner from_ts = {}, to_ts = {}, region = {}",
