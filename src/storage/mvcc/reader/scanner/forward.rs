@@ -311,7 +311,7 @@ where
                 0,
             );
             if has_2590 {
-                info!("[2590] post checking current key!"; "current_encoded_key" => %hex::encode(&current_user_key));
+                info!("[2590] post checking current key!"; "current_encoded_key" => %current_user_key);
             }
 
             if has_lock {
@@ -326,7 +326,6 @@ where
                 )?;
                 if has_2590 {
                     info!("[2590] handle_lock";
-                        "current_encoded_key" => %current_user_key,
                         "result" => ?result
                     );
                 }
@@ -350,7 +349,6 @@ where
                     )?;
                     if has_2590 {
                         info!("[2590] handle_write";
-                            "current_encoded_key" => %current_user_key,
                             "result" => ?result
                         );
                     }
