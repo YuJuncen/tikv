@@ -119,8 +119,9 @@ impl<S: Snapshot> EventLoader<S> {
                 let mut valid = iter.seek_to_first().unwrap();
                 while valid {
                     if latest_version == 0 {
-                        let (_, commit_ts) = Key::split_on_ts_for(iter.key()).unwrap();
+                        let (user_key, commit_ts) = Key::split_on_ts_for(iter.key()).unwrap();
                         latest_version = commit_ts.into_inner();
+                        info!("initial scanning meet 2590 in snapshot"; "region_id" => %r.id, "table" => %tid, "commit_ts" => %commit_ts, "encoded_key" => %utils::redact(&user_key));
                     }
                     version_count += 1;
                     valid = iter.next().unwrap();
