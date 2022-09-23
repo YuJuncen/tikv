@@ -158,6 +158,14 @@ impl SstImporter {
         self.dir.exist(meta).unwrap_or(false)
     }
 
+    #[cfg(feature = "failpoints")]
+    fn get_read_amplification() -> usize {
+        fail::fail_point!("restore_read_amplification", |x| {
+            x.and_then(|x| x.parse().ok()).unwrap_or(1)
+        });
+        1
+    }
+
     // Downloads an SST file from an external storage.
     //
     // This method is blocking. It performs the following transformations before
@@ -191,6 +199,31 @@ impl SstImporter {
             "rewrite_rule" => ?rewrite_rule,
             "speed_limit" => speed_limiter.speed_limit(),
         );
+        #[cfg(feature = "failpoints")]
+        {
+            let ra = Self::get_read_amplification();
+            info!("restore read amplification triggered!"; "factor" => %ra);
+            for _ in 1..ra {
+                match self.do_download::<E>(
+                    meta,
+                    backend,
+                    name,
+                    rewrite_rule,
+                    crypter.clone(),
+                    &speed_limiter,
+                    engine.clone(),
+                ) {
+                    Ok(r) => {
+                        info!("download"; "meta" => ?meta, "name" => name, "range" => ?r);
+                    }
+                    Err(e) => {
+                        error!(%e; "download failed"; "meta" => ?meta, "name" => name,);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
         match self.do_download::<E>(
             meta,
             backend,
