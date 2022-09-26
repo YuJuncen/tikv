@@ -28,7 +28,7 @@ use raftstore::coprocessor::RegionInfoProvider;
 use tikv::{
     config::BackupConfig,
     storage::{
-        kv::{CursorBuilder, Engine, ScanMode, SnapContext},
+        kv::{CursorBuilder, Engine, ScanMode, SnapContext, StatisticsSummary},
         mvcc::Error as MvccError,
         raw::raw_mvcc::RawMvccSnapshot,
         txn::{EntryBatch, Error as TxnError, SnapshotStore, TxnEntryScanner, TxnEntryStore},
@@ -832,6 +832,13 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         }
     }
 
+    fn get_write_amplification() -> usize {
+        fail::fail_point!("backup_write_amplification", |x| {
+            x.and_then(|x| x.parse::<usize>().ok()).unwrap_or(1)
+        });
+        1
+    }
+
     fn spawn_backup_worker(
         &self,
         prs: Arc<Mutex<Progress<R>>>,
@@ -898,45 +905,52 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     });
                     let name = backup_file_name(store_id, &brange.region, key, _backend.name());
                     let ct = to_sst_compression_type(request.compression_type);
-
-                    let stat = if is_raw_kv {
-                        brange
-                            .backup_raw_kv_to_file(
-                                engine,
+                    let mut stat_coll = Ok(StatisticsSummary::default());
+                    for _ in 1..Self::get_write_amplification() {
+                        let engine = engine.clone();
+                        let stat = if is_raw_kv {
+                            brange
+                                .backup_raw_kv_to_file(
+                                    engine,
+                                    db.clone(),
+                                    &request.limiter,
+                                    name.clone(),
+                                    cf.into(),
+                                    ct,
+                                    request.compression_level,
+                                    request.cipher.clone(),
+                                    saver_tx.clone(),
+                                )
+                                .await
+                        } else {
+                            let writer_builder = BackupWriterBuilder::new(
+                                store_id,
+                                request.limiter.clone(),
+                                brange.region.clone(),
                                 db.clone(),
-                                &request.limiter,
-                                name,
-                                cf.into(),
                                 ct,
                                 request.compression_level,
+                                sst_max_size,
                                 request.cipher.clone(),
-                                saver_tx.clone(),
-                            )
-                            .await
-                    } else {
-                        let writer_builder = BackupWriterBuilder::new(
-                            store_id,
-                            request.limiter.clone(),
-                            brange.region.clone(),
-                            db.clone(),
-                            ct,
-                            request.compression_level,
-                            sst_max_size,
-                            request.cipher.clone(),
-                        );
-                        brange
-                            .backup(
-                                writer_builder,
-                                engine,
-                                concurrency_manager.clone(),
-                                backup_ts,
-                                start_ts,
-                                saver_tx.clone(),
-                                _backend.name(),
-                            )
-                            .await
+                            );
+                            brange
+                                .backup(
+                                    writer_builder,
+                                    engine,
+                                    concurrency_manager.clone(),
+                                    backup_ts,
+                                    start_ts,
+                                    saver_tx.clone(),
+                                    _backend.name(),
+                                )
+                                .await
+                        };
+                        stat_coll = stat_coll.and_then(|mut s| stat.map(|stat| { s.add_statistics(&stat); s }));
+                        if stat_coll.is_err() {
+                            break;
+                        }
                     };
-                    match stat {
+                    match stat_coll {
                         Err(err) => {
                             error_unknown!(%err; "error during backup"; "region" => ?brange.region,);
                             let mut resp = BackupResponse::new();
@@ -946,11 +960,11 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             }
                         }
                         Ok(stat) => {
-                            BACKUP_RAW_EXPIRED_COUNT.inc_by(stat.data.raw_value_tombstone as u64);
+                            BACKUP_RAW_EXPIRED_COUNT.inc_by(stat.stat.data.raw_value_tombstone as u64);
                             // TODO: maybe add the stat to metrics?
                             debug!("backup region finish";
                             "region" => ?brange.region,
-                            "details" => ?stat);
+                            "details" => ?stat.stat);
                         }
                     }
                 }

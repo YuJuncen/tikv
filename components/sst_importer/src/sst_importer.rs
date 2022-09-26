@@ -202,7 +202,6 @@ impl SstImporter {
         #[cfg(feature = "failpoints")]
         {
             let ra = Self::get_read_amplification();
-            info!("restore read amplification triggered!"; "factor" => %ra);
             for _ in 1..ra {
                 match self.do_download::<E>(
                     meta,

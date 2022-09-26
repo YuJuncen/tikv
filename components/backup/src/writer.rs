@@ -1,8 +1,6 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{fmt::Display, io::Read};
-#[cfg(feature = "failpoints")]
-use std::{io::Cursor, sync::Arc};
 
 use encryption::{EncrypterReader, Iv};
 use engine_rocks::{RocksEngine, RocksSstWriter, RocksSstWriterBuilder};
@@ -18,8 +16,6 @@ use kvproto::{
     metapb::Region,
 };
 use tikv::{coprocessor::checksum_crc64_xor, storage::txn::TxnEntry};
-#[cfg(feature = "failpoints")]
-use tikv_util::info;
 use tikv_util::{
     self, box_err, error,
     time::{Instant, Limiter},
@@ -109,14 +105,6 @@ impl Writer {
         Ok((sst_info.file_size(), sst_reader))
     }
 
-    #[cfg(feature = "failpoints")]
-    fn get_write_amplification() -> usize {
-        fail::fail_point!("backup_write_amplification", |x| {
-            x.and_then(|x| x.parse::<usize>().ok()).unwrap_or(1)
-        });
-        1
-    }
-
     async fn save_and_build_file(
         self,
         name: &str,
@@ -138,16 +126,6 @@ impl Writer {
             .with_label_values(&[cf.into()])
             .inc_by(self.total_kvs);
 
-        #[cfg(feature = "failpoints")]
-        let buf = {
-            let mut buf = Vec::with_capacity(size as _);
-            sst_reader.read_to_end(&mut buf)?;
-            // release the memory manually because shadowing won't drop the old object.
-            drop(sst_reader);
-            Arc::<[u8]>::from(buf.into_boxed_slice())
-        };
-        #[cfg(feature = "failpoints")]
-        let sst_reader = Cursor::new(buf.clone());
         let file_name = format!("{}_{}.sst", name, cf);
         let iv = Iv::new_ctr();
         let encrypter_reader =
@@ -169,38 +147,6 @@ impl Writer {
             .finish()
             .map(|digest| digest.to_vec())
             .map_err(|e| Error::Other(box_err!("Sha256 error: {:?}", e)))?;
-
-        #[cfg(feature = "failpoints")]
-        {
-            let wf = Self::get_write_amplification();
-            info!("backup write amplification triggered!"; "n" => %wf);
-            for _ in 1..wf {
-                let sst_reader = Cursor::new(buf.clone());
-                let iv = Iv::new_ctr();
-                let encrypter_reader =
-                    EncrypterReader::new(sst_reader, cipher.cipher_type, &cipher.cipher_key, iv)
-                        .map_err(|e| {
-                            Error::Other(box_err!("new EncrypterReader error: {:?}", e))
-                        })?;
-                let (reader, hasher) = Sha256Reader::new(encrypter_reader)
-                    .map_err(|e| Error::Other(box_err!("Sha256 error: {:?}", e)))?;
-                storage
-                    .write(
-                        &file_name,
-                        // AllowStdIo here only introduces the Sha256 reader and an in-memory sst
-                        // reader.
-                        UnpinReader(Box::new(limiter.clone().limit(AllowStdIo::new(reader)))),
-                        size,
-                    )
-                    .await?;
-                hasher
-                    .lock()
-                    .unwrap()
-                    .finish()
-                    .map(|digest| digest.to_vec())
-                    .map_err(|e| Error::Other(box_err!("Sha256 error: {:?}", e)))?;
-            }
-        }
 
         let mut file = File::default();
         file.set_name(file_name);
