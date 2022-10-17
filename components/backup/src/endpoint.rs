@@ -906,7 +906,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                     let name = backup_file_name(store_id, &brange.region, key, _backend.name());
                     let ct = to_sst_compression_type(request.compression_type);
                     let mut stat_coll = Ok(StatisticsSummary::default());
-                    for _ in 1..Self::get_write_amplification() {
+                    for _ in 0..Self::get_write_amplification() {
                         let engine = engine.clone();
                         let stat = if is_raw_kv {
                             brange
