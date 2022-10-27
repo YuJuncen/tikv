@@ -215,6 +215,7 @@ impl SstImporter {
                     rewrite_rule,
                     crypter.clone(),
                     &speed_limiter,
+                    cache_key,
                     engine.clone(),
                 ) {
                     Ok(r) => {
