@@ -4,6 +4,7 @@ use std::{sync::Arc, time::Duration};
 
 use etcd_client::{ConnectOptions, Error as EtcdError, OpenSslClientConfig};
 use futures::Future;
+use openssl::x509::verify::X509VerifyFlags;
 use tikv_util::{
     info,
     stream::{RetryError, RetryExt},
@@ -33,6 +34,7 @@ impl ConnectionConfig {
             opts = opts.with_openssl_tls(
                 OpenSslClientConfig::default()
                     .ca_cert_pem(&tls.ca)
+                    .manually(|c| c.cert_store_mut().set_flags(X509VerifyFlags::PARTIAL_CHAIN))
                     .client_cert_pem_and_key(&tls.client_cert, &tls.client_key.0),
             )
         }
