@@ -64,8 +64,9 @@ use std::{
     borrow::Cow,
     iter,
     marker::PhantomData,
+    mem,
     sync::{
-        atomic::{self, AtomicBool, AtomicU64},
+        atomic::{self, AtomicBool, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -87,9 +88,10 @@ use pd_client::FeatureGate;
 use raftstore::store::{util::build_key_range, ReadStats, TxnExt, WriteStats};
 use rand::prelude::*;
 use resource_metering::{FutureExt, ResourceTagFactory};
-use tikv_kv::SnapshotExt;
+use tikv_kv::{OnAppliedCb, SnapshotExt};
 use tikv_util::{
     deadline::Deadline,
+    future::try_poll,
     quota_limiter::QuotaLimiter,
     time::{duration_to_ms, Instant, ThreadReadId},
 };
@@ -1548,11 +1550,18 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
         let mut batch = WriteData::from_modifies(modifies);
         batch.set_allowed_on_disk_almost_full();
-        self.engine.async_write(
+        let res = kv::write(
+            &self.engine,
             &ctx,
             batch,
-            Box::new(|res| callback(res.map_err(Error::from))),
-        )?;
+            Some(Box::new(|res| {
+                callback(mem::replace(res, Ok(())).map_err(Error::from))
+            })),
+        );
+        // TODO: perhaps change delete_range API to return future.
+        if let Some(Some(Err(e))) = try_poll(res) {
+            return Err(Error::from(e));
+        }
         KV_COMMAND_COUNTER_VEC_STATIC.delete_range.inc();
         Ok(())
     }
@@ -1951,14 +1960,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
 
             let mut batch = WriteData::from_modifies(vec![m]);
             batch.set_allowed_on_disk_almost_full();
-            let (cb, f) = tikv_util::future::paired_future_callback();
-            let async_ret =
-                engine.async_write(&ctx, batch, Box::new(|res| cb(res.map_err(Error::from))));
-            let v: Result<()> = match async_ret {
-                Err(e) => Err(Error::from(e)),
-                Ok(_) => f.await.unwrap(),
-            };
-            callback(v);
+            let res = kv::write(&engine, &ctx, batch, None);
+            callback(
+                res.await
+                    .unwrap_or_else(|| Err(box_err!("stale command")))
+                    .map_err(Error::from),
+            );
             KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
             SCHED_STAGE_COUNTER_VEC.get(CMD).write_finish.inc();
             SCHED_HISTOGRAM_VEC_STATIC
@@ -2054,14 +2061,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             let modifies = Self::raw_batch_put_requests_to_modifies(cf, pairs, ttls, ts.unwrap());
             let mut batch = WriteData::from_modifies(modifies);
             batch.set_allowed_on_disk_almost_full();
-            let (cb, f) = tikv_util::future::paired_future_callback();
-            let async_ret =
-                engine.async_write(&ctx, batch, Box::new(|res| cb(res.map_err(Error::from))));
-            let v: Result<()> = match async_ret {
-                Err(e) => Err(Error::from(e)),
-                Ok(_) => f.await.unwrap(),
-            };
-            callback(v);
+            let res = kv::write(&engine, &ctx, batch, None);
+            callback(
+                res.await
+                    .unwrap_or_else(|| Err(box_err!("stale command")))
+                    .map_err(Error::from),
+            );
             KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
             SCHED_STAGE_COUNTER_VEC.get(CMD).write_finish.inc();
             SCHED_HISTOGRAM_VEC_STATIC
@@ -2118,14 +2123,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             let m = Self::raw_delete_request_to_modify(cf, key, ts.unwrap());
             let mut batch = WriteData::from_modifies(vec![m]);
             batch.set_allowed_on_disk_almost_full();
-            let (cb, f) = tikv_util::future::paired_future_callback();
-            let async_ret =
-                engine.async_write(&ctx, batch, Box::new(|res| cb(res.map_err(Error::from))));
-            let v: Result<()> = match async_ret {
-                Err(e) => Err(Error::from(e)),
-                Ok(_) => f.await.unwrap(),
-            };
-            callback(v);
+            let res = kv::write(&engine, &ctx, batch, None);
+            callback(
+                res.await
+                    .unwrap_or_else(|| Err(box_err!("stale command")))
+                    .map_err(Error::from),
+            );
             KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
             SCHED_STAGE_COUNTER_VEC.get(CMD).write_finish.inc();
             SCHED_HISTOGRAM_VEC_STATIC
@@ -2171,14 +2174,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             batch.set_allowed_on_disk_almost_full();
 
             // TODO: special notification channel for API V2.
-            let (cb, f) = tikv_util::future::paired_future_callback();
-            let async_ret =
-                engine.async_write(&ctx, batch, Box::new(|res| cb(res.map_err(Error::from))));
-            let v: Result<()> = match async_ret {
-                Err(e) => Err(Error::from(e)),
-                Ok(_) => f.await.unwrap(),
-            };
-            callback(v);
+            let res = kv::write(&engine, &ctx, batch, None);
+            callback(
+                res.await
+                    .unwrap_or_else(|| Err(box_err!("stale command")))
+                    .map_err(Error::from),
+            );
             KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
             SCHED_STAGE_COUNTER_VEC.get(CMD).write_finish.inc();
             SCHED_HISTOGRAM_VEC_STATIC
@@ -2231,14 +2232,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
                 .collect();
             let mut batch = WriteData::from_modifies(modifies);
             batch.set_allowed_on_disk_almost_full();
-            let (cb, f) = tikv_util::future::paired_future_callback();
-            let async_ret =
-                engine.async_write(&ctx, batch, Box::new(|res| cb(res.map_err(Error::from))));
-            let v: Result<()> = match async_ret {
-                Err(e) => Err(Error::from(e)),
-                Ok(_) => f.await.unwrap(),
-            };
-            callback(v);
+            let res = kv::write(&engine, &ctx, batch, None);
+            callback(
+                res.await
+                    .unwrap_or_else(|| Err(box_err!("stale command")))
+                    .map_err(Error::from),
+            );
             KV_COMMAND_COUNTER_VEC_STATIC.get(CMD).inc();
             SCHED_STAGE_COUNTER_VEC.get(CMD).write_finish.inc();
             SCHED_HISTOGRAM_VEC_STATIC
@@ -2993,13 +2992,15 @@ impl<E: Engine> Engine for TxnTestEngine<E> {
         }
     }
 
+    type WriteRes = E::WriteRes;
     fn async_write(
         &self,
         ctx: &Context,
         batch: WriteData,
-        write_cb: tikv_kv::Callback<()>,
-    ) -> tikv_kv::Result<()> {
-        self.engine.async_write(ctx, batch, write_cb)
+        subscribed: u8,
+        on_applied: Option<OnAppliedCb>,
+    ) -> Self::WriteRes {
+        self.engine.async_write(ctx, batch, subscribed, on_applied)
     }
 }
 
@@ -3101,6 +3102,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> TestStorageBuilder<E, L, F> {
         self
     }
 
+    pub fn wake_up_delay_duration(self, duration_ms: u64) -> Self {
+        self.wake_up_delay_duration_ms
+            .store(duration_ms, Ordering::Relaxed);
+        self
+    }
+
     pub fn set_api_version(mut self, api_version: ApiVersion) -> Self {
         self.config.set_api_version(api_version);
         self
@@ -3194,6 +3201,9 @@ pub mod test_util {
             Mutex,
         },
     };
+
+    use futures_executor::block_on;
+    use kvproto::kvrpcpb::Op;
 
     use super::*;
     use crate::storage::{
@@ -3505,6 +3515,46 @@ pub mod test_util {
         feature_gate.set_version(env!("CARGO_PKG_VERSION")).unwrap();
         feature_gate
     }
+
+    pub fn must_have_locks<E: Engine, L: LockManager, F: KvFormat>(
+        storage: &Storage<E, L, F>,
+        ts: u64,
+        start_key: &[u8],
+        end_key: &[u8],
+        expected_locks: &[(
+            // key
+            &[u8],
+            Op,
+            // start_ts
+            u64,
+            // for_update_ts
+            u64,
+        )],
+    ) {
+        let locks = block_on(storage.scan_lock(
+            Context::default(),
+            ts.into(),
+            Some(Key::from_raw(start_key)),
+            Some(Key::from_raw(end_key)),
+            100,
+        ))
+        .unwrap();
+        assert_eq!(
+            locks.len(),
+            expected_locks.len(),
+            "lock count not match, expected: {:?}; got: {:?}",
+            expected_locks,
+            locks
+        );
+        for (lock_info, (expected_key, expected_op, expected_start_ts, expected_for_update_ts)) in
+            locks.into_iter().zip(expected_locks.iter())
+        {
+            assert_eq!(lock_info.get_key(), *expected_key);
+            assert_eq!(lock_info.get_lock_type(), *expected_op);
+            assert_eq!(lock_info.get_lock_version(), *expected_start_ts);
+            assert_eq!(lock_info.get_lock_for_update_ts(), *expected_for_update_ts);
+        }
+    }
 }
 
 /// All statistics related to KvGet/KvBatchGet.
@@ -3543,9 +3593,13 @@ mod tests {
     use txn_types::{Mutation, PessimisticLock, WriteType, SHORT_VALUE_MAX_LEN};
 
     use super::{
+        config::EngineType,
         mvcc::tests::{must_unlocked, must_written},
         test_util::*,
-        txn::{commands::new_flashback_to_version_read_phase_cmd, FLASHBACK_BATCH_SIZE},
+        txn::{
+            commands::{new_flashback_rollback_lock_cmd, new_flashback_write_cmd},
+            FLASHBACK_BATCH_SIZE,
+        },
         *,
     };
     use crate::{
@@ -3557,8 +3611,8 @@ mod tests {
                 Error as KvError, ErrorInner as EngineErrorInner, ExpectedWrite, MockEngineBuilder,
             },
             lock_manager::{
-                DiagnosticContext, KeyLockWaitInfo, LockDigest, LockWaitToken, UpdateWaitForEvent,
-                WaitTimeout,
+                CancellationCallback, DiagnosticContext, KeyLockWaitInfo, LockDigest,
+                LockWaitToken, UpdateWaitForEvent, WaitTimeout,
             },
             mvcc::LockType,
             txn::{
@@ -4084,20 +4138,27 @@ mod tests {
             let cfs_opts = vec![
                 (
                     CF_DEFAULT,
-                    cfg_rocksdb
-                        .defaultcf
-                        .build_opt(&cache, None, ApiVersion::V1),
+                    cfg_rocksdb.defaultcf.build_opt(
+                        &cache,
+                        None,
+                        ApiVersion::V1,
+                        EngineType::RaftKv,
+                    ),
                 ),
-                (CF_LOCK, cfg_rocksdb.lockcf.build_opt(&cache)),
-                (CF_WRITE, cfg_rocksdb.writecf.build_opt(&cache, None)),
+                (
+                    CF_LOCK,
+                    cfg_rocksdb.lockcf.build_opt(&cache, EngineType::RaftKv),
+                ),
+                (
+                    CF_WRITE,
+                    cfg_rocksdb
+                        .writecf
+                        .build_opt(&cache, None, EngineType::RaftKv),
+                ),
                 (CF_RAFT, cfg_rocksdb.raftcf.build_opt(&cache)),
             ];
             RocksEngine::new(
-                &path,
-                None,
-                cfs_opts,
-                cache.is_some(),
-                None, // io_rate_limiter
+                &path, None, cfs_opts, None, // io_rate_limiter
             )
         }
         .unwrap();
@@ -4816,20 +4877,14 @@ mod tests {
             let (key, value) = write.0.clone().into_key_value();
             // The version we want to flashback to.
             let version = write.2;
-            storage
-                .sched_txn_command(
-                    new_flashback_to_version_read_phase_cmd(
-                        start_ts,
-                        commit_ts,
-                        version,
-                        key.clone(),
-                        Key::from_raw(b"z"),
-                        Context::default(),
-                    ),
-                    expect_ok_callback(tx.clone(), 2),
-                )
-                .unwrap();
-            rx.recv().unwrap();
+            run_flashback_to_version(
+                &storage,
+                start_ts,
+                commit_ts,
+                version,
+                key.clone(),
+                Some(Key::from_raw(b"z")),
+            );
             if let Mutation::Put(..) = write.0 {
                 expect_value(
                     value.unwrap(),
@@ -4845,6 +4900,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn run_flashback_to_version<F: KvFormat>(
+        storage: &Storage<RocksEngine, MockLockManager, F>,
+        start_ts: TimeStamp,
+        commit_ts: TimeStamp,
+        version: TimeStamp,
+        start_key: Key,
+        end_key: Option<Key>,
+    ) {
+        let (tx, rx) = channel();
+        storage
+            .sched_txn_command(
+                new_flashback_rollback_lock_cmd(
+                    start_ts,
+                    version,
+                    start_key.clone(),
+                    end_key.clone(),
+                    Context::default(),
+                ),
+                expect_ok_callback(tx.clone(), 0),
+            )
+            .unwrap();
+        rx.recv().unwrap();
+        storage
+            .sched_txn_command(
+                new_flashback_write_cmd(
+                    start_ts,
+                    commit_ts,
+                    version,
+                    start_key,
+                    end_key,
+                    Context::default(),
+                ),
+                expect_ok_callback(tx, 1),
+            )
+            .unwrap();
+        rx.recv().unwrap();
     }
 
     #[test]
@@ -4890,7 +4983,7 @@ mod tests {
                     b"k".to_vec(),
                     *ts.incr(),
                 ),
-                expect_ok_callback(tx.clone(), 2),
+                expect_ok_callback(tx, 2),
             )
             .unwrap();
         rx.recv().unwrap();
@@ -4906,20 +4999,14 @@ mod tests {
 
         let start_ts = *ts.incr();
         let commit_ts = *ts.incr();
-        storage
-            .sched_txn_command(
-                new_flashback_to_version_read_phase_cmd(
-                    start_ts,
-                    commit_ts,
-                    2.into(),
-                    Key::from_raw(b"k"),
-                    Key::from_raw(b"z"),
-                    Context::default(),
-                ),
-                expect_ok_callback(tx.clone(), 3),
-            )
-            .unwrap();
-        rx.recv().unwrap();
+        run_flashback_to_version(
+            &storage,
+            start_ts,
+            commit_ts,
+            2.into(),
+            Key::from_raw(b"k"),
+            Some(Key::from_raw(b"z")),
+        );
         expect_value(
             b"v@1".to_vec(),
             block_on(storage.get(Context::default(), Key::from_raw(b"k"), commit_ts))
@@ -4928,20 +5015,14 @@ mod tests {
         );
         let start_ts = *ts.incr();
         let commit_ts = *ts.incr();
-        storage
-            .sched_txn_command(
-                new_flashback_to_version_read_phase_cmd(
-                    start_ts,
-                    commit_ts,
-                    1.into(),
-                    Key::from_raw(b"k"),
-                    Key::from_raw(b"z"),
-                    Context::default(),
-                ),
-                expect_ok_callback(tx, 4),
-            )
-            .unwrap();
-        rx.recv().unwrap();
+        run_flashback_to_version(
+            &storage,
+            start_ts,
+            commit_ts,
+            1.into(),
+            Key::from_raw(b"k"),
+            Some(Key::from_raw(b"z")),
+        );
         expect_none(
             block_on(storage.get(Context::default(), Key::from_raw(b"k"), commit_ts))
                 .unwrap()
@@ -5025,20 +5106,14 @@ mod tests {
         let flashback_start_ts = *ts.incr();
         let flashback_commit_ts = *ts.incr();
         for _ in 0..10 {
-            storage
-                .sched_txn_command(
-                    new_flashback_to_version_read_phase_cmd(
-                        flashback_start_ts,
-                        flashback_commit_ts,
-                        TimeStamp::zero(),
-                        Key::from_raw(b"k"),
-                        Key::from_raw(b"z"),
-                        Context::default(),
-                    ),
-                    expect_ok_callback(tx.clone(), 2),
-                )
-                .unwrap();
-            rx.recv().unwrap();
+            run_flashback_to_version(
+                &storage,
+                flashback_start_ts,
+                flashback_commit_ts,
+                TimeStamp::zero(),
+                Key::from_raw(b"k"),
+                Some(Key::from_raw(b"z")),
+            );
             for i in 1..=FLASHBACK_BATCH_SIZE * 4 {
                 let key = Key::from_raw(format!("k{}", i).as_bytes());
                 expect_none(
@@ -5098,7 +5173,7 @@ mod tests {
         storage
             .sched_txn_command(
                 commands::Commit::new(vec![k.clone()], ts, *ts.incr(), Context::default()),
-                expect_value_callback(tx.clone(), 3, TxnStatus::committed(ts)),
+                expect_value_callback(tx, 3, TxnStatus::committed(ts)),
             )
             .unwrap();
         rx.recv().unwrap();
@@ -5110,20 +5185,14 @@ mod tests {
         // Flashback the key.
         let flashback_start_ts = *ts.incr();
         let flashback_commit_ts = *ts.incr();
-        storage
-            .sched_txn_command(
-                new_flashback_to_version_read_phase_cmd(
-                    flashback_start_ts,
-                    flashback_commit_ts,
-                    1.into(),
-                    Key::from_raw(b"k"),
-                    Key::from_raw(b"z"),
-                    Context::default(),
-                ),
-                expect_ok_callback(tx, 4),
-            )
-            .unwrap();
-        rx.recv().unwrap();
+        run_flashback_to_version(
+            &storage,
+            flashback_start_ts,
+            flashback_commit_ts,
+            1.into(),
+            Key::from_raw(b"k"),
+            Some(Key::from_raw(b"z")),
+        );
         expect_none(
             block_on(storage.get(Context::default(), k, flashback_commit_ts))
                 .unwrap()
@@ -8139,46 +8208,6 @@ mod tests {
         test_pessimistic_lock_impl(true);
     }
 
-    fn must_have_locks<E: Engine, L: LockManager, F: KvFormat>(
-        storage: &Storage<E, L, F>,
-        ts: u64,
-        start_key: &[u8],
-        end_key: &[u8],
-        expected_locks: &[(
-            // key
-            &[u8],
-            Op,
-            // start_ts
-            u64,
-            // for_update_ts
-            u64,
-        )],
-    ) {
-        let locks = block_on(storage.scan_lock(
-            Context::default(),
-            ts.into(),
-            Some(Key::from_raw(start_key)),
-            Some(Key::from_raw(end_key)),
-            100,
-        ))
-        .unwrap();
-        assert_eq!(
-            locks.len(),
-            expected_locks.len(),
-            "lock count not match, expected: {:?}; got: {:?}",
-            expected_locks,
-            locks
-        );
-        for (lock_info, (expected_key, expected_op, expected_start_ts, expected_for_update_ts)) in
-            locks.into_iter().zip(expected_locks.iter())
-        {
-            assert_eq!(lock_info.get_key(), *expected_key);
-            assert_eq!(lock_info.get_lock_type(), *expected_op);
-            assert_eq!(lock_info.get_lock_version(), *expected_start_ts);
-            assert_eq!(lock_info.get_lock_for_update_ts(), *expected_for_update_ts);
-        }
-    }
-
     fn test_pessimistic_lock_resumable_impl(
         pipelined_pessimistic_lock: bool,
         in_memory_lock: bool,
@@ -8711,7 +8740,7 @@ mod tests {
             wait_info: KeyLockWaitInfo,
             is_first_lock: bool,
             timeout: Option<WaitTimeout>,
-            cancel_callback: Box<dyn FnOnce(Error) + Send>,
+            cancel_callback: CancellationCallback,
             diag_ctx: DiagnosticContext,
         },
         RemoveLockWait {
@@ -8751,7 +8780,7 @@ mod tests {
             wait_info: KeyLockWaitInfo,
             is_first_lock: bool,
             timeout: Option<WaitTimeout>,
-            cancel_callback: Box<dyn FnOnce(Error) + Send>,
+            cancel_callback: CancellationCallback,
             diag_ctx: DiagnosticContext,
         ) {
             self.tx

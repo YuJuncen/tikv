@@ -16,8 +16,7 @@ use encryption_export::{
 use engine_rocks::{config::BlobRunMode, RocksEngine, RocksSnapshot};
 use engine_test::raft::RaftTestEngine;
 use engine_traits::{
-    Engines, Iterable, Peekable, RaftEngineDebug, RaftEngineReadOnly, TabletFactory, ALL_CFS,
-    CF_DEFAULT, CF_RAFT,
+    Engines, Iterable, Peekable, RaftEngineDebug, RaftEngineReadOnly, ALL_CFS, CF_DEFAULT, CF_RAFT,
 };
 use file_system::IoRateLimiter;
 use futures::executor::block_on;
@@ -597,17 +596,14 @@ pub fn create_test_engine(
     let raft_engine = RaftTestEngine::build(&cfg, &env, &key_manager, &cache);
 
     let mut builder =
-        KvEngineFactoryBuilder::new(env, &cfg, dir.path()).sst_recovery_sender(Some(scheduler));
-    if let Some(cache) = cache {
-        builder = builder.block_cache(cache);
-    }
+        KvEngineFactoryBuilder::new(env, &cfg, cache).sst_recovery_sender(Some(scheduler));
     if let Some(router) = router {
         builder = builder.compaction_event_sender(Arc::new(RaftRouterCompactedEventSender {
             router: Mutex::new(router),
         }));
     }
     let factory = builder.build();
-    let engine = factory.create_shared_db().unwrap();
+    let engine = factory.create_shared_db(dir.path()).unwrap();
     let engines = Engines::new(engine, raft_engine);
     (engines, key_manager, dir, sst_worker)
 }
@@ -1249,6 +1245,10 @@ pub fn must_flashback_to_version(
 ) {
     let mut prepare_req = PrepareFlashbackToVersionRequest::default();
     prepare_req.set_context(ctx.clone());
+    prepare_req.set_start_ts(start_ts);
+    prepare_req.set_version(version);
+    prepare_req.set_start_key(b"a".to_vec());
+    prepare_req.set_end_key(b"z".to_vec());
     client
         .kv_prepare_flashback_to_version(&prepare_req)
         .unwrap();
@@ -1256,9 +1256,9 @@ pub fn must_flashback_to_version(
     req.set_context(ctx);
     req.set_start_ts(start_ts);
     req.set_commit_ts(commit_ts);
-    req.version = version;
-    req.start_key = b"a".to_vec();
-    req.end_key = b"z".to_vec();
+    req.set_version(version);
+    req.set_start_key(b"a".to_vec());
+    req.set_end_key(b"z".to_vec());
     let resp = client.kv_flashback_to_version(&req).unwrap();
     assert!(!resp.has_region_error());
     assert!(resp.get_error().is_empty());
