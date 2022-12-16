@@ -9,7 +9,7 @@ edition = "2021"
 backup-stream = { path = "../../components/backup-stream" }
 clap = { version = "4.0.22", features = ["derive"] }
 rand = "0.8.5"
-security = { path = "../../components/security", features = ["tonic"] }
+security = { path = "../../components/security" }
 tokio = { version = "1.21.2", features = ["rt", "rt-multi-thread"] }
 
 [build-dependencies]
