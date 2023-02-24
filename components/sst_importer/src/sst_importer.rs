@@ -500,15 +500,16 @@ impl SstImporter {
         &self,
         backend: &StorageBackend,
         cache_id: &str,
-    ) -> Result<Arc<dyn ExternalStorage>> {
+    ) -> Result<Box<dyn ExternalStorage>> {
         // prepare to download the file from the external_storage
         // TODO: pass a config to support hdfs
         let ext_storage = if cache_id.is_empty() {
             EXT_STORAGE_CACHE_COUNT.with_label_values(&["skip"]).inc();
             let s = external_storage_export::create_storage(backend, Default::default())?;
-            Arc::from(s)
+            s
         } else {
-            self.cached_storage.cached_or_create(cache_id, backend)?
+            let o = self.cached_storage.cached_or_create(cache_id, backend)?;
+            Box::new(o)
         };
         Ok(ext_storage)
     }
@@ -744,7 +745,7 @@ impl SstImporter {
 
     pub fn wrap_kms(
         &self,
-        ext_storage: Arc<dyn ExternalStorage>,
+        ext_storage: impl ExternalStorage,
         support_kms: bool,
     ) -> Arc<dyn external_storage_export::ExternalStorage> {
         // kv-files needn't are decrypted with KMS when download currently because these
@@ -758,7 +759,7 @@ impl SstImporter {
                     storage: ext_storage,
                 })
             }
-            _ => ext_storage,
+            _ => Arc::new(ext_storage),
         }
     }
 

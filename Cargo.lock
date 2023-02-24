@@ -5503,6 +5503,7 @@ name = "sst_importer"
 version = "0.1.0"
 dependencies = [
  "api_version",
+ "async-trait",
  "crc32fast",
  "dashmap",
  "encryption",
@@ -5533,6 +5534,7 @@ dependencies = [
  "tikv_util",
  "tokio",
  "txn_types",
+ "url",
  "uuid 0.8.2",
 ]
 
