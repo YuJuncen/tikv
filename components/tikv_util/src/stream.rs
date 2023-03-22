@@ -152,24 +152,28 @@ where
     })();
 
     let mut retry_wait_dur = Duration::from_secs(1);
-
-    let mut final_result = action().await;
-    for _ in 1..max_retry_times {
-        if let Err(e) = &final_result {
-            if let Some(ref mut f) = ext.on_failure {
-                f(e);
-            }
-            if e.is_retryable() {
-                let backoff = thread_rng().gen_range(0..1000);
-                sleep(retry_wait_dur + Duration::from_millis(backoff)).await;
-                retry_wait_dur = MAX_RETRY_DELAY.min(retry_wait_dur * 2);
-                final_result = action().await;
-                continue;
+    let mut retry_time = 0;
+    loop {
+        match action().await {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                if let Some(ref mut f) = ext.on_failure {
+                    f(&e);
+                }
+                if !e.is_retryable() {
+                    return Err(e);
+                }
+                retry_time += 1;
+                if retry_time > max_retry_times {
+                    return Err(e);
+                }
             }
         }
-        break;
+
+        let backoff = thread_rng().gen_range(0..1000);
+        sleep(retry_wait_dur + Duration::from_millis(backoff)).await;
+        retry_wait_dur = MAX_RETRY_DELAY.min(retry_wait_dur * 2);
     }
-    final_result
 }
 
 // Return an error if the future does not finish by the timeout
@@ -230,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_retry_is_send_even_return_type_not_sync() {
-        struct BangSync(Option<RefCell<String>>);
+        struct BangSync(Option<RefCell<()>>);
         let fut = retry(|| futures::future::ok::<_, HttpDispatchError>(BangSync(None)));
         assert_send(fut)
     }

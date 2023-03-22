@@ -37,13 +37,13 @@ use crate::{
     errors::{ContextualResultExt, Error, Result},
     metrics,
     router::{ApplyEvent, ApplyEvents, Router},
-    subscription_track::{SubscriptionTracer, TwoPhaseResolver},
+    subscription_track::{Ref, RefMut, SubscriptionTracer, TwoPhaseResolver},
     try_send,
     utils::{self, RegionPager},
     Task,
 };
 
-const MAX_GET_SNAPSHOT_RETRY: usize = 3;
+const MAX_GET_SNAPSHOT_RETRY: usize = 5;
 
 #[derive(Clone)]
 pub struct PendingMemoryQuota(Arc<Semaphore>);
@@ -236,7 +236,8 @@ where
     ) -> Result<impl Snapshot> {
         let mut last_err = None;
         for _ in 0..MAX_GET_SNAPSHOT_RETRY {
-            let r = self.observe_over(region, cmd());
+            let c = cmd();
+            let r = self.observe_over(region, c);
             match r {
                 Ok(s) => {
                     return Ok(s);
@@ -268,7 +269,7 @@ where
                     if !can_retry {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(500));
+                    std::thread::sleep(Duration::from_secs(1));
                     continue;
                 }
             }

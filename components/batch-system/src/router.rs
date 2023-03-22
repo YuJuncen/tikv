@@ -12,12 +12,7 @@ use std::{
 
 use collections::HashMap;
 use crossbeam::channel::{SendError, TrySendError};
-use tikv_util::{
-    debug, info,
-    lru::LruCache,
-    time::{duration_to_sec, Instant},
-    Either,
-};
+use tikv_util::{debug, info, lru::LruCache, time::Instant, Either};
 
 use crate::{
     fsm::{Fsm, FsmScheduler, FsmState},
@@ -188,10 +183,18 @@ where
         mailbox: BasicMailbox<N>,
         msg: N::Message,
     ) -> Result<(), (BasicMailbox<N>, N::Message)> {
+        let mut normals = self.normals.lock().unwrap();
+        // Send has to be done within lock, otherwise the message may be handled
+        // before the mailbox is register.
         if let Err(SendError(m)) = mailbox.force_send(msg, &self.normal_scheduler) {
             return Err((mailbox, m));
         }
-        self.register(addr, mailbox);
+        if let Some(mailbox) = normals.map.insert(addr, mailbox) {
+            mailbox.close();
+        }
+        normals
+            .alive_cnt
+            .store(normals.map.len(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -294,7 +297,7 @@ where
         }
     }
 
-    /// Force sending message to control FSM.
+    /// Sending message to control FSM.
     #[inline]
     pub fn send_control(&self, msg: C::Message) -> Result<(), TrySendError<C::Message>> {
         match self.control_box.try_send(msg, &self.control_scheduler) {
@@ -309,6 +312,12 @@ where
         }
     }
 
+    /// Force sending message to control FSM.
+    #[inline]
+    pub fn force_send_control(&self, msg: C::Message) -> Result<(), SendError<C::Message>> {
+        self.control_box.force_send(msg, &self.control_scheduler)
+    }
+
     /// Try to notify all normal FSMs a message.
     pub fn broadcast_normal(&self, mut msg_gen: impl FnMut() -> N::Message) {
         let timer = Instant::now_coarse();
@@ -316,7 +325,7 @@ where
         for mailbox in mailboxes.map.values() {
             let _ = mailbox.force_send(msg_gen(), &self.normal_scheduler);
         }
-        BROADCAST_NORMAL_DURATION.observe(duration_to_sec(timer.saturating_elapsed()) as f64);
+        BROADCAST_NORMAL_DURATION.observe(timer.saturating_elapsed_secs());
     }
 
     /// Try to notify all FSMs that the cluster is being shutdown.
@@ -336,7 +345,7 @@ where
 
     /// Close the mailbox of address.
     pub fn close(&self, addr: u64) {
-        info!("[region {}] shutdown mailbox", addr);
+        info!("shutdown mailbox"; "region_id" => addr);
         unsafe { &mut *self.caches.as_ptr() }.remove(&addr);
         let mut mailboxes = self.normals.lock().unwrap();
         if let Some(mb) = mailboxes.map.remove(&addr) {
