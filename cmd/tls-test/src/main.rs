@@ -1,3 +1,5 @@
+#![feature(const_option_ext)]
+
 use std::{sync::Arc, time::Duration};
 
 use backup_stream::{
@@ -16,16 +18,32 @@ use tikv::config::TikvConfig;
 
 #[derive(Clone, Debug, PartialEq, Default, Parser)]
 struct Config {
-    #[arg(short, long, default_value = "https://127.0.0.1:2379")]
+    #[arg(
+        short,
+        long,
+        default_value = "https://127.0.0.1:2379",
+        help = "the PD addresses, this option will override the config from TiKV config."
+    )]
     endpoints: Vec<String>,
-    #[arg(long, default_value = "")]
+    #[arg(
+        long,
+        default_value = "",
+        help = "when set, would read the TLS suite (cannot be overriden then) and endpoints config (can be overriden by set `--endpoints` or `-e`) from the TiKV config."
+    )]
     tikv_config_path: String,
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help = "the path to client trusted CA cert.")]
     ca_path: String,
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help = "the client cert path.")]
     cert_path: String,
-    #[arg(long, default_value = "")]
+    #[arg(long, default_value = "", help = "the client key path.")]
     key_path: String,
+    #[arg(
+        short,
+        long,
+        default_value_t = false,
+        help = "Do nothing and show the build info."
+    )]
+    version: bool,
 }
 
 struct Run {
@@ -78,7 +96,11 @@ fn init_run(cfg: &Config) -> MayFail<Run> {
         info!("Loaded config from TiKV config."; "cfg" => ?kvcfg.security, "pds" => ?kvcfg.pd.endpoints);
         let security_manager = Arc::new(SecurityManager::new(&kvcfg.security)?);
         // If manually configuried the endpoints, don't override it by the TiKV config.
-        let endpoints = if cfg.endpoints != [ "https://127.0.0.1:2379"] { cfg.endpoints.clone() } else { kvcfg.pd.endpoints };
+        let endpoints = if cfg.endpoints != ["https://127.0.0.1:2379"] {
+            cfg.endpoints.clone()
+        } else {
+            kvcfg.pd.endpoints
+        };
         return Ok(Run {
             endpoints,
             security_manager,
@@ -87,12 +109,21 @@ fn init_run(cfg: &Config) -> MayFail<Run> {
     Err("must provide [--ca-path, --cert-path, --key-path] or --tikv-config-path".into())
 }
 
-fn main() -> Result<()> {
+const BUILD_HASH: &'static str = option_env!("TIKV_BUILD_GIT_HASH").unwrap_or("<UNKNOWN>");
+const BUILD_BRANCH: &'static str = option_env!("TIKV_BUILD_GIT_BRANCH").unwrap_or("<UNKNOWN>");
+
+fn run() -> Result<()> {
     let cfg = Config::parse();
     init_log();
+    if cfg.version {
+        println!("BUILD_HASH: {BUILD_HASH}");
+        println!("BUILD_BRANCH: {BUILD_BRANCH}");
+        return Ok(());
+    }
+
     info!("Welcome to TLS compatibility test utility!";
-        "build_hash" => %option_env!("TIKV_BUILD_GIT_HASH").unwrap_or("<UNKNOWN>"),
-        "build_branch" => %option_env!("TIKV_BUILD_GIT_BRANCH").unwrap_or("<UNKNOWN>")
+        "build_hash" => %BUILD_HASH,
+        "build_branch" => %BUILD_BRANCH
     );
     info!("Using config."; "cfg" => ?cfg);
     let run = init_run(&cfg).map_err(|err| Error::Other(format!("{}", err).into()))?;
@@ -109,6 +140,12 @@ fn main() -> Result<()> {
         .build()
         .unwrap();
     t.block_on(execute_test(&etcd_cli))?;
-    info!("SUCCESS");
     Ok(())
+}
+
+fn main() {
+    match run() {
+        Ok(_) => println!("SUCCESS"),
+        Err(err) => println!("FAILURE: {err}"),
+    }
 }
