@@ -67,6 +67,8 @@ fn main() {
         "cargo:rustc-env=TIKV_BUILD_TIME={}",
         time::now_utc().strftime("%Y-%m-%d %H:%M:%S").unwrap()
     );
+    // Relinking may be expensive... Anyway this is an ad-hoc binary.
+    println!("cargo:rerun-if-changed=.git");
 
     let tool = cc::Build::default().get_compiler();
     link_cpp(&tool);
