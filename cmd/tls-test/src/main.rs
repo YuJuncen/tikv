@@ -114,7 +114,6 @@ const BUILD_BRANCH: &'static str = option_env!("TIKV_BUILD_GIT_BRANCH").unwrap_o
 
 fn run() -> Result<()> {
     let cfg = Config::parse();
-    init_log();
     if cfg.version {
         println!("BUILD_HASH: {BUILD_HASH}");
         println!("BUILD_BRANCH: {BUILD_BRANCH}");
@@ -144,7 +143,13 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    match run() {
+    init_log();
+    let result = run();
+    slog_global::clear_global();
+    // For waiting logs to be fully print...
+    // We cannot be waken up when logger dropped...
+    std::thread::sleep(Duration::from_secs(1));
+    match result {
         Ok(_) => println!("SUCCESS"),
         Err(err) => println!("FAILURE: {err}"),
     }
