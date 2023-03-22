@@ -6745,8 +6745,15 @@ dependencies = [
  "clap 4.0.22",
  "rand 0.8.5",
  "security",
+ "serde",
+ "server",
+ "slog",
+ "slog-global",
+ "slog-term",
+ "tikv",
  "time",
  "tokio",
+ "toml",
 ]
 
 [[package]]
