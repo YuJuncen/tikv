@@ -6650,6 +6650,7 @@ dependencies = [
  "backup-stream",
  "cc",
  "clap 4.0.22",
+ "grpcio",
  "rand 0.8.5",
  "security",
  "serde",

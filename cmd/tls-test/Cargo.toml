@@ -12,8 +12,9 @@ security = { path = "../../components/security" }
 serde = "*"
 server = { path = "../../components/server" }
 slog = "*"
-slog-global = { workspace = true } 
+slog-global = { version = "0.1", git = "https://github.com/breeswish/slog-global.git", rev = "d592f88e4dbba5eb439998463054f1a44fbf17b9" }
 slog-term = "*"
+grpcio = { workspace = true }
 tikv = { path = "../.." }
 tokio = { version = "1.21.2", features = ["rt", "rt-multi-thread"] }
 toml = "*"

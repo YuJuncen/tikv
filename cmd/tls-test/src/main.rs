@@ -11,10 +11,12 @@ use backup_stream::{
     },
 };
 use clap::Parser;
+use grpcio::ChannelBuilder;
 use security::{SecurityConfig, SecurityManager};
 use server::setup::initial_logger;
 use slog_global::info;
 use tikv::config::TikvConfig;
+use tokio::join;
 
 #[derive(Clone, Debug, PartialEq, Default, Parser)]
 struct Config {
@@ -46,6 +48,7 @@ struct Config {
     version: bool,
 }
 
+#[derive(Clone)]
 struct Run {
     security_manager: Arc<SecurityManager>,
     endpoints: Vec<String>,
@@ -80,6 +83,29 @@ async fn execute_test<M: MetaStore>(cli: &M) -> Result<()> {
     let query = Keys::Prefix(MetaKey(b"/tidb/br-stream".to_vec()));
     let keys = snap.get(query).await?;
     info!("Query successed!"; "pitr-key-len" => %keys.len());
+    Ok(())
+}
+
+async fn test_tikv_connection(run: &Run) -> Result<()> {
+    let env = grpcio::EnvBuilder::new().cq_count(1).build();
+    let conn = run
+        .security_manager
+        .connect(ChannelBuilder::new(Arc::new(env)), &run.endpoints[0]);
+    if !conn.wait_for_connected(Duration::from_secs(10)).await {
+        return Err(Error::Other("TiKV connection timeout".into()));
+    }
+    Ok(())
+}
+
+async fn test_pitr_connection(run: &Run) -> Result<()> {
+    let ccfg = ConnectionConfig {
+        keep_alive_interval: Duration::from_secs(3),
+        keep_alive_timeout: Duration::from_secs(10),
+        tls: Arc::clone(&run.security_manager),
+    };
+    let etcd_cli = LazyEtcdClient::new(run.endpoints.as_slice(), ccfg);
+
+    execute_test(&etcd_cli).await?;
     Ok(())
 }
 
@@ -126,19 +152,27 @@ fn run() -> Result<()> {
     );
     info!("Using config."; "cfg" => ?cfg);
     let run = init_run(&cfg).map_err(|err| Error::Other(format!("{}", err).into()))?;
-
-    let ccfg = ConnectionConfig {
-        keep_alive_interval: Duration::from_secs(3),
-        keep_alive_timeout: Duration::from_secs(10),
-        tls: run.security_manager,
+    let run2 = run.clone();
+    let show = |r: Result<()>, name: &str| {
+        match &r {
+            Ok(_) => info!("success on {}", name),
+            Err(err) => info!("failed on {}: err = {}", name, err),
+        }
+        r
     };
-    let etcd_cli = LazyEtcdClient::new(run.endpoints.as_slice(), ccfg);
-
-    let t = tokio::runtime::Builder::new_current_thread()
+    let tikv = async move { show(test_tikv_connection(&run).await, "grpc") };
+    let pitr = async move { show(test_pitr_connection(&run2).await, "tonic") };
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
-    t.block_on(execute_test(&etcd_cli))?;
+        .unwrap()
+        .block_on(async move {
+            let s1 = tokio::spawn(pitr);
+            let s2 = tokio::spawn(tikv);
+            let r1 = s1.await.unwrap();
+            let r2 = s2.await.unwrap();
+            r1.and(r2)
+        })?;
     Ok(())
 }
 
