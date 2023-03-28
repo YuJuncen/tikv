@@ -54,6 +54,15 @@ struct Run {
     endpoints: Vec<String>,
 }
 
+impl std::fmt::Debug for Run {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Run")
+            .field("security_manager", &self.security_manager.get_config())
+            .field("endpoints", &self.endpoints)
+            .finish()
+    }
+}
+
 type MayFail<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 impl Config {
@@ -153,6 +162,7 @@ fn run() -> Result<()> {
     info!("Using config."; "cfg" => ?cfg);
     let run = init_run(&cfg).map_err(|err| Error::Other(format!("{}", err).into()))?;
     let run2 = run.clone();
+    info!("Run!"; "run" => ?run);
     let show = |r: Result<()>, name: &str| {
         match &r {
             Ok(_) => info!("success on {}", name),
