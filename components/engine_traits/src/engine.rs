@@ -33,6 +33,7 @@ pub trait KvEngine:
     + Debug
     + Unpin
     + Checkpointable
+    + VersionedLsmExt
     + 'static
 {
     /// A consistent read-only snapshot of the database

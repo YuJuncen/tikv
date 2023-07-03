@@ -27,6 +27,7 @@ extern crate tikv_alloc;
 extern crate test;
 
 mod cf_names;
+mod versioned_lsm;
 pub use crate::cf_names::*;
 mod cf_options;
 pub use crate::cf_options::*;

@@ -4,6 +4,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     fmt,
+    fs::OpenOptions,
     sync::{atomic::*, mpsc, Arc, Mutex, RwLock},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,10 +12,15 @@ use std::{
 use async_channel::SendError;
 use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
-use engine_traits::{name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, SstCompressionType};
-use external_storage::{BackendConfig, HdfsConfig};
+use engine_traits::{
+    name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, LsmVersion, SstCompressionType,
+    SstMetaData, VersionedLsmExt, CF_DEFAULT, CF_WRITE,
+};
+use external_storage::{BackendConfig, HdfsConfig, UnpinReader};
 use external_storage_export::{create_storage, ExternalStorage};
+use file_system::Sha256Reader;
 use futures::{channel::mpsc::*, executor::block_on};
+use futures_util::io::AllowStdIo;
 use kvproto::{
     brpb::*,
     encryptionpb::EncryptionMethod,
@@ -71,6 +77,7 @@ struct Request {
     compression_level: i32,
     cipher: CipherInfo,
     replica_read: bool,
+    backup_mode: BackupMode,
 }
 
 // Backup Operation corrosponsed to backup service
@@ -146,6 +153,7 @@ impl Task {
                     cipher.set_cipher_type(EncryptionMethod::Plaintext);
                     cipher
                 }),
+                backup_mode: req.mode,
             },
             resp,
         };
@@ -203,7 +211,7 @@ impl<EK: KvEngine> KvWriter<EK> {
 
 #[derive(Debug)]
 struct InMemBackupFiles<EK: KvEngine> {
-    files: KvWriter<EK>,
+    files: BackupFile<EK>,
     start_key: Vec<u8>,
     end_key: Vec<u8>,
     start_version: TimeStamp,
@@ -211,73 +219,173 @@ struct InMemBackupFiles<EK: KvEngine> {
     region: Region,
 }
 
+#[derive(Debug)]
+enum BackupFile<EK: KvEngine> {
+    BuiltByScan(KvWriter<EK>),
+    NativeSsts(Vec<SstMetaData>),
+}
+
+impl<EK: KvEngine> BackupFile<EK> {
+    async fn save(
+        self,
+        ext_storage: &dyn ExternalStorage,
+        native_sst_prefix: &str,
+    ) -> Result<Vec<File>> {
+        match self {
+            BackupFile::BuiltByScan(wrt) => wrt.save(ext_storage).await,
+            BackupFile::NativeSsts(sst_mds) => {
+                let tasks = sst_mds
+                    .into_iter()
+                    .map(|sst_md| Self::save_sst_metadata(ext_storage, native_sst_prefix, sst_md));
+                let files = futures::future::try_join_all(tasks).await?;
+                Ok(files)
+            }
+        }
+    }
+
+    async fn save_sst_metadata(
+        ext_storage: &dyn ExternalStorage,
+        prefix: &str,
+        sst_md: SstMetaData,
+    ) -> Result<File> {
+        let file = OpenOptions::new().read(true).open(sst_md.abs_path)?;
+        let (checksumed_file, hasher) =
+            Sha256Reader::new(file).map_err(|err| Error::Other(format!("{err}").into()))?;
+        let name = format!("{}_{}", prefix, sst_md.name);
+        // TODO: rate limit, encryption, better file layout.
+        ext_storage
+            .write(
+                &name,
+                UnpinReader(Box::new(AllowStdIo::new(checksumed_file))),
+                sst_md.size,
+            )
+            .await?;
+        let hash = hasher
+            .lock()
+            .unwrap()
+            .finish()
+            .map(|d| d.to_vec())
+            .unwrap_or_else(|err| {
+                warn!("cannot hash for file"; "file" => %name, "err" => %err);
+                Default::default()
+            });
+        let mut out_file = File::new();
+        out_file.set_size(sst_md.size);
+        out_file.set_sha256(hash);
+        out_file.set_cf(sst_md.column_family.to_owned());
+        out_file.set_name(name);
+        Ok(out_file)
+    }
+
+    fn need_flush_keys(&self) -> bool {
+        match self {
+            BackupFile::BuiltByScan(wrt) => wrt.need_flush_keys(),
+            BackupFile::NativeSsts(ssts) => !ssts.is_empty(),
+        }
+    }
+
+    fn is_atomic(&self) -> bool {
+        match self {
+            BackupFile::BuiltByScan(_) => false,
+            BackupFile::NativeSsts(_) => true,
+        }
+    }
+}
+
 async fn save_backup_file_worker<EK: KvEngine>(
     rx: async_channel::Receiver<InMemBackupFiles<EK>>,
     tx: UnboundedSender<BackupResponse>,
     storage: Arc<dyn ExternalStorage>,
     codec: KeyValueCodec,
+    store_id: u64,
 ) {
+    let file_prefix = format!("{store_id}");
+
     while let Ok(msg) = rx.recv().await {
-        let files = if msg.files.need_flush_keys() {
-            match msg.files.save(&storage).await {
-                Ok(mut split_files) => {
-                    let mut has_err = false;
-                    for file in split_files.iter_mut() {
-                        // In the case that backup from v1 and restore to v2,
-                        // the file range need be encoded as v2 format.
-                        // And range in response keep in v1 format.
-                        let ret = codec.convert_key_range_to_dst_version(
-                            msg.start_key.clone(),
-                            msg.end_key.clone(),
-                        );
-                        if ret.is_err() {
-                            has_err = true;
-                            break;
-                        }
-                        let (start, end) = ret.unwrap();
-                        file.set_start_key(start);
-                        file.set_end_key(end);
-                        file.set_start_version(msg.start_version.into_inner());
-                        file.set_end_version(msg.end_version.into_inner());
-                    }
-                    if has_err {
-                        Err(box_err!("backup convert key range failed"))
-                    } else {
-                        Ok(split_files)
-                    }
-                }
-                Err(e) => {
-                    error_unknown!(?e; "backup save file failed");
-                    Err(e)
-                }
-            }
-        } else {
-            Ok(vec![])
+        let response_by_err = |e: Error| -> BackupResponse {
+            let mut response = BackupResponse::default();
+            error_unknown!(?e; "backup region failed";
+                "region" => ?msg.region,
+                "start_key" => &log_wrappers::Value::key(&msg.start_key),
+                "end_key" => &log_wrappers::Value::key(&msg.end_key),
+            );
+            response.set_error(e.into());
+            response
         };
-        let mut response = BackupResponse::default();
-        match files {
-            Err(e) => {
-                error_unknown!(?e; "backup region failed";
-                    "region" => ?msg.region,
+        let send_streamy_files = |files: Vec<File>| {
+            let mut response = BackupResponse::default();
+            response.set_files(files.into());
+            response.set_start_key(msg.start_key.clone());
+            response.set_end_key(msg.end_key.clone());
+            response.set_api_version(codec.dst_api_ver);
+            response
+        };
+        let send_batch_files = |files: Vec<File>| {
+            let mut response = BackupResponse::default();
+            response.set_start_key(msg.region.get_start_key().to_owned());
+            response.set_end_key(msg.region.get_end_key().to_owned());
+            response.set_files(files.into());
+            response
+        };
+        let send_and_log_error = |resp| {
+            let res = tx.unbounded_send(resp);
+            if let Err(e) = &res {
+                error_unknown!(?e; "backup failed to send response"; "region" => ?msg.region,
                     "start_key" => &log_wrappers::Value::key(&msg.start_key),
-                    "end_key" => &log_wrappers::Value::key(&msg.end_key),
-                );
-                response.set_error(e.into());
+                    "end_key" => &log_wrappers::Value::key(&msg.end_key),);
             }
-            Ok(files) => {
-                response.set_files(files.into());
+            res
+        };
+        let using_region_boundary = msg.files.is_atomic();
+        let response_by_files = |files: Vec<File>| {
+            if using_region_boundary {
+                send_batch_files(files)
+            } else {
+                send_streamy_files(files)
             }
-        }
-        response.set_start_key(msg.start_key.clone());
-        response.set_end_key(msg.end_key.clone());
-        response.set_api_version(codec.dst_api_ver);
-        if let Err(e) = tx.unbounded_send(response) {
-            error_unknown!(?e; "backup failed to send response"; "region" => ?msg.region,
-            "start_key" => &log_wrappers::Value::key(&msg.start_key),
-            "end_key" => &log_wrappers::Value::key(&msg.end_key),);
-            if e.is_disconnected() {
+        };
+        if !msg.files.need_flush_keys() {
+            let resp = response_by_files(vec![]);
+            let res = send_and_log_error(resp);
+            if res.err().map(|e| e.is_disconnected()).unwrap_or(false) {
                 return;
             }
+        }
+        let convert_key_range = |mut files: Vec<File>| {
+            for file in files.iter_mut() {
+                // In the case that backup from v1 and restore to v2,
+                // the file range need be encoded as v2 format.
+                // And range in response keep in v1 format.
+                let (start, end) = codec
+                    .convert_key_range_to_dst_version(msg.start_key.clone(), msg.end_key.clone())
+                    .map_err(|err| -> Error {
+                        box_err!("backup convert key range failed: {}", err)
+                    })?;
+
+                file.set_start_key(start);
+                file.set_end_key(end);
+                file.set_start_version(msg.start_version.into_inner());
+                file.set_end_version(msg.end_version.into_inner());
+            }
+            Result::Ok(files)
+        };
+
+        let files = match msg.files.save(&storage, &file_prefix).await {
+            Ok(split_files) => convert_key_range(split_files),
+            Err(e) => {
+                error_unknown!(?e; "backup save file failed");
+                Err(e)
+            }
+        };
+
+        let resp = match files {
+            Ok(files) => response_by_files(files),
+            Err(err) => response_by_err(err),
+        };
+
+        let res = send_and_log_error(resp);
+        if res.err().map(|e| e.is_disconnected()).unwrap_or(false) {
+            return;
         }
     }
 }
@@ -299,19 +407,12 @@ async fn send_to_worker_with_metrics<EK: KvEngine>(
 }
 
 impl BackupRange {
-    /// Get entries from the scanner and save them to storage
-    async fn backup<E: Engine>(
+    fn take_snapshot<E: Engine>(
         &self,
-        writer_builder: BackupWriterBuilder<E::Local>,
-        mut engine: E,
-        concurrency_manager: ConcurrencyManager,
+        engine: &mut E,
         backup_ts: TimeStamp,
-        begin_ts: TimeStamp,
-        saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
-        storage_name: &str,
-    ) -> Result<Statistics> {
-        assert!(!self.codec.is_raw_kv);
-
+        concurrency_manager: &ConcurrencyManager,
+    ) -> Result<E::Snap> {
         let mut ctx = Context::default();
         ctx.set_region_id(self.region.get_id());
         ctx.set_region_epoch(self.region.get_region_epoch().to_owned());
@@ -366,6 +467,57 @@ impl BackupRange {
         BACKUP_RANGE_HISTOGRAM_VEC
             .with_label_values(&["snapshot"])
             .observe(start_snapshot.saturating_elapsed().as_secs_f64());
+        Ok(snapshot)
+    }
+
+    async fn backup_files<E: Engine>(
+        &self,
+        mut engine: E,
+        db: E::Local,
+        backup_ts: TimeStamp,
+        cm: &ConcurrencyManager,
+        saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
+    ) -> Result<()> {
+        // Firstly, create a snapshot to making sure out leadership (at least
+        // consistency).
+        let _snap = self.take_snapshot(&mut engine, backup_ts, &cm)?;
+        let mut ssts = vec![];
+        let r = &self.region;
+        for cf in [CF_DEFAULT, CF_WRITE] {
+            let version = db.lock_current_version(cf)?;
+            let files = version.get_files_in_range(
+                &keys::data_key(r.get_start_key()),
+                &keys::data_end_key(r.get_end_key()),
+            )?;
+            for file in files {
+                ssts.push(file);
+            }
+        }
+        let in_mem_file = InMemBackupFiles {
+            files: BackupFile::NativeSsts(ssts),
+            start_key: r.get_start_key().to_owned(),
+            end_key: r.get_end_key().to_owned(),
+            start_version: TimeStamp::zero(),
+            end_version: backup_ts,
+            region: r.clone(),
+        };
+        send_to_worker_with_metrics(&saver, in_mem_file).await?;
+        Ok(())
+    }
+
+    /// Get entries from the scanner and save them to storage
+    async fn backup<E: Engine>(
+        &self,
+        writer_builder: BackupWriterBuilder<E::Local>,
+        mut engine: E,
+        concurrency_manager: ConcurrencyManager,
+        backup_ts: TimeStamp,
+        begin_ts: TimeStamp,
+        saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
+        storage_name: &str,
+    ) -> Result<Statistics> {
+        assert!(!self.codec.is_raw_kv);
+        let snapshot = self.take_snapshot(&mut engine, backup_ts, &concurrency_manager)?;
         let snap_store = SnapshotStore::new(
             snapshot,
             backup_ts,
@@ -413,7 +565,7 @@ impl BackupRange {
                 )?;
                 let this_start_key = next_file_start_key.clone();
                 let msg = InMemBackupFiles {
-                    files: KvWriter::Txn(writer),
+                    files: BackupFile::BuiltByScan(KvWriter::Txn(writer)),
                     start_key: this_start_key,
                     end_key: this_end_key.clone(),
                     start_version: begin_ts,
@@ -453,7 +605,7 @@ impl BackupRange {
             .observe(take);
 
         let msg = InMemBackupFiles {
-            files: KvWriter::Txn(writer),
+            files: BackupFile::BuiltByScan(KvWriter::Txn(writer)),
             start_key: next_file_start_key,
             end_key: self
                 .end_key
@@ -589,7 +741,7 @@ impl BackupRange {
         let start_key = self.codec.decode_backup_key(self.start_key.clone())?;
         let end_key = self.codec.decode_backup_key(self.end_key.clone())?;
         let msg = InMemBackupFiles {
-            files: KvWriter::Raw(writer),
+            files: BackupFile::BuiltByScan(KvWriter::Raw(writer)),
             start_key,
             end_key,
             start_version: TimeStamp::zero(),
@@ -980,7 +1132,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                                 saver_tx.clone(),
                             )
                             .await
-                    } else {
+                    } else if request.backup_mode == BackupMode::Scan {
                         let writer_builder = BackupWriterBuilder::new(
                             store_id,
                             request.limiter.clone(),
@@ -1002,6 +1154,14 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                                 _backend.name(),
                             )
                             .await
+                    } else {
+                        let res = brange.backup_files(
+                            engine,
+                            db.into_owned(),
+                            backup_ts, &concurrency_manager,
+                            saver_tx.clone(),
+                        ).await;
+                        res.map(|_| Statistics::default())
                     };
                     match stat {
                         Err(err) => {
@@ -1128,6 +1288,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                 resp.clone(),
                 backend.clone(),
                 codec,
+                self.store_id,
             ));
         }
     }
@@ -1585,6 +1746,7 @@ pub mod tests {
                         compression_level: 0,
                         cipher: CipherInfo::default(),
                         replica_read: false,
+                        backup_mode: BackupMode::Scan,
                     },
                     resp: tx,
                 };
@@ -1694,6 +1856,7 @@ pub mod tests {
                 compression_level: 0,
                 cipher: CipherInfo::default(),
                 replica_read: false,
+                backup_mode: BackupMode::Scan,
             },
             resp: tx,
         };
@@ -1708,6 +1871,7 @@ pub mod tests {
         let (tx, rx) = unbounded();
         let replica_read_task = Task {
             request: Request {
+                backup_mode: BackupMode::Scan,
                 start_key: b"".to_vec(),
                 end_key: b"3".to_vec(),
                 sub_ranges: ranges.clone(),
@@ -1821,6 +1985,7 @@ pub mod tests {
                 }
                 let task = Task {
                     request: Request {
+                        backup_mode: BackupMode::Scan,
                         start_key: b"1".to_vec(),
                         end_key: b"2".to_vec(),
                         sub_ranges: ranges,
@@ -1945,7 +2110,7 @@ pub mod tests {
             for i in 0..10u8 {
                 let start = alloc_ts();
                 let commit = alloc_ts();
-                let key = format!("{}", i);
+                let key = format!("z{}", i);
                 must_prewrite_put(
                     &mut engine,
                     key.as_bytes(),
@@ -1974,6 +2139,7 @@ pub mod tests {
             let mut req = BackupRequest::default();
             req.set_start_key(vec![]);
             req.set_end_key(vec![b'5']);
+            req.set_mode(BackupMode::File);
             req.set_start_version(0);
             req.set_end_version(ts.into_inner());
             let (tx, rx) = unbounded();
@@ -1983,6 +2149,7 @@ pub mod tests {
             if len % 2 == 0 {
                 req.set_rate_limit(10 * 1024 * 1024);
             }
+
             let (mut task, _) = Task::new(req, tx).unwrap();
             if len % 2 == 0 {
                 // Make sure the rate limiter is set.
@@ -1997,6 +2164,8 @@ pub mod tests {
             let file_len = if *len <= SHORT_VALUE_MAX_LEN { 1 } else { 2 };
             let files = resp.get_files();
             info!("{:?}", files);
+            println!("{}", tmp1.display());
+            std::io::stdin().read_line(&mut String::new()).unwrap();
             assert_eq!(
                 files.len(),
                 file_len, // default and write

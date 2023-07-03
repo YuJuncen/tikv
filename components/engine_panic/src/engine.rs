@@ -1,8 +1,8 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
 use engine_traits::{
-    IterOptions, Iterable, Iterator, KvEngine, Peekable, ReadOptions, Result, SyncMutable,
-    WriteOptions,
+    CfName, IterOptions, Iterable, Iterator, KvEngine, LsmVersion, Peekable, ReadOptions, Result,
+    SstMetaData, SyncMutable, VersionedLsmExt, WriteOptions,
 };
 
 use crate::{db_vector::PanicDbVector, snapshot::PanicSnapshot, write_batch::PanicWriteBatch};
@@ -108,5 +108,21 @@ impl Iterator for PanicEngineIterator {
 
     fn valid(&self) -> Result<bool> {
         panic!()
+    }
+}
+
+pub struct PanicVersion;
+
+impl LsmVersion for PanicVersion {
+    fn get_all_files(&self) -> std::result::Result<Vec<SstMetaData>, String> {
+        unimplemented!()
+    }
+}
+
+impl VersionedLsmExt for PanicEngine {
+    type Version = PanicVersion;
+
+    fn lock_current_version(&self, on_cf: CfName) -> std::result::Result<Self::Version, String> {
+        Ok(PanicVersion)
     }
 }
