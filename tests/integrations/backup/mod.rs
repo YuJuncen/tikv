@@ -7,11 +7,12 @@ use external_storage_export::{create_storage, make_local_backend};
 use file_system::calc_crc32_bytes;
 use futures::{executor::block_on, AsyncReadExt, StreamExt};
 use kvproto::{
+    brpb::BackupMode,
     import_sstpb::*,
     kvrpcpb::*,
     raft_cmdpb::{CmdType, RaftCmdRequest, RaftRequestHeader, Request},
 };
-use tempfile::Builder;
+use tempfile::{Builder, TempDir};
 use test_backup::*;
 use tikv::coprocessor::checksum_crc64_xor;
 use tikv_util::HandyRwLock;
@@ -627,4 +628,25 @@ fn test_backup_in_flashback() {
         region.get_id(),
         kvproto::raft_cmdpb::AdminCmdType::FinishFlashback,
     );
+}
+
+#[test]
+fn test_file_based_backup() {
+    let mut suite = TestSuite::new(3, 144 * 1024 * 1024, ApiVersion::V1);
+    suite.must_kv_put(1_000, 4);
+    for i in 1..10 {
+        let key = format!("key_{i}00");
+        let region = suite.cluster.get_region(key.as_bytes());
+        suite.cluster.must_split(&region, key.as_bytes());
+    }
+    let ts = suite.alloc_ts();
+    let tmp = TempDir::new().unwrap();
+    let resp = suite.backup_with(|req| {
+        req.set_end_version(ts.into_inner());
+        req.set_mode(BackupMode::File);
+        req.set_storage_backend(make_local_backend(tmp.path()));
+    });
+    let resp = block_on(resp.collect::<Vec<_>>());
+    println!("{:?}", resp);
+    assert!(!resp[0].has_error());
 }

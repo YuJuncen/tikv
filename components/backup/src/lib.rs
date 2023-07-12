@@ -12,6 +12,7 @@ mod service;
 mod softlimit;
 mod utils;
 mod writer;
+mod flush_progress;
 
 pub use endpoint::{backup_file_name, Endpoint, Operation, Task};
 pub use errors::{Error, Result};

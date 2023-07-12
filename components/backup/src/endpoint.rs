@@ -20,7 +20,7 @@ use external_storage::{BackendConfig, HdfsConfig, UnpinReader};
 use external_storage_export::{create_storage, ExternalStorage};
 use file_system::Sha256Reader;
 use futures::{channel::mpsc::*, executor::block_on};
-use futures_util::io::AllowStdIo;
+use futures_util::{io::AllowStdIo, SinkExt};
 use kvproto::{
     brpb::*,
     encryptionpb::EncryptionMethod,
@@ -29,7 +29,7 @@ use kvproto::{
 };
 use online_config::OnlineConfig;
 use raft::StateRole;
-use raftstore::coprocessor::RegionInfoProvider;
+use raftstore::{coprocessor::RegionInfoProvider, store::RegionReadProgressRegistry};
 use tikv::{
     config::BackupConfig,
     storage::{
@@ -49,6 +49,7 @@ use tikv_util::{
 };
 use tokio::runtime::Runtime;
 use txn_types::{Key, Lock, TimeStamp};
+use uuid::Uuid;
 
 use crate::{
     metrics::*,
@@ -477,12 +478,27 @@ impl BackupRange {
         backup_ts: TimeStamp,
         cm: &ConcurrencyManager,
         saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
+        progress: &flush_progress::Advancer<E::Local>,
     ) -> Result<()> {
         // Firstly, create a snapshot to making sure out leadership (at least
         // consistency).
         let _snap = self.take_snapshot(&mut engine, backup_ts, &cm)?;
         let mut ssts = vec![];
         let r = &self.region;
+        progress.with(|prog| {
+            if prog.check_resolved_ts(r.get_id(), backup_ts).is_err() {
+                prog.advance_progress()?;
+            }
+            if let Err(reason) = prog.check_resolved_ts(r.get_id(), backup_ts) {
+                prog.hint_advance_resolved_ts(r.get_id());
+                return Result::Err(Error::Other(box_err!(
+                    "resolved ts not ready for region {}, reason is {:?}",
+                    r.get_id(),
+                    reason
+                )));
+            }
+            Result::Ok(())
+        })?;
         for cf in [CF_DEFAULT, CF_WRITE] {
             let version = db.lock_current_version(cf)?;
             let files = version.get_files_in_range(
@@ -848,6 +864,8 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
 
     pub(crate) engine: E,
     pub(crate) region_info: R,
+
+    flush_prog: flush_progress::Advancer<E::Local>,
 }
 
 /// The progress of a backup task
@@ -999,12 +1017,16 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         concurrency_manager: ConcurrencyManager,
         api_version: ApiVersion,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
+        read_progress: RegionReadProgressRegistry,
     ) -> Endpoint<E, R> {
         let pool = ControlThreadPool::new();
         let rt = utils::create_tokio_runtime(config.io_thread_size, "backup-io").unwrap();
         let config_manager = ConfigManager(Arc::new(RwLock::new(config)));
         let softlimit = SoftLimitKeeper::new(config_manager.clone());
         rt.spawn(softlimit.clone().run());
+        // TODO: handle v2.
+        let prog = flush_progress::AdvancerCore::new(read_progress, engine.kv_engine().unwrap());
+        let flush_prog = flush_progress::Advancer::new(prog);
         Endpoint {
             store_id,
             engine,
@@ -1017,6 +1039,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             concurrency_manager,
             api_version,
             causal_ts_provider,
+            flush_prog,
         }
     }
 
@@ -1058,6 +1081,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         let batch_size = self.config_manager.0.read().unwrap().batch_size;
         let sst_max_size = self.config_manager.0.read().unwrap().sst_max_size.0;
         let limit = self.softlimit.limit();
+        let prog = self.flush_prog.clone();
 
         self.pool.borrow_mut().spawn(async move {
             // Migrated to 2021 migration. This let statement is probably not needed, see
@@ -1160,6 +1184,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             db.into_owned(),
                             backup_ts, &concurrency_manager,
                             saver_tx.clone(),
+                            &prog
                         ).await;
                         res.map(|_| Statistics::default())
                     };
@@ -1307,11 +1332,17 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Runnable for Endpoint<E
                 info!("run backup task"; "task" => %task);
                 self.handle_backup_task(task);
             }
-            Operation::Prepare(_persistent, _tx) => {
-                unimplemented!();
+            Operation::Prepare(_persistent, mut tx) => {
+                self.pool.borrow().spawn(async move {
+                    let mut resp = PrepareResponse::new();
+                    resp.set_unique_id(Uuid::new_v4().to_string());
+                    let _ = tx.send(resp).await;
+                });
             }
-            Operation::Cleanup(_unique_id, _tx) => {
-                unimplemented!();
+            Operation::Cleanup(_unique_id, mut tx) => {
+                self.pool.borrow().spawn(async move {
+                    let _ = tx.send(CleanupResponse::new()).await;
+                });
             }
         }
     }
@@ -1602,6 +1633,7 @@ pub mod tests {
                 concurrency_manager,
                 api_version,
                 causal_ts_provider,
+                RegionReadProgressRegistry::new(),
             ),
         )
     }
@@ -2139,7 +2171,6 @@ pub mod tests {
             let mut req = BackupRequest::default();
             req.set_start_key(vec![]);
             req.set_end_key(vec![b'5']);
-            req.set_mode(BackupMode::File);
             req.set_start_version(0);
             req.set_end_version(ts.into_inner());
             let (tx, rx) = unbounded();
@@ -2164,8 +2195,6 @@ pub mod tests {
             let file_len = if *len <= SHORT_VALUE_MAX_LEN { 1 } else { 2 };
             let files = resp.get_files();
             info!("{:?}", files);
-            println!("{}", tmp1.display());
-            std::io::stdin().read_line(&mut String::new()).unwrap();
             assert_eq!(
                 files.len(),
                 file_len, // default and write

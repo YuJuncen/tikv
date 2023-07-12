@@ -1497,6 +1497,10 @@ impl LocalLeaderInfo {
     pub fn get_leader_store_id(&self) -> Option<u64> {
         self.leader_store_id
     }
+
+    pub fn get_epoch(&self) -> &RegionEpoch {
+        &self.epoch
+    }
 }
 
 fn find_store_id(peer_list: &[Peer], peer_id: u64) -> Option<u64> {
@@ -1652,6 +1656,14 @@ impl RegionReadProgressCore {
 
     pub fn get_local_leader_info(&self) -> &LocalLeaderInfo {
         &self.leader_info
+    }
+
+    pub fn last_merge_index(&self) -> u64 {
+        self.last_merge_index
+    }
+
+    pub fn applied_index(&self) -> u64 {
+        self.applied_index
     }
 }
 

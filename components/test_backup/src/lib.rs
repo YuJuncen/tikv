@@ -16,6 +16,7 @@ use external_storage_export::make_local_backend;
 use futures::{channel::mpsc as future_mpsc, executor::block_on};
 use grpcio::{ChannelBuilder, Environment};
 use kvproto::{brpb::*, kvrpcpb::*, tikvpb::TikvClient};
+use raftstore::{coprocessor::CoprocessorHost, router::CdcRaftRouter};
 use rand::Rng;
 use test_raftstore::*;
 use tidb_query_common::storage::{
@@ -23,7 +24,7 @@ use tidb_query_common::storage::{
     IntervalRange, Range,
 };
 use tikv::{
-    config::BackupConfig,
+    config::{BackupConfig, ResolvedTsConfig},
     coprocessor::{checksum_crc64_xor, dag::TikvStorage},
     storage::{
         kv::{Engine, LocalTablets, SnapContext},
@@ -46,6 +47,7 @@ pub struct TestSuite {
     pub ts: TimeStamp,
     pub bg_worker: Worker,
     pub api_version: ApiVersion,
+    pub resolvedts_handles: HashMap<u64, LazyWorker<resolved_ts::Task>>,
 
     _env: Arc<Environment>,
 }
@@ -74,13 +76,51 @@ impl TestSuite {
         let mut cluster = new_server_cluster_with_api_ver(1, count, api_version);
         // Increase the Raft tick interval to make this test case running reliably.
         configure_for_lease_read(&mut cluster.cfg, Some(100), None);
+
+        let mut resolvedts_handles = HashMap::default();
+        let bg_worker = Worker::new("backup-test");
+        for id in 1..=count as u64 {
+            let mut sim = cluster.sim.wl();
+            let worker = bg_worker.lazy_build(format!("resolved-ts-{}", id));
+
+            let rts_ob = resolved_ts::Observer::new(worker.scheduler());
+            sim.coprocessor_hooks.entry(id).or_default().push(Box::new(
+                move |host: &mut CoprocessorHost<_>| {
+                    // Migrated to 2021 migration. This let statement is probably not needed, see
+                    //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
+                    let _ = &rts_ob;
+                    rts_ob.register_to(host);
+                },
+            ));
+            resolvedts_handles.insert(id, worker);
+        }
         cluster.run();
 
         let mut endpoints = HashMap::default();
-        let bg_worker = Worker::new("backup-test");
         for (id, engines) in &cluster.engines {
+            let mut sim = cluster.sim.wl();
+            let worker = resolvedts_handles.get_mut(id).unwrap();
+            let raft_router = sim.get_server_router(*id);
+            let env = Arc::new(Environment::new(1));
+            let pd_cli = cluster.pd_client.clone();
+            let cfg = ResolvedTsConfig {
+                advance_ts_interval: tikv_util::config::ReadableDuration(Duration::from_millis(10)),
+                ..Default::default()
+            };
+
+            let rts_endpoint = resolved_ts::Endpoint::new(
+                &cfg,
+                worker.scheduler(),
+                CdcRaftRouter(raft_router),
+                cluster.store_metas[id].clone(),
+                pd_cli.clone(),
+                sim.get_concurrency_manager(*id),
+                env,
+                sim.security_mgr.clone(),
+            );
+            worker.start(rts_endpoint);
+
             // Create and run backup endpoints.
-            let sim = cluster.sim.rl();
             let backup_endpoint = backup::Endpoint::new(
                 *id,
                 sim.storages[id].clone(),
@@ -95,6 +135,11 @@ impl TestSuite {
                 sim.get_concurrency_manager(*id),
                 api_version,
                 None,
+                cluster.store_metas[id]
+                    .lock()
+                    .unwrap()
+                    .region_read_progress
+                    .clone(),
             );
             let mut worker = bg_worker.lazy_build(format!("backup-{}", id));
             worker.start(backup_endpoint);
@@ -136,6 +181,7 @@ impl TestSuite {
             _env: env,
             bg_worker,
             api_version,
+            resolvedts_handles,
         }
     }
 
@@ -145,6 +191,9 @@ impl TestSuite {
 
     pub fn stop(mut self) {
         for (_, mut worker) in self.endpoints {
+            worker.stop();
+        }
+        for (_, mut worker) in self.resolvedts_handles {
             worker.stop();
         }
         self.bg_worker.stop();
@@ -283,21 +332,12 @@ impl TestSuite {
         }
     }
 
-    pub fn backup(
+    pub fn backup_with(
         &self,
-        start_key: Vec<u8>,
-        end_key: Vec<u8>,
-        begin_ts: TimeStamp,
-        backup_ts: TimeStamp,
-        path: &Path,
+        f: impl FnOnce(&mut BackupRequest),
     ) -> future_mpsc::UnboundedReceiver<BackupResponse> {
         let mut req = BackupRequest::default();
-        req.set_start_key(start_key);
-        req.set_end_key(end_key);
-        req.start_version = begin_ts.into_inner();
-        req.end_version = backup_ts.into_inner();
-        req.set_storage_backend(make_local_backend(path));
-        req.set_is_raw_kv(false);
+        f(&mut req);
         let (tx, rx) = future_mpsc::unbounded();
         for end in self.endpoints.values() {
             let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
@@ -308,6 +348,24 @@ impl TestSuite {
         rx
     }
 
+    pub fn backup(
+        &self,
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+        begin_ts: TimeStamp,
+        backup_ts: TimeStamp,
+        path: &Path,
+    ) -> future_mpsc::UnboundedReceiver<BackupResponse> {
+        self.backup_with(|req| {
+            req.set_start_key(start_key);
+            req.set_end_key(end_key);
+            req.start_version = begin_ts.into_inner();
+            req.end_version = backup_ts.into_inner();
+            req.set_storage_backend(make_local_backend(path));
+            req.set_is_raw_kv(false);
+        })
+    }
+
     pub fn backup_raw(
         &self,
         start_key: Vec<u8>,
@@ -316,21 +374,14 @@ impl TestSuite {
         path: &Path,
         dst_api_ver: ApiVersion,
     ) -> future_mpsc::UnboundedReceiver<BackupResponse> {
-        let mut req = BackupRequest::default();
-        req.set_start_key(start_key);
-        req.set_end_key(end_key);
-        req.set_storage_backend(make_local_backend(path));
-        req.set_is_raw_kv(true);
-        req.set_cf(cf);
-        req.set_dst_api_version(dst_api_ver);
-        let (tx, rx) = future_mpsc::unbounded();
-        for end in self.endpoints.values() {
-            let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();
-            end.scheduler()
-                .schedule(Operation::BackupTask(task))
-                .unwrap();
-        }
-        rx
+        self.backup_with(|req| {
+            req.set_start_key(start_key);
+            req.set_end_key(end_key);
+            req.set_storage_backend(make_local_backend(path));
+            req.set_is_raw_kv(true);
+            req.set_cf(cf);
+            req.set_dst_api_version(dst_api_ver);
+        })
     }
 
     pub fn admin_checksum(

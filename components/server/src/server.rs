@@ -1106,7 +1106,12 @@ where
         {
             fatal!("failed to register backup service");
         }
-
+        let region_read_progress = engines
+            .store_meta
+            .lock()
+            .unwrap()
+            .region_read_progress
+            .clone();
         let backup_endpoint = backup::Endpoint::new(
             servers.node.id(),
             engines.engine.clone(),
@@ -1116,6 +1121,7 @@ where
             self.concurrency_manager.clone(),
             self.core.config.storage.api_version(),
             self.causal_ts_provider.clone(),
+            region_read_progress,
         );
         self.cfg_controller.as_mut().unwrap().register(
             tikv::config::Module::Backup,

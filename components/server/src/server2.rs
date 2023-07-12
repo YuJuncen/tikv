@@ -877,6 +877,7 @@ where
             self.concurrency_manager.clone(),
             self.core.config.storage.api_version(),
             self.causal_ts_provider.clone(),
+            todo!(),
         );
         self.cfg_controller.as_mut().unwrap().register(
             tikv::config::Module::Backup,
