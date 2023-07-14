@@ -487,7 +487,9 @@ impl BackupRange {
         let r = &self.region;
         progress.with(|prog| {
             if prog.check_resolved_ts(r.get_id(), backup_ts).is_err() {
+                let begin = Instant::now();
                 prog.advance_progress()?;
+                metrics::BACKUP_FILE_FLUSH_DURATION.observe(begin.saturating_elapsed_secs());
             }
             if let Err(reason) = prog.check_resolved_ts(r.get_id(), backup_ts) {
                 prog.hint_advance_resolved_ts(r.get_id());
@@ -499,6 +501,7 @@ impl BackupRange {
             }
             Result::Ok(())
         })?;
+        let begin = Instant::now();
         for cf in [CF_DEFAULT, CF_WRITE] {
             let version = db.lock_current_version(cf)?;
             let files = version.get_files_in_range(
@@ -509,6 +512,7 @@ impl BackupRange {
                 ssts.push(file);
             }
         }
+        metrics::BACKUP_FILE_FIND_FILE_DURATION.observe(begin.saturating_elapsed_secs());
         let in_mem_file = InMemBackupFiles {
             files: BackupFile::NativeSsts(ssts),
             start_key: r.get_start_key().to_owned(),
@@ -517,6 +521,8 @@ impl BackupRange {
             end_version: backup_ts,
             region: r.clone(),
         };
+        metrics::BACKUP_FILE_FILES_PER_REGION.observe(ssts.len() as f64);
+
         send_to_worker_with_metrics(&saver, in_mem_file).await?;
         Ok(())
     }
