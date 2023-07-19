@@ -483,7 +483,7 @@ impl SstImporter {
         let sst_iter = sst_reader.iter(IterOptions::default())?;
 
         let (range_start, range_end) = self
-            .do_pre_rewrite_ext(meta, rewrite_rule, ext.req_type.clone())
+            .do_pre_rewrite_ext(meta, rewrite_rule, ext.req_type)
             .await?;
 
         let start_rename_rewrite = Instant::now();
@@ -495,7 +495,7 @@ impl SstImporter {
             &range_start,
             &range_end,
             rewrite_rule,
-            ext.req_type.clone(),
+            ext.req_type,
         )? {
             return Ok(Some(range));
         }
@@ -511,7 +511,7 @@ impl SstImporter {
                 sst_iter,
                 name_to_cf(meta.get_cf_name()).unwrap(),
                 engine,
-                ext.req_type.clone(),
+                ext.req_type,
                 || {
                     let _ = file_system::remove_file(&path.temp);
                 },
@@ -593,7 +593,7 @@ impl SstImporter {
         let write_iter = MergeIterator::new(resolved_ts, sst_write_iters);
 
         let (range_start, range_end) = self
-            .do_pre_rewrite_ext(basic_meta, rewrite_rule, ext.req_type.clone())
+            .do_pre_rewrite_ext(basic_meta, rewrite_rule, ext.req_type)
             .await?;
 
         let mut res_sst = Vec::new();
@@ -609,10 +609,10 @@ impl SstImporter {
                     default_iter,
                     CF_DEFAULT,
                     engine.clone(),
-                    ext.req_type.clone(),
+                    ext.req_type,
                     move || {
                         for p in clean_default_path {
-                            let _ = file_system::remove_file(&p);
+                            let _ = file_system::remove_file(p);
                         }
                     },
                 )
@@ -635,10 +635,10 @@ impl SstImporter {
                     write_iter,
                     CF_WRITE,
                     engine,
-                    ext.req_type.clone(),
+                    ext.req_type,
                     move || {
                         for p in clean_write_path {
-                            let _ = file_system::remove_file(&p);
+                            let _ = file_system::remove_file(p);
                         }
                     },
                 )
@@ -1297,15 +1297,39 @@ impl SstImporter {
         speed_limiter: Limiter,
         engine: E,
     ) -> Result<Option<Range>> {
-        let mut metas = HashMap::new();
-        metas.insert(name.to_owned(), meta.to_owned());
-        self._download_rt.block_on(self.download_ext(
-            &metas,
+        self._download_rt.block_on(self.download_scan_ext(
+            meta, 
+            backend, 
+            name, 
+            rewrite_rule, 
+            crypter, 
+            speed_limiter, 
+            engine, 
+            DownloadExt::default(),
+        ))
+    }
+
+    #[cfg(test)]
+    fn download_file<E: KvEngine>(
+        &self,
+        meta: &SstMeta,
+        metas: &HashMap<String, SstMeta>,
+        backend: &StorageBackend,
+        name: &str,
+        rewrite_rule: &RewriteRule,
+        crypter: Option<CipherInfo>,
+        speed_limiter: Limiter,
+        engine: E,
+    ) -> Result<Vec<SstMeta>> {
+        self._download_rt.block_on(self.download_file_ext(
+            meta,
+            metas,
             backend,
             rewrite_rule,
             crypter,
             speed_limiter,
             engine,
+            u64::MAX,
             DownloadExt::default(),
         ))
     }
@@ -1384,7 +1408,7 @@ impl SstImporter {
             }
 
             let start_key = keys::origin_key(iter.key());
-            if is_before_start_bound(start_key, &range_start) {
+            if is_before_start_bound(start_key, range_start) {
                 // SST's start is before the range to consume, so needs to iterate to skip over
                 return Ok(None);
             }
@@ -1393,7 +1417,7 @@ impl SstImporter {
             // seek to end and fetch the last (inclusive) key of the SST.
             iter.seek_to_last()?;
             let last_key = keys::origin_key(iter.key());
-            if is_after_end_bound(last_key, &range_end) {
+            if is_after_end_bound(last_key, range_end) {
                 // SST's end is after the range to consume
                 return Ok(None);
             }
@@ -1745,6 +1769,7 @@ mod tests {
         usize,
     };
 
+    use engine_rocks::RocksExternalSstFileInfo;
     use engine_traits::{
         collect, EncryptionMethod, Error as TraitError, ExternalSstFileInfo, Iterable, Iterator,
         RefIterable, SstReader, SstWriter, CF_DEFAULT, DATA_CFS,
@@ -1753,7 +1778,8 @@ mod tests {
     use file_system::File;
     use online_config::{ConfigManager, OnlineConfig};
     use openssl::hash::{Hasher, MessageDigest};
-    use tempfile::Builder;
+    use rand::rngs::ThreadRng;
+    use tempfile::{Builder, TempDir};
     use test_sst_importer::*;
     use test_util::new_test_key_manager;
     use tikv_util::{codec::stream_event::EventEncoder, stream::block_on_external_io};
@@ -3235,6 +3261,165 @@ mod tests {
                 (b"zb".to_vec(), b"v2".to_vec()),
                 (b"zb\x00".to_vec(), b"v3".to_vec()),
                 (b"zc".to_vec(), b"v4".to_vec()),
+            ]
+        );
+    }
+
+    fn create_sample_external_sst_file_txn_default_and_write(
+        file_num: usize,
+        key_start: usize,
+        key_end: usize,
+        key_dup: usize,
+        mut ts_base: usize,
+    ) -> Result<(tempfile::TempDir, StorageBackend, Vec<SstMeta>)> {
+        let mut metas = Vec::new();
+        let ext_sst_dir = tempfile::tempdir()?;
+        let rng = rand::thread_rng();
+        for num in 1..file_num {
+            ts_base = ts_base + key_end + key_dup;
+            let (meta1, meta2) = create_sample_external_sst_file_txn_default_and_write_impl(
+                num,
+                key_start,
+                key_end,
+                key_dup,
+                ts_base,
+                &ext_sst_dir,
+                &rng,
+            )?;
+            metas.push(meta1);
+            metas.push(meta2);
+        }
+        let backend = external_storage_export::make_local_backend(ext_sst_dir.path());
+        Ok((ext_sst_dir, backend, metas))
+    }
+
+    // {key}: [key_start, key_end)
+    // {dup}: [0, key_dup)
+    // {start_ts}: ts_base + {key} + {dup}
+    // {commit_ts}: {start_ts} + 10
+    //
+    // the content of write cf file is :
+    //   key_{key}_{commit_ts} : {start_ts}
+    //
+    // the content of default cf file is :
+    //   key_{key}_{start_ts} : val_{commit_ts}
+    //
+    fn create_sample_external_sst_file_txn_default_and_write_impl(
+        num: usize,
+        key_start: usize,
+        key_end: usize,
+        key_dup: usize,
+        ts_base: usize,
+        ext_sst_dir: &TempDir,
+        rng: &ThreadRng,
+    ) -> Result<(SstMeta, SstMeta)> {
+        let mut sst_write_writer = new_sst_writer(
+            ext_sst_dir
+                .path()
+                .join(format!("sample_write_{num}.sst"))
+                .to_str()
+                .unwrap(),
+        );
+        let mut sst_default_writer = new_sst_writer(
+            ext_sst_dir
+            .path()
+            .join(format!("sample_default_{num}.sst"))
+                .to_str()
+                .unwrap(),
+        );
+
+        for key in key_start..key_end {
+            for dup in 0..key_dup {
+                let start_ts = (ts_base + key + dup) as u64;
+                let commit_ts = start_ts + 10;
+                let key = format!("key_{key}").as_bytes();
+                sst_write_writer.put(
+                    &get_encoded_key(key, commit_ts),
+                    &get_write_value(WriteType::Put, start_ts, None),
+                )?;
+                sst_default_writer.put(&get_encoded_key(key, 1), key)?;
+            }
+        }
+        let sst_meta_write = generate_sst_meta_from_sst_info(CF_WRITE, sst_write_writer.finish()?);
+        let sst_meta_default = generate_sst_meta_from_sst_info(CF_DEFAULT, sst_default_writer.finish()?);
+
+        Ok((sst_meta_write, sst_meta_default))
+    }
+
+    fn generate_sst_meta_from_sst_info(cf_name: CfName, sst_info: RocksExternalSstFileInfo) -> SstMeta {
+        // make up the SST meta for downloading.
+        let mut meta = SstMeta::default();
+        let uuid = Uuid::new_v4();
+        meta.set_uuid(uuid.as_bytes().to_vec());
+        meta.set_cf_name(cf_name);
+        meta.set_length(sst_info.file_size());
+        meta.set_region_id(4);
+        meta.mut_region_epoch().set_conf_ver(5);
+        meta.mut_region_epoch().set_version(6);
+        meta
+    }
+
+    #[test]
+    fn test_download_file_merged() {
+        // performs the download.
+        let importer_dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1).unwrap();
+
+        // creates a sample SST file.
+        let (_ext_sst_dir, backend, metas) = create_sample_external_sst_file_txn_default_and_write(
+            6, 10, 30, 3, 10
+        ).unwrap();
+        let db = create_sst_test_engine().unwrap();
+
+        let meta = &metas[0];
+        let _ = importer
+            .download_file::<TestEngine>(
+                &meta,
+                &metas,
+                &backend,
+                "sample_write.sst",
+                &new_rewrite_rule(b"", b"", 16),
+                None,
+                Limiter::new(f64::INFINITY),
+                db,
+            )
+            .unwrap()
+            .unwrap();
+
+        // verifies that the file is saved to the correct place.
+        // (the file size may be changed, so not going to check the file size)
+        let sst_file_path = importer.dir.join(&meta).unwrap().save;
+        assert!(sst_file_path.is_file());
+
+        // verifies the SST content is correct.
+        let sst_reader = new_sst_reader(sst_file_path.to_str().unwrap(), None);
+        sst_reader.verify_checksum().unwrap();
+        let mut iter = sst_reader.iter(IterOptions::default()).unwrap();
+        iter.seek_to_first().unwrap();
+        assert_eq!(
+            collect(iter),
+            vec![
+                (
+                    get_encoded_key(b"t123_r01", 16),
+                    get_write_value(WriteType::Put, 16, None)
+                ),
+                (
+                    get_encoded_key(b"t123_r02", 16),
+                    get_write_value(WriteType::Delete, 16, None)
+                ),
+                (
+                    get_encoded_key(b"t123_r04", 16),
+                    get_write_value(WriteType::Put, 16, None)
+                ),
+                (
+                    get_encoded_key(b"t123_r07", 16),
+                    get_write_value(WriteType::Put, 16, None)
+                ),
+                (
+                    get_encoded_key(b"t123_r13", 16),
+                    get_write_value(WriteType::Put, 16, Some(b"www".to_vec()))
+                ),
             ]
         );
     }
