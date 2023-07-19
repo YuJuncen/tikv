@@ -51,10 +51,11 @@ use txn_types::{Key, TimeStamp, WriteRef};
 
 use crate::{
     caching::cache_map::{CacheMap, ShareOwned},
-    import_file::{ImportDir, ImportFile},
+    import_file::{ImportDir, ImportFile, ImportPath},
     import_mode::{ImportModeSwitcher, RocksDbMetricsFn},
     import_mode2::{HashRange, ImportModeSwitcherV2},
     metrics::*,
+    sst_merge_iter::MergeIterator,
     sst_writer::{RawSstWriter, TxnSstWriter},
     util, Config, ConfigManager as ImportConfigManager, Error, Result,
 };
@@ -362,6 +363,70 @@ impl SstImporter {
         self.dir.exist(meta).unwrap_or(false)
     }
 
+    pub async fn download_ext_dispatcher<E: KvEngine>(
+        &self,
+        req: DownloadRequest,
+        crypter: Option<CipherInfo>,
+        speed_limiter: Limiter,
+        engine: E,
+        ext: DownloadExt<'_>,
+    ) -> DownloadResponse {
+        let mut resp = DownloadResponse::default();
+        let res = if req.get_ssts().is_empty() {
+            self.download_scan_ext(
+                req.get_sst(),
+                req.get_storage_backend(),
+                req.get_name(),
+                req.get_rewrite_rule(),
+                crypter,
+                speed_limiter,
+                engine,
+                ext,
+            )
+            .await
+        } else {
+            self.download_file_ext(
+                req.get_sst(),
+                req.get_ssts(),
+                req.get_storage_backend(),
+                req.get_rewrite_rule(),
+                crypter,
+                speed_limiter,
+                engine,
+                req.get_resolved_ts(),
+                ext,
+            )
+            .await
+        };
+
+        // match r {
+        // Ok(r) => {
+        // info!("download"; "meta" => ?meta, "name" => name, "range" => ?r);
+        // Ok(r)
+        // }
+        // Err(e) => {
+        // error!(%e; "download failed"; "meta" => ?meta, "name" => name,);
+        // Err(e)
+        // }
+        // }
+        match res {
+            Ok(range) => match range {
+                Some(r) => resp.set_range(r),
+                None => resp.set_is_empty(true),
+            },
+            Err(e) => resp.set_error(e.into()),
+        }
+        resp
+    }
+
+    fn generate_sst_reader_with_verify(&self, dst_file_name: &str) -> Result<RocksSstReader> {
+        let env = get_env(self.key_manager.clone(), get_io_rate_limiter())?;
+        // Use abstracted SstReader after Env is abstracted.
+        let sst_reader = RocksSstReader::open_with_env(dst_file_name, Some(env))?;
+        sst_reader.verify_checksum()?;
+        Ok(sst_reader)
+    }
+
     // Downloads an SST file from an external storage.
     //
     // This method is blocking. It performs the following transformations before
@@ -378,7 +443,7 @@ impl SstImporter {
     //
     // This method returns the *inclusive* key range (`[start, end]`) of SST
     // file created, or returns None if the SST is empty.
-    pub async fn download_ext<E: KvEngine>(
+    async fn download_scan_ext<E: KvEngine>(
         &self,
         meta: &SstMeta,
         backend: &StorageBackend,
@@ -389,33 +454,163 @@ impl SstImporter {
         engine: E,
         ext: DownloadExt<'_>,
     ) -> Result<Option<Range>> {
-        debug!("download start";
+        debug!("scan download start";
             "meta" => ?meta,
             "url" => ?backend,
             "name" => name,
+            "speed_limit" => speed_limiter.speed_limit(),
+        );
+
+        let path = self.dir.join(meta)?;
+
+        let dst_file_name = self
+            .do_download_ext(&path, meta, backend, name, crypter, &speed_limiter, ext.cache_key.unwrap_or(""))
+            .await?;
+
+        // now validate the SST file.
+        let sst_reader = self.generate_sst_reader_with_verify(&dst_file_name)?;
+        let sst_iter = sst_reader.iter(IterOptions::default())?;
+
+        let (range_start, range_end) = self
+            .do_pre_rewrite_ext(meta, rewrite_rule, ext.req_type.clone())
+            .await?;
+
+        let start_rename_rewrite = Instant::now();
+        if let Some(range) = self.try_skip_rewriting(
+            &path,
+            &start_rename_rewrite,
+            meta,
+            sst_iter,
+            &range_start,
+            &range_end,
+            rewrite_rule,
+            ext.req_type.clone(),
+        )? {
+            return Ok(Some(range));
+        }
+
+        let sst_iter = sst_reader.iter(IterOptions::default())?;
+        let res = self.do_rewrite_ext(
+            path.save.to_str().unwrap(),
+            &start_rename_rewrite,
+            rewrite_rule,
+            &range_start,
+            &range_end,
+            sst_iter,
+            name_to_cf(meta.get_cf_name()).unwrap(),
+            engine,
+            ext.req_type.clone(),
+            || {let _ = file_system::remove_file(&path.temp);}
+        )?;
+        Ok(res)
+    }
+
+    pub async fn download_file_ext<E: KvEngine>(
+        &self,
+        basic_meta: &SstMeta,
+        metas: &HashMap<String, SstMeta>,
+        backend: &StorageBackend,
+        rewrite_rule: &RewriteRule,
+        crypter: Option<CipherInfo>,
+        speed_limiter: Limiter,
+        engine: E,
+        resolved_ts: u64,
+        ext: DownloadExt<'_>,
+    ) -> Result<Option<Range>> {
+        debug!("file download start";
+            "metas" => ?metas,
+            "url" => ?backend,
             "rewrite_rule" => ?rewrite_rule,
             "speed_limit" => speed_limiter.speed_limit(),
         );
-        let r = self.do_download_ext::<E>(
-            meta,
-            backend,
-            name,
-            rewrite_rule,
-            crypter,
-            &speed_limiter,
-            engine,
-            ext,
-        );
-        match r.await {
-            Ok(r) => {
-                info!("download"; "meta" => ?meta, "name" => name, "range" => ?r);
-                Ok(r)
-            }
-            Err(e) => {
-                error!(%e; "download failed"; "meta" => ?meta, "name" => name,);
-                Err(e)
+        let mut sst_default_readers = Vec::new();
+        let mut sst_write_readers = Vec::new();
+        let mut dst_default_path = None;
+        let mut dst_write_path = None;
+        let mut clean_default_path = Vec::new();
+        let mut clean_write_path = Vec::new();
+        for (name, meta) in metas {
+            let path = self.dir.join(meta)?;
+
+            let dst_file_name = self
+                .do_download_ext(&path, meta, backend, name, crypter.clone(), &speed_limiter, ext.cache_key.unwrap_or(""))
+                .await?;
+
+            // now validate the SST file.
+            let sst_reader = self.generate_sst_reader_with_verify(&dst_file_name)?;
+            if meta.get_cf_name() == CF_WRITE {
+                if dst_write_path.is_none() {
+                    dst_write_path = Some(path.save.to_str().unwrap().to_string());
+                }
+                clean_write_path.push(path.temp);
+                sst_write_readers.push(sst_reader);
+            } else if meta.get_cf_name() == CF_DEFAULT {
+                if dst_default_path.is_none() {
+                    dst_default_path = Some(path.save.to_str().unwrap().to_string());
+                }
+                clean_default_path.push(path.temp);
+                sst_default_readers.push(sst_reader);
+            } else {
+                warn!("invalid cf name for SstMeta"; "meta" => ?meta);
+                let _ = file_system::remove_file(&path.temp);
             }
         }
+
+        // generate the sst files merged iterator for default cf and write cf
+        let mut sst_default_iters = Vec::with_capacity(sst_default_readers.len());
+        for sst_reader in &sst_default_readers {
+            sst_default_iters.push(sst_reader.iter(IterOptions::default())?);
+        }
+        let mut sst_write_iters = Vec::with_capacity(sst_default_iters.len());
+        for sst_reader in &sst_write_readers {
+            sst_write_iters.push(sst_reader.iter(IterOptions::default())?);
+        }
+        let default_iter = MergeIterator::new(resolved_ts, sst_default_iters);
+        let write_iter = MergeIterator::new(resolved_ts, sst_write_iters);
+
+        let (range_start, range_end) = self
+            .do_pre_rewrite_ext(basic_meta, rewrite_rule, ext.req_type.clone())
+            .await?;
+
+        let start_rename_rewrite = Instant::now();
+        if let Some(file_name) = &dst_default_path {
+            self.do_rewrite_ext(
+                file_name,
+                &start_rename_rewrite,
+                rewrite_rule,
+                &range_start,
+                &range_end,
+                default_iter,
+                CF_DEFAULT,
+                engine.clone(),
+                ext.req_type.clone(),
+                move || {
+                    for p in clean_default_path {
+                        let _ = file_system::remove_file(&p);
+                    }
+                }
+            )?;
+        }
+        if let Some(file_name) = &dst_write_path {
+            self.do_rewrite_ext(
+                file_name,
+                &start_rename_rewrite,
+                rewrite_rule,
+                &range_start,
+                &range_end,
+                write_iter,
+                CF_WRITE,
+                engine,
+                ext.req_type.clone(),
+                move || {
+                    for p in clean_write_path {
+                        let _ = file_system::remove_file(&p);
+                    }
+                }
+            )?;
+        }
+
+        Ok(None)
     }
 
     pub fn enter_normal_mode<E: KvEngine>(&self, db: E, mf: RocksDbMetricsFn) -> Result<bool> {
@@ -1061,10 +1256,11 @@ impl SstImporter {
         speed_limiter: Limiter,
         engine: E,
     ) -> Result<Option<Range>> {
+        let mut metas = HashMap::new();
+        metas.insert(name.to_owned(), meta.to_owned());
         self._download_rt.block_on(self.download_ext(
-            meta,
+            &metas,
             backend,
-            name,
             rewrite_rule,
             crypter,
             speed_limiter,
@@ -1073,19 +1269,16 @@ impl SstImporter {
         ))
     }
 
-    async fn do_download_ext<E: KvEngine>(
+    async fn do_download_ext(
         &self,
+        path: &ImportPath,
         meta: &SstMeta,
         backend: &StorageBackend,
         name: &str,
-        rewrite_rule: &RewriteRule,
         crypter: Option<CipherInfo>,
         speed_limiter: &Limiter,
-        engine: E,
-        ext: DownloadExt<'_>,
-    ) -> Result<Option<Range>> {
-        let path = self.dir.join(meta)?;
-
+        cache_key: &str,
+    ) -> Result<String> {
         let file_crypter = crypter.map(|c| FileEncryptionInfo {
             method: to_engine_encryption_method(c.cipher_type),
             key: c.cipher_key,
@@ -1104,65 +1297,34 @@ impl SstImporter {
             backend,
             true,
             speed_limiter,
-            ext.cache_key.unwrap_or(""),
+            cache_key,
             restore_config,
         )
         .await?;
 
-        // now validate the SST file.
-        let env = get_env(self.key_manager.clone(), get_io_rate_limiter())?;
-        // Use abstracted SstReader after Env is abstracted.
         let dst_file_name = path.temp.to_str().unwrap();
-        let sst_reader = RocksSstReader::open_with_env(dst_file_name, Some(env))?;
-        sst_reader.verify_checksum()?;
-
-        // undo key rewrite so we could compare with the keys inside SST
-        let old_prefix = rewrite_rule.get_old_key_prefix();
-        let new_prefix = rewrite_rule.get_new_key_prefix();
-        let req_type = ext.req_type;
 
         debug!("downloaded file and verified";
             "meta" => ?meta,
             "name" => name,
             "path" => dst_file_name,
-            "old_prefix" => log_wrappers::Value::key(old_prefix),
-            "new_prefix" => log_wrappers::Value::key(new_prefix),
-            "req_type" => ?req_type,
         );
+        Ok(dst_file_name.to_string())
+    }
 
-        let range_start = meta.get_range().get_start();
-        let range_end = meta.get_range().get_end();
-        let range_start_bound = key_to_bound(range_start);
-        let range_end_bound = if meta.get_end_key_exclusive() {
-            key_to_exclusive_bound(range_end)
-        } else {
-            key_to_bound(range_end)
-        };
-
-        let mut range_start =
-            keys::rewrite::rewrite_prefix_of_start_bound(new_prefix, old_prefix, range_start_bound)
-                .map_err(|_| Error::WrongKeyPrefix {
-                    what: "SST start range",
-                    key: range_start.to_vec(),
-                    prefix: new_prefix.to_vec(),
-                })?;
-        let mut range_end =
-            keys::rewrite::rewrite_prefix_of_end_bound(new_prefix, old_prefix, range_end_bound)
-                .map_err(|_| Error::WrongKeyPrefix {
-                    what: "SST end range",
-                    key: range_end.to_vec(),
-                    prefix: new_prefix.to_vec(),
-                })?;
-
-        if req_type == DownloadRequestType::Keyspace {
-            range_start = keys::rewrite::encode_bound(range_start);
-            range_end = keys::rewrite::encode_bound(range_end);
-        }
-
-        let start_rename_rewrite = Instant::now();
+    fn try_skip_rewriting<Iter: Iterator>(
+        &self,
+        path: &ImportPath,
+        start_rename_rewrite: &Instant,
+        meta: &SstMeta,
+        mut iter: Iter,
+        range_start: &Bound<Vec<u8>>,
+        range_end: &Bound<Vec<u8>>,
+        rewrite_rule: &RewriteRule,
+        req_type: DownloadRequestType,
+    ) -> Result<Option<Range>> {
         // read the first and last keys from the SST, determine if we could
         // simply move the entire SST instead of iterating and generate a new one.
-        let mut iter = sst_reader.iter(IterOptions::default())?;
         let direct_retval = (|| -> Result<Option<_>> {
             if rewrite_rule.old_key_prefix != rewrite_rule.new_key_prefix
                 || rewrite_rule.new_timestamp != 0
@@ -1228,7 +1390,75 @@ impl SstImporter {
                 .observe(start_rename_rewrite.saturating_elapsed().as_secs_f64());
             return Ok(Some(range));
         }
+        Ok(None)
+    }
 
+    async fn do_pre_rewrite_ext(
+        &self,
+        meta: &SstMeta,
+        rewrite_rule: &RewriteRule,
+        req_type: DownloadRequestType,
+    ) -> Result<(Bound<Vec<u8>>, Bound<Vec<u8>>)> {
+        // undo key rewrite so we could compare with the keys inside SST
+        let old_prefix = rewrite_rule.get_old_key_prefix();
+        let new_prefix = rewrite_rule.get_new_key_prefix();
+        let req_type = req_type;
+
+        debug!("rewrite file";
+            "old_prefix" => log_wrappers::Value::key(old_prefix),
+            "new_prefix" => log_wrappers::Value::key(new_prefix),
+            "req_type" => ?req_type,
+        );
+
+        let range_start = meta.get_range().get_start();
+        let range_end = meta.get_range().get_end();
+        let range_start_bound = key_to_bound(range_start);
+        let range_end_bound = if meta.get_end_key_exclusive() {
+            key_to_exclusive_bound(range_end)
+        } else {
+            key_to_bound(range_end)
+        };
+
+        let mut range_start =
+            keys::rewrite::rewrite_prefix_of_start_bound(new_prefix, old_prefix, range_start_bound)
+                .map_err(|_| Error::WrongKeyPrefix {
+                    what: "SST start range",
+                    key: range_start.to_vec(),
+                    prefix: new_prefix.to_vec(),
+                })?;
+        let mut range_end =
+            keys::rewrite::rewrite_prefix_of_end_bound(new_prefix, old_prefix, range_end_bound)
+                .map_err(|_| Error::WrongKeyPrefix {
+                    what: "SST end range",
+                    key: range_end.to_vec(),
+                    prefix: new_prefix.to_vec(),
+                })?;
+
+        if req_type == DownloadRequestType::Keyspace {
+            range_start = keys::rewrite::encode_bound(range_start);
+            range_end = keys::rewrite::encode_bound(range_end);
+        }
+        Ok((range_start, range_end))
+    }
+
+    fn do_rewrite_ext<E: KvEngine, Iter: Iterator, F>(
+        &self,
+        dst_file_name: &str,
+        start_rename_rewrite: &Instant,
+        rewrite_rule: &RewriteRule,
+        range_start: &Bound<Vec<u8>>,
+        range_end: &Bound<Vec<u8>>,
+        mut iter: Iter,
+        cf_name: CfName,
+        engine: E,
+        req_type: DownloadRequestType,
+        clean_files: F,
+    )
+
+     -> Result<Option<Range>> 
+     where F: FnOnce(){
+        let old_prefix = rewrite_rule.get_old_key_prefix();
+        let new_prefix = rewrite_rule.get_new_key_prefix();
         // perform iteration and key rewrite.
         let mut data_key = keys::DATA_PREFIX_KEY.to_vec();
         let data_key_prefix_len = keys::DATA_PREFIX_KEY.len();
@@ -1244,12 +1474,11 @@ impl SstImporter {
         // SST writer must not be opened in gRPC threads, because it may be
         // blocked for a long time due to IO, especially, when encryption at rest
         // is enabled, and it leads to gRPC keepalive timeout.
-        let cf_name = name_to_cf(meta.get_cf_name()).unwrap();
         let mut sst_writer = <E as SstExt>::SstWriterBuilder::new()
             .set_db(&engine)
             .set_cf(cf_name)
             .set_compression_type(self.compression_types.get(cf_name).copied())
-            .build(path.save.to_str().unwrap())
+            .build(dst_file_name)
             .unwrap();
 
         let mut yield_check =
@@ -1304,7 +1533,7 @@ impl SstImporter {
                     })?
                     .append_ts(TimeStamp::new(rewrite_rule.new_timestamp))
                     .into_encoded();
-                if meta.get_cf_name() == CF_WRITE {
+                if cf_name == CF_WRITE {
                     let mut write = WriteRef::parse(iter.value()).map_err(|e| {
                         Error::BadFormat(format!(
                             "write {}: {}",
@@ -1329,7 +1558,7 @@ impl SstImporter {
             }
         }
 
-        let _ = file_system::remove_file(&path.temp);
+        clean_files();
 
         IMPORTER_DOWNLOAD_DURATION
             .with_label_values(&["rewrite"])

@@ -949,7 +949,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
             };
 
             let res = with_resource_limiter(
-                importer.download_ext::<E::Local>(
+                importer.dispatch_download_ext::<E::Local>(
                     req.get_sst(),
                     req.get_storage_backend(),
                     req.get_name(),
@@ -963,14 +963,6 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                 ),
                 resource_limiter,
             );
-            let mut resp = DownloadResponse::default();
-            match res.await {
-                Ok(range) => match range {
-                    Some(r) => resp.set_range(r),
-                    None => resp.set_is_empty(true),
-                },
-                Err(e) => resp.set_error(e.into()),
-            }
             crate::send_rpc_response!(Ok(resp), sink, label, timer);
         };
 
