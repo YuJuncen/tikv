@@ -19,9 +19,9 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use encryption::{to_engine_encryption_method, DataKeyManager};
 use engine_rocks::{get_env, RocksSstReader};
 use engine_traits::{
-    name_to_cf, util::check_key_in_range, CfName, EncryptionKeyManager, FileEncryptionInfo,
-    IterOptions, Iterator, KvEngine, RefIterable, SstCompressionType, SstExt, SstMetaInfo,
-    SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT, CF_WRITE,
+    name_to_cf, util::check_key_in_range, CfName, EncryptionKeyManager, ExternalSstFileInfo,
+    FileEncryptionInfo, IterOptions, Iterator, KvEngine, RefIterable, SstCompressionType, SstExt,
+    SstMetaInfo, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT, CF_WRITE,
 };
 use external_storage_export::{
     compression_reader_dispatcher, encrypt_wrap_reader, ExternalStorage, RestoreConfig,
@@ -363,58 +363,61 @@ impl SstImporter {
         self.dir.exist(meta).unwrap_or(false)
     }
 
-    pub async fn download_ext_dispatcher<E: KvEngine>(
+    pub async fn download_dispatcher<E: KvEngine>(
         &self,
         req: DownloadRequest,
         crypter: Option<CipherInfo>,
         speed_limiter: Limiter,
         engine: E,
-        ext: DownloadExt<'_>,
     ) -> DownloadResponse {
+        let ext = DownloadExt::default()
+            .cache_key(req.get_storage_cache_id())
+            .req_type(req.get_request_type());
         let mut resp = DownloadResponse::default();
-        let res = if req.get_ssts().is_empty() {
-            self.download_scan_ext(
-                req.get_sst(),
-                req.get_storage_backend(),
-                req.get_name(),
-                req.get_rewrite_rule(),
-                crypter,
-                speed_limiter,
-                engine,
-                ext,
-            )
-            .await
+        if req.get_ssts().is_empty() {
+            let res = self
+                .download_scan_ext(
+                    req.get_sst(),
+                    req.get_storage_backend(),
+                    req.get_name(),
+                    req.get_rewrite_rule(),
+                    crypter,
+                    speed_limiter,
+                    engine,
+                    ext,
+                )
+                .await;
+            match res {
+                Ok(range) => match range {
+                    Some(r) => resp.set_range(r),
+                    None => resp.set_is_empty(true),
+                },
+                Err(e) => resp.set_error(e.into()),
+            }
         } else {
-            self.download_file_ext(
-                req.get_sst(),
-                req.get_ssts(),
-                req.get_storage_backend(),
-                req.get_rewrite_rule(),
-                crypter,
-                speed_limiter,
-                engine,
-                req.get_resolved_ts(),
-                ext,
-            )
-            .await
-        };
-
-        // match r {
-        // Ok(r) => {
-        // info!("download"; "meta" => ?meta, "name" => name, "range" => ?r);
-        // Ok(r)
-        // }
-        // Err(e) => {
-        // error!(%e; "download failed"; "meta" => ?meta, "name" => name,);
-        // Err(e)
-        // }
-        // }
-        match res {
-            Ok(range) => match range {
-                Some(r) => resp.set_range(r),
-                None => resp.set_is_empty(true),
-            },
-            Err(e) => resp.set_error(e.into()),
+            let res = self
+                .download_file_ext(
+                    req.get_sst(),
+                    req.get_ssts(),
+                    req.get_storage_backend(),
+                    req.get_rewrite_rule(),
+                    crypter,
+                    speed_limiter,
+                    engine,
+                    req.get_resolved_ts(),
+                    ext,
+                )
+                .await;
+            match res {
+                Ok(metas) => {
+                    if metas.is_empty() {
+                        resp.set_is_empty(true);
+                    } else {
+                        resp.set_ssts(metas.into());
+                    }
+                }
+                Err(e) => resp.set_error(e.into()),
+            }
         }
         resp
     }
@@ -464,7 +467,15 @@ impl SstImporter {
         let path = self.dir.join(meta)?;
 
         let dst_file_name = self
-            .do_download_ext(&path, meta, backend, name, crypter, &speed_limiter, ext.cache_key.unwrap_or(""))
+            .do_download_ext(
+                &path,
+                meta,
+                backend,
+                name,
+                crypter,
+                &speed_limiter,
+                ext.cache_key.unwrap_or(""),
+            )
             .await?;
 
         // now validate the SST file.
@@ -490,18 +501,22 @@ impl SstImporter {
         }
 
         let sst_iter = sst_reader.iter(IterOptions::default())?;
-        let res = self.do_rewrite_ext(
-            path.save.to_str().unwrap(),
-            &start_rename_rewrite,
-            rewrite_rule,
-            &range_start,
-            &range_end,
-            sst_iter,
-            name_to_cf(meta.get_cf_name()).unwrap(),
-            engine,
-            ext.req_type.clone(),
-            || {let _ = file_system::remove_file(&path.temp);}
-        )?;
+        let res = self
+            .do_rewrite_ext(
+                path.save.to_str().unwrap(),
+                &start_rename_rewrite,
+                rewrite_rule,
+                &range_start,
+                &range_end,
+                sst_iter,
+                name_to_cf(meta.get_cf_name()).unwrap(),
+                engine,
+                ext.req_type.clone(),
+                || {
+                    let _ = file_system::remove_file(&path.temp);
+                },
+            )?
+            .map(|(range, _)| range);
         Ok(res)
     }
 
@@ -516,7 +531,7 @@ impl SstImporter {
         engine: E,
         resolved_ts: u64,
         ext: DownloadExt<'_>,
-    ) -> Result<Option<Range>> {
+    ) -> Result<Vec<SstMeta>> {
         debug!("file download start";
             "metas" => ?metas,
             "url" => ?backend,
@@ -525,28 +540,36 @@ impl SstImporter {
         );
         let mut sst_default_readers = Vec::new();
         let mut sst_write_readers = Vec::new();
-        let mut dst_default_path = None;
-        let mut dst_write_path = None;
+        let mut dst_default = None;
+        let mut dst_write = None;
         let mut clean_default_path = Vec::new();
         let mut clean_write_path = Vec::new();
         for (name, meta) in metas {
             let path = self.dir.join(meta)?;
 
             let dst_file_name = self
-                .do_download_ext(&path, meta, backend, name, crypter.clone(), &speed_limiter, ext.cache_key.unwrap_or(""))
+                .do_download_ext(
+                    &path,
+                    meta,
+                    backend,
+                    name,
+                    crypter.clone(),
+                    &speed_limiter,
+                    ext.cache_key.unwrap_or(""),
+                )
                 .await?;
 
             // now validate the SST file.
             let sst_reader = self.generate_sst_reader_with_verify(&dst_file_name)?;
             if meta.get_cf_name() == CF_WRITE {
-                if dst_write_path.is_none() {
-                    dst_write_path = Some(path.save.to_str().unwrap().to_string());
+                if dst_write.is_none() {
+                    dst_write = Some((path.save.to_str().unwrap().to_string(), meta.clone()));
                 }
                 clean_write_path.push(path.temp);
                 sst_write_readers.push(sst_reader);
             } else if meta.get_cf_name() == CF_DEFAULT {
-                if dst_default_path.is_none() {
-                    dst_default_path = Some(path.save.to_str().unwrap().to_string());
+                if dst_default.is_none() {
+                    dst_default = Some((path.save.to_str().unwrap().to_string(), meta.clone()));
                 }
                 clean_default_path.push(path.temp);
                 sst_default_readers.push(sst_reader);
@@ -572,45 +595,60 @@ impl SstImporter {
             .do_pre_rewrite_ext(basic_meta, rewrite_rule, ext.req_type.clone())
             .await?;
 
+        let mut res_sst = Vec::new();
         let start_rename_rewrite = Instant::now();
-        if let Some(file_name) = &dst_default_path {
-            self.do_rewrite_ext(
-                file_name,
-                &start_rename_rewrite,
-                rewrite_rule,
-                &range_start,
-                &range_end,
-                default_iter,
-                CF_DEFAULT,
-                engine.clone(),
-                ext.req_type.clone(),
-                move || {
-                    for p in clean_default_path {
-                        let _ = file_system::remove_file(&p);
-                    }
-                }
-            )?;
+        if let Some((file_name, mut sst)) = dst_default {
+            let info = self
+                .do_rewrite_ext(
+                    &file_name,
+                    &start_rename_rewrite,
+                    rewrite_rule,
+                    &range_start,
+                    &range_end,
+                    default_iter,
+                    CF_DEFAULT,
+                    engine.clone(),
+                    ext.req_type.clone(),
+                    move || {
+                        for p in clean_default_path {
+                            let _ = file_system::remove_file(&p);
+                        }
+                    },
+                )?
+                .map(|(_, info)| info);
+            if let Some(info) = info {
+                sst.set_total_bytes(info.file_size());
+                sst.set_total_kvs(info.num_entries());
+                res_sst.push(sst);
+            }
         }
-        if let Some(file_name) = &dst_write_path {
-            self.do_rewrite_ext(
-                file_name,
-                &start_rename_rewrite,
-                rewrite_rule,
-                &range_start,
-                &range_end,
-                write_iter,
-                CF_WRITE,
-                engine,
-                ext.req_type.clone(),
-                move || {
-                    for p in clean_write_path {
-                        let _ = file_system::remove_file(&p);
-                    }
-                }
-            )?;
+        if let Some((file_name, mut sst)) = dst_write {
+            let info = self
+                .do_rewrite_ext(
+                    &file_name,
+                    &start_rename_rewrite,
+                    rewrite_rule,
+                    &range_start,
+                    &range_end,
+                    write_iter,
+                    CF_WRITE,
+                    engine,
+                    ext.req_type.clone(),
+                    move || {
+                        for p in clean_write_path {
+                            let _ = file_system::remove_file(&p);
+                        }
+                    },
+                )?
+                .map(|(_, info)| info);
+            if let Some(info) = info {
+                sst.set_total_bytes(info.file_size());
+                sst.set_total_kvs(info.num_entries());
+                res_sst.push(sst);
+            }
         }
 
-        Ok(None)
+        Ok(res_sst)
     }
 
     pub fn enter_normal_mode<E: KvEngine>(&self, db: E, mf: RocksDbMetricsFn) -> Result<bool> {
@@ -1453,10 +1491,15 @@ impl SstImporter {
         engine: E,
         req_type: DownloadRequestType,
         clean_files: F,
-    )
-
-     -> Result<Option<Range>> 
-     where F: FnOnce(){
+    ) -> Result<
+        Option<(
+            Range,
+            <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileInfo,
+        )>,
+    >
+    where
+        F: FnOnce(),
+    {
         let old_prefix = rewrite_rule.get_old_key_prefix();
         let new_prefix = rewrite_rule.get_new_key_prefix();
         // perform iteration and key rewrite.
@@ -1566,7 +1609,7 @@ impl SstImporter {
 
         if let Some(start_key) = first_key {
             let start_finish = Instant::now();
-            sst_writer.finish()?;
+            let info = sst_writer.finish()?;
             IMPORTER_DOWNLOAD_DURATION
                 .with_label_values(&["finish"])
                 .observe(start_finish.saturating_elapsed().as_secs_f64());
@@ -1574,7 +1617,7 @@ impl SstImporter {
             let mut final_range = Range::default();
             final_range.set_start(start_key);
             final_range.set_end(keys::origin_key(&data_key).to_vec());
-            Ok(Some(final_range))
+            Ok(Some((final_range, info)))
         } else {
             // nothing is written: prevents finishing the SST at all.
             Ok(None)

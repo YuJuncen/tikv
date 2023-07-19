@@ -27,8 +27,7 @@ use kvproto::{
 use raftstore_v2::StoreMeta;
 use resource_control::{with_resource_limiter, ResourceGroupManager};
 use sst_importer::{
-    error_inc, metrics::*, sst_importer::DownloadExt, sst_meta_to_path, Config, ConfigManager,
-    Error, Result, SstImporter,
+    error_inc, metrics::*, sst_meta_to_path, Config, ConfigManager, Error, Result, SstImporter,
 };
 use tikv_kv::{
     Engine, LocalTablets, Modify, SnapContext, Snapshot, SnapshotExt, WriteData, WriteEvent,
@@ -948,21 +947,11 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
                 }
             };
 
-            let res = with_resource_limiter(
-                importer.dispatch_download_ext::<E::Local>(
-                    req.get_sst(),
-                    req.get_storage_backend(),
-                    req.get_name(),
-                    req.get_rewrite_rule(),
-                    cipher,
-                    limiter,
-                    tablet.into_owned(),
-                    DownloadExt::default()
-                        .cache_key(req.get_storage_cache_id())
-                        .req_type(req.get_request_type()),
-                ),
-                resource_limiter,
-            );
+            let resp = with_resource_limiter(
+                importer.download_dispatcher::<E::Local>(req, cipher, limiter, tablet.into_owned()),
+                limiter,
+            )
+            .await;
             crate::send_rpc_response!(Ok(resp), sink, label, timer);
         };
 
