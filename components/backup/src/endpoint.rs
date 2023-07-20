@@ -1324,14 +1324,14 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Runnable for Endpoint<E
                 self.handle_backup_task(task);
             }
             Operation::Prepare(_persistent, mut tx) => {
-                self.pool.borrow().spawn(async move {
+                self.io_pool.borrow().spawn(async move {
                     let mut resp = PrepareResponse::new();
                     resp.set_unique_id(Uuid::new_v4().to_string());
                     let _ = tx.send(resp).await;
                 });
             }
             Operation::Cleanup(_unique_id, mut tx) => {
-                self.pool.borrow().spawn(async move {
+                self.io_pool.borrow().spawn(async move {
                     let _ = tx.send(CleanupResponse::new()).await;
                 });
             }
