@@ -321,6 +321,15 @@ async fn save_backup_file_worker<EK: KvEngine>(
     let file_prefix = format!("{store_id}");
 
     while let Ok(msg) = rx.recv().await {
+        let send_and_log_error = |resp| {
+            let res = tx.unbounded_send(resp);
+            if let Err(e) = &res {
+                error_unknown!(?e; "backup failed to send response"; "region" => ?msg.region,
+                    "start_key" => &log_wrappers::Value::key(&msg.start_key),
+                    "end_key" => &log_wrappers::Value::key(&msg.end_key),);
+            }
+            res
+        };
         let response_by_err = |e: Error| -> BackupResponse {
             let mut response = BackupResponse::default();
             error_unknown!(?e; "backup region failed";
@@ -365,7 +374,9 @@ async fn save_backup_file_worker<EK: KvEngine>(
             Result::Ok(files)
         };
 
-        let files = match with_resource_limiter(msg.files.save(&storage, &file_prefix), msg.limiter).await {
+        let files = match with_resource_limiter(msg.files.save(&storage, &file_prefix), msg.limiter)
+            .await
+        {
             Ok(split_files) => convert_key_range(split_files),
             Err(e) => {
                 error_unknown!(?e; "backup save file failed");
@@ -477,7 +488,7 @@ impl BackupRange {
     ) -> Result<()> {
         // Firstly, create a snapshot to making sure out leadership (at least
         // consistency).
-        let _snap = self.take_snapshot(&mut engine, backup_ts, &cm)?;
+        let _snap = self.take_snapshot(&mut engine, backup_ts, cm)?;
         let mut ssts = vec![];
         let r = &self.region;
         progress.with(|prog| {
@@ -500,24 +511,42 @@ impl BackupRange {
         for cf in [CF_DEFAULT, CF_WRITE] {
             let version = db.lock_current_version(cf)?;
             let files = version.get_files_in_range(
-                &keys::data_key(&self.start_key),
-                &keys::data_end_key(&self.end_key),
+                &keys::data_key(
+                    self.start_key
+                        .as_ref()
+                        .map(|k| k.as_encoded().as_slice())
+                        .unwrap_or_default(),
+                ),
+                &keys::data_end_key(
+                    self.end_key
+                        .as_ref()
+                        .map(|k| k.as_encoded().as_slice())
+                        .unwrap_or_default(),
+                ),
             )?;
             for file in files {
                 ssts.push(file);
             }
         }
         metrics::BACKUP_FILE_FIND_FILE_DURATION.observe(begin.saturating_elapsed_secs());
+        metrics::BACKUP_FILE_FILES_PER_REGION.observe(ssts.len() as f64);
         let in_mem_file = InMemBackupFiles {
             files: BackupFile::NativeSsts(ssts),
-            start_key: self.start_key.to_owned(),
-            end_key: self.end_key.to_owned(),
+            start_key: self
+                .start_key
+                .to_owned()
+                .map(|k| k.into_encoded())
+                .unwrap_or_default(),
+            end_key: self
+                .end_key
+                .to_owned()
+                .map(|k| k.into_encoded())
+                .unwrap_or_default(),
             start_version: TimeStamp::zero(),
             end_version: backup_ts,
             region: r.clone(),
             limiter,
         };
-        metrics::BACKUP_FILE_FILES_PER_REGION.observe(ssts.len() as f64);
 
         send_to_worker_with_metrics(&saver, in_mem_file).await?;
         Ok(())
@@ -1197,7 +1226,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             db.into_owned(),
                             backup_ts, &concurrency_manager,
                             saver_tx.clone(),
-                            &prog
+                            &prog,
                             resource_limiter.clone(),
                         ).await;
                         res.map(|_| Statistics::default())

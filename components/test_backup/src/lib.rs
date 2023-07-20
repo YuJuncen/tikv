@@ -98,7 +98,7 @@ impl TestSuite {
 
         let mut endpoints = HashMap::default();
         for (id, engines) in &cluster.engines {
-            let mut sim = cluster.sim.wl();
+            let sim = cluster.sim.rl();
             let worker = resolvedts_handles.get_mut(id).unwrap();
             let raft_router = sim.get_server_router(*id);
             let env = Arc::new(Environment::new(1));

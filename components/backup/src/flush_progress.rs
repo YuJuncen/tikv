@@ -98,9 +98,9 @@ impl<E> AdvancerCore<E> {
     }
 
     pub fn hint_advance_resolved_ts(&self, region: u64) {
-        self.read_progress
-            .get(&region)
-            .map(|r| r.notify_advance_resolved_ts());
+        if let Some(r) = self.read_progress.get(&region) {
+            r.notify_advance_resolved_ts();
+        }
     }
 }
 
