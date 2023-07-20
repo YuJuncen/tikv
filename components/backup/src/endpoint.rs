@@ -313,7 +313,7 @@ async fn save_backup_file_worker<EK: KvEngine>(
             response.set_error(e.into());
             response
         };
-        let send_streamy_files = |files: Vec<File>| {
+        let response_by_files = |files: Vec<File>| {
             let mut response = BackupResponse::default();
             response.set_files(files.into());
             response.set_start_key(msg.start_key.clone());
@@ -321,14 +321,6 @@ async fn save_backup_file_worker<EK: KvEngine>(
             response.set_api_version(codec.dst_api_ver);
             response
         };
-        let send_batch_files = |files: Vec<File>| {
-            let mut response = BackupResponse::default();
-            response.set_start_key(msg.region.get_start_key().to_owned());
-            response.set_end_key(msg.region.get_end_key().to_owned());
-            response.set_files(files.into());
-            response
-        };
-        let send_and_log_error = |resp| {
             let res = tx.unbounded_send(resp);
             if let Err(e) = &res {
                 error_unknown!(?e; "backup failed to send response"; "region" => ?msg.region,
@@ -338,13 +330,6 @@ async fn save_backup_file_worker<EK: KvEngine>(
             res
         };
         let using_region_boundary = msg.files.is_atomic();
-        let response_by_files = |files: Vec<File>| {
-            if using_region_boundary {
-                send_batch_files(files)
-            } else {
-                send_streamy_files(files)
-            }
-        };
         if !msg.files.need_flush_keys() {
             let resp = response_by_files(vec![]);
             let res = send_and_log_error(resp);

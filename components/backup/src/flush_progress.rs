@@ -83,7 +83,7 @@ impl<E> AdvancerCore<E> {
                 last_applied_index: core.applied_index(),
             });
         }
-        let flushed = local_prog.resolved_ts > target_rts;
+        let flushed = local_prog.resolved_ts >= target_rts;
         if !flushed {
             return Err(FlushTsLessThanBackupTs {
                 flushed_ts: local_prog.resolved_ts,
