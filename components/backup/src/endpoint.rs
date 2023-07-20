@@ -490,8 +490,8 @@ impl BackupRange {
         for cf in [CF_DEFAULT, CF_WRITE] {
             let version = db.lock_current_version(cf)?;
             let files = version.get_files_in_range(
-                &keys::data_key(r.get_start_key()),
-                &keys::data_end_key(r.get_end_key()),
+                &keys::data_key(&self.start_key),
+                &keys::data_end_key(&self.end_key),
             )?;
             for file in files {
                 ssts.push(file);
@@ -500,8 +500,8 @@ impl BackupRange {
         metrics::BACKUP_FILE_FIND_FILE_DURATION.observe(begin.saturating_elapsed_secs());
         let in_mem_file = InMemBackupFiles {
             files: BackupFile::NativeSsts(ssts),
-            start_key: r.get_start_key().to_owned(),
-            end_key: r.get_end_key().to_owned(),
+            start_key: self.start_key.to_owned(),
+            end_key: self.end_key.to_owned(),
             start_version: TimeStamp::zero(),
             end_version: backup_ts,
             region: r.clone(),
