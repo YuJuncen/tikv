@@ -140,6 +140,7 @@ impl TestSuite {
                     .unwrap()
                     .region_read_progress
                     .clone(),
+                None,
             );
             let mut worker = bg_worker.lazy_build(format!("backup-{}", id));
             worker.start(backup_endpoint);

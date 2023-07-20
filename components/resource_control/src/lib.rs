@@ -1,5 +1,6 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 #![feature(test)]
+#![feature(local_key_cell_methods)]
 
 use online_config::OnlineConfig;
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ pub use resource_group::{
 };
 
 mod future;
-pub use future::ControlledFuture;
+pub use future::{with_resource_limiter, ControlledFuture};
 
 #[cfg(test)]
 extern crate test;
@@ -23,6 +24,8 @@ pub mod channel;
 pub use channel::ResourceMetered;
 
 mod resource_limiter;
+pub use resource_limiter::ResourceLimiter;
+pub mod worker;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug, OnlineConfig)]
 #[serde(default)]

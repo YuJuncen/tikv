@@ -21,7 +21,7 @@ use engine_test::{
     kv::{KvTestEngine, KvTestSnapshot, TestTabletFactory},
     raft::RaftTestEngine,
 };
-use engine_traits::{EncryptionKeyManager, TabletContext, TabletRegistry, DATA_CFS};
+use engine_traits::{TabletContext, TabletRegistry, DATA_CFS};
 use futures::executor::block_on;
 use kvproto::{
     kvrpcpb::ApiVersion,
@@ -45,6 +45,7 @@ use raftstore_v2::{
     Bootstrap, SimpleWriteEncoder, StateStorage, StoreSystem,
 };
 use resource_metering::CollectorRegHandle;
+use service::service_manager::GrpcServiceManager;
 use slog::{debug, o, Logger};
 use sst_importer::SstImporter;
 use tempfile::TempDir;
@@ -326,6 +327,7 @@ impl RunningState {
                 path.join("importer"),
                 key_manager.clone(),
                 ApiVersion::V1,
+                true,
             )
             .unwrap(),
         );
@@ -352,6 +354,7 @@ impl RunningState {
                 pd_worker,
                 importer,
                 key_manager,
+                GrpcServiceManager::dummy(),
             )
             .unwrap();
 
@@ -536,15 +539,27 @@ impl Cluster {
         Cluster::with_node_count(1, Some(config))
     }
 
+    pub fn with_config_and_extra_setting(
+        config: Config,
+        extra_setting: impl FnMut(&mut Config),
+    ) -> Cluster {
+        Cluster::with_configs(1, Some(config), None, extra_setting)
+    }
+
     pub fn with_node_count(count: usize, config: Option<Config>) -> Self {
-        Cluster::with_configs(count, config, None)
+        Cluster::with_configs(count, config, None, |_| {})
     }
 
     pub fn with_cop_cfg(config: Option<Config>, coprocessor_cfg: CopConfig) -> Cluster {
-        Cluster::with_configs(1, config, Some(coprocessor_cfg))
+        Cluster::with_configs(1, config, Some(coprocessor_cfg), |_| {})
     }
 
-    pub fn with_configs(count: usize, config: Option<Config>, cop_cfg: Option<CopConfig>) -> Self {
+    pub fn with_configs(
+        count: usize,
+        config: Option<Config>,
+        cop_cfg: Option<CopConfig>,
+        mut extra_setting: impl FnMut(&mut Config),
+    ) -> Self {
         let pd_server = test_pd::Server::new(1);
         let logger = slog_global::borrow_global().new(o!());
         let mut cluster = Cluster {
@@ -560,6 +575,7 @@ impl Cluster {
             v2_default_config()
         };
         disable_all_auto_ticks(&mut cfg);
+        extra_setting(&mut cfg);
         let cop_cfg = cop_cfg.unwrap_or_default();
         for _ in 1..=count {
             let mut node = TestNode::with_pd(&cluster.pd_server, cluster.logger.clone());
@@ -648,7 +664,7 @@ impl Cluster {
                     }
                     std::fs::rename(&gen_path, &recv_path).unwrap();
                     if let Some(m) = from_snap_mgr.key_manager() {
-                        m.delete_file(gen_path.to_str().unwrap()).unwrap();
+                        m.remove_dir(&gen_path, Some(&recv_path)).unwrap();
                     }
                     assert!(recv_path.exists());
                 }

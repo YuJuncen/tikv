@@ -25,11 +25,13 @@
 //!   created by the store, and here init it using the data sent from the parent
 //!   peer.
 
-use std::{any::Any, borrow::Cow, cmp, path::PathBuf, time::Duration};
+use std::{any::Any, borrow::Cow, cmp, path::PathBuf};
 
 use collections::HashSet;
 use crossbeam::channel::SendError;
-use engine_traits::{KvEngine, RaftEngine, RaftLogBatch, TabletContext, TabletRegistry};
+use engine_traits::{
+    Checkpointer, KvEngine, RaftEngine, RaftLogBatch, TabletContext, TabletRegistry,
+};
 use fail::fail_point;
 use futures::channel::oneshot;
 use kvproto::{
@@ -53,7 +55,7 @@ use raftstore::{
     Result,
 };
 use slog::{error, info, warn};
-use tikv_util::{log::SlogFormat, slog_panic, time::Instant, worker::Scheduler};
+use tikv_util::{box_err, log::SlogFormat, slog_panic, time::Instant};
 
 use crate::{
     batch::StoreContext,
@@ -61,7 +63,7 @@ use crate::{
     operation::{AdminCmdResult, SharedReadTablet},
     raft::{Apply, Peer},
     router::{CmdResChannel, PeerMsg, PeerTick, StoreMsg},
-    worker::{checkpoint, tablet},
+    worker::tablet,
     Error,
 };
 
@@ -278,10 +280,11 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         self.add_pending_tick(PeerTick::SplitRegionCheck);
     }
 
-    pub fn update_split_flow_control(&mut self, metrics: &ApplyMetrics) {
+    pub fn update_split_flow_control(&mut self, metrics: &ApplyMetrics, threshold: i64) {
         let control = self.split_flow_control_mut();
         control.size_diff_hint += metrics.size_diff_hint;
-        if self.is_leader() {
+        let size_diff_hint = control.size_diff_hint;
+        if self.is_leader() && size_diff_hint >= threshold {
             self.add_pending_tick(PeerTick::SplitRegionCheck);
         }
     }
@@ -311,6 +314,15 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 self.region_id(),
                 self.leader(),
             )));
+            return;
+        }
+        if self.storage().has_dirty_data() {
+            // If we split dirty tablet, the same trim compaction will be repeated
+            // exponentially more times.
+            info!(self.logger, "tablet still dirty, skip split.");
+            ch.set_result(cmd_resp::new_error(Error::Other(box_err!(
+                "tablet is dirty"
+            ))));
             return;
         }
         if let Err(e) = util::validate_split_region(
@@ -354,6 +366,11 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
                 "receive a stale halfsplit message";
                 "is_key_range" => is_key_range,
             );
+            return;
+        }
+
+        if self.storage().has_dirty_data() {
+            info!(self.logger, "tablet still dirty, skip half split.");
             return;
         }
 
@@ -506,11 +523,61 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
             .map(|r| r.get_id())
             .filter(|id| id != &region_id)
             .collect::<Vec<_>>();
-        let scheduler: _ = self.checkpoint_scheduler().clone();
+        let (tx, rx) = oneshot::channel();
         let tablet = self.tablet().clone();
-        let checkpoint_duration =
-            async_checkpoint(tablet, &scheduler, region_id, split_region_ids, log_index).await;
+        let logger = self.logger.clone();
+        let tablet_registry = self.tablet_registry().clone();
+        self.high_priority_pool()
+            .spawn(async move {
+                let checkpoint_start = Instant::now();
+                let mut checkpointer = tablet.new_checkpointer().unwrap_or_else(|e| {
+                    slog_panic!(
+                        logger,
+                        "fails to create checkpoint object";
+                        "region_id" => region_id,
+                        "error" => ?e
+                    )
+                });
 
+                for id in split_region_ids {
+                    let split_temp_path = temp_split_path(&tablet_registry, id);
+                    checkpointer
+                        .create_at(&split_temp_path, None, 0)
+                        .unwrap_or_else(|e| {
+                            slog_panic!(
+                                logger,
+                                "fails to create checkpoint";
+                                "region_id" => region_id,
+                                "path" => %split_temp_path.display(),
+                                "error" => ?e
+                            )
+                        });
+                }
+
+                let derived_path = tablet_registry.tablet_path(region_id, log_index);
+
+                // If it's recovered from restart, it's possible the target path exists already.
+                // And because checkpoint is atomic, so we don't need to worry about corruption.
+                // And it's also wrong to delete it and remake as it may has applied and flushed
+                // some data to the new checkpoint before being restarted.
+                if !derived_path.exists() {
+                    checkpointer
+                        .create_at(&derived_path, None, 0)
+                        .unwrap_or_else(|e| {
+                            slog_panic!(
+                                logger,
+                                "fails to create checkpoint";
+                                "region_id" => region_id,
+                                "path" => %derived_path.display(),
+                                "error" => ?e
+                            )
+                        });
+                }
+
+                tx.send(checkpoint_start.saturating_elapsed()).unwrap();
+            })
+            .unwrap();
+        let checkpoint_duration = rx.await.unwrap();
         // It should equal to checkpoint_duration + the duration of rescheduling current
         // apply peer
         let elapsed = now.saturating_elapsed();
@@ -551,27 +618,6 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
             }),
         ))
     }
-}
-
-// asynchronously execute the checkpoint creation and return the duration spent
-// by it
-async fn async_checkpoint<EK: KvEngine>(
-    tablet: EK,
-    scheduler: &Scheduler<checkpoint::Task<EK>>,
-    parent_region: u64,
-    split_regions: Vec<u64>,
-    log_index: u64,
-) -> Duration {
-    let (tx, rx) = oneshot::channel();
-    let task = checkpoint::Task::Checkpoint {
-        tablet,
-        log_index,
-        parent_region,
-        split_regions,
-        sender: tx,
-    };
-    scheduler.schedule_force(task).unwrap();
-    rx.await.unwrap()
 }
 
 impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
@@ -928,9 +974,9 @@ mod test {
     use slog::o;
     use tempfile::TempDir;
     use tikv_util::{
-        defer,
         store::{new_learner_peer, new_peer},
-        worker::{dummy_scheduler, Worker},
+        worker::dummy_scheduler,
+        yatp_pool::{DefaultTicker, YatpPoolBuilder},
     };
 
     use super::*;
@@ -1055,13 +1101,7 @@ mod test {
         region_state.set_region(region.clone());
         region_state.set_tablet_index(5);
 
-        let checkpoint_worker = Worker::new("checkpoint-worker");
-        let checkpoint_scheduler = checkpoint_worker.start(
-            "checkpoint-worker",
-            checkpoint::Runner::new(logger.clone(), reg.clone()),
-        );
-        defer!(checkpoint_worker.stop());
-
+        let high_priority_pool = YatpPoolBuilder::new(DefaultTicker::default()).build_future_pool();
         let (tablet_scheduler, _) = dummy_scheduler();
         let (read_scheduler, _rx) = dummy_scheduler();
         let (reporter, _) = MockReporter::new();
@@ -1086,8 +1126,8 @@ mod test {
             None,
             importer,
             host,
-            checkpoint_scheduler,
             tablet_scheduler,
+            high_priority_pool,
             logger.clone(),
         );
 

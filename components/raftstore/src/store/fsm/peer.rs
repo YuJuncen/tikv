@@ -2684,6 +2684,10 @@ where
         let mut resp = ExtraMessage::default();
         resp.set_type(ExtraMessageType::MsgAvailabilityResponse);
         resp.wait_data = self.fsm.peer.wait_data;
+        let report = resp.mut_availability_context();
+        report.set_from_region_id(self.region_id());
+        report.set_from_region_epoch(self.region().get_region_epoch().clone());
+        report.set_trimmed(true);
         self.fsm
             .peer
             .send_extra_message(resp, &mut self.ctx.trans, from);
@@ -2824,7 +2828,9 @@ where
                 }
             }
             // It's v2 only message and ignore does no harm.
-            ExtraMessageType::MsgGcPeerResponse | ExtraMessageType::MsgFlushMemtable => (),
+            ExtraMessageType::MsgGcPeerResponse
+            | ExtraMessageType::MsgFlushMemtable
+            | ExtraMessageType::MsgRefreshBuckets => (),
         }
     }
 
@@ -5724,7 +5730,9 @@ where
         // When Lightning or BR is importing data to TiKV, their ingest-request may fail
         // because of region-epoch not matched. So we hope TiKV do not check region size
         // and split region during importing.
-        if self.ctx.importer.get_mode() == SwitchMode::Import {
+        if self.ctx.importer.get_mode() == SwitchMode::Import
+            || self.ctx.importer.region_in_import_mode(self.region())
+        {
             return;
         }
 

@@ -281,6 +281,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d468802bab17cbc0cc575e9b053f41e72aa36bfa6b7f55e3529ffa43161b97fa"
 
 [[package]]
+name = "autotools"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aef8da1805e028a172334c3b680f93e71126f2327622faef2ec3d893c0a4ad77"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "aws"
 version = "0.0.1"
 dependencies = [
@@ -391,7 +400,7 @@ dependencies = [
 [[package]]
 name = "azure_core"
 version = "0.12.0"
-source = "git+https://github.com/Azure/azure-sdk-for-rust#5014404dff3cd77faf37a7077ec67bb6a2cf1f4c"
+source = "git+https://github.com/Azure/azure-sdk-for-rust#69431158e9d39f2064fe207cf241d3fc748c851c"
 dependencies = [
  "async-trait",
  "base64 0.21.0",
@@ -403,7 +412,7 @@ dependencies = [
  "log",
  "paste",
  "pin-project",
- "quick-xml 0.28.2",
+ "quick-xml 0.29.0",
  "rand 0.8.5",
  "reqwest",
  "rustc_version 0.4.0",
@@ -417,7 +426,7 @@ dependencies = [
 [[package]]
 name = "azure_identity"
 version = "0.12.0"
-source = "git+https://github.com/Azure/azure-sdk-for-rust#5014404dff3cd77faf37a7077ec67bb6a2cf1f4c"
+source = "git+https://github.com/Azure/azure-sdk-for-rust#69431158e9d39f2064fe207cf241d3fc748c851c"
 dependencies = [
  "async-lock",
  "async-trait",
@@ -437,7 +446,7 @@ dependencies = [
 [[package]]
 name = "azure_security_keyvault"
 version = "0.12.0"
-source = "git+https://github.com/Azure/azure-sdk-for-rust#5014404dff3cd77faf37a7077ec67bb6a2cf1f4c"
+source = "git+https://github.com/Azure/azure-sdk-for-rust#69431158e9d39f2064fe207cf241d3fc748c851c"
 dependencies = [
  "async-trait",
  "azure_core",
@@ -452,7 +461,7 @@ dependencies = [
 [[package]]
 name = "azure_storage"
 version = "0.12.0"
-source = "git+https://github.com/Azure/azure-sdk-for-rust#5014404dff3cd77faf37a7077ec67bb6a2cf1f4c"
+source = "git+https://github.com/Azure/azure-sdk-for-rust#69431158e9d39f2064fe207cf241d3fc748c851c"
 dependencies = [
  "RustyXML",
  "async-trait",
@@ -474,7 +483,7 @@ dependencies = [
 [[package]]
 name = "azure_storage_blobs"
 version = "0.12.0"
-source = "git+https://github.com/Azure/azure-sdk-for-rust#5014404dff3cd77faf37a7077ec67bb6a2cf1f4c"
+source = "git+https://github.com/Azure/azure-sdk-for-rust#69431158e9d39f2064fe207cf241d3fc748c851c"
 dependencies = [
  "RustyXML",
  "azure_core",
@@ -537,6 +546,7 @@ dependencies = [
  "raft",
  "raftstore",
  "rand 0.8.5",
+ "resource_control",
  "security",
  "serde",
  "serde_derive",
@@ -2967,12 +2977,12 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.2"
-source = "git+https://github.com/pingcap/kvproto.git#3788ab4ee6b3675865814bf26da43ea926ddaeae"
+source = "git+https://github.com/3pointer/kvproto?branch=file_restore#a2359ac446f4bb33016dbbebb4cd6103f25f47e2"
 dependencies = [
  "futures 0.3.15",
  "grpcio",
  "protobuf",
- "protobuf-build 0.14.1",
+ "protobuf-build 0.15.1",
  "raft-proto",
 ]
 
@@ -3096,7 +3106,7 @@ dependencies = [
 [[package]]
 name = "librocksdb_sys"
 version = "0.1.0"
-source = "git+https://github.com/yujuncen/rust-rocksdb.git?branch=iter-sst#61f439f80e81c61b9a4f33c701a917f3be6dc79d"
+source = "git+https://github.com/yujuncen/rust-rocksdb.git?branch=iter-sst#c8510ecc824975c588de7623dc61c7f634ceb069"
 dependencies = [
  "bindgen 0.65.1",
  "bzip2-sys",
@@ -3115,7 +3125,7 @@ dependencies = [
 [[package]]
 name = "libtitan_sys"
 version = "0.0.1"
-source = "git+https://github.com/yujuncen/rust-rocksdb.git?branch=iter-sst#61f439f80e81c61b9a4f33c701a917f3be6dc79d"
+source = "git+https://github.com/yujuncen/rust-rocksdb.git?branch=iter-sst#c8510ecc824975c588de7623dc61c7f634ceb069"
 dependencies = [
  "bzip2-sys",
  "cc",
@@ -4415,9 +4425,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2df9942df2981178a930a72d442de47e2f0df18ad68e50a30f816f1848215ad0"
 dependencies = [
  "bitflags",
+ "protobuf",
+ "protobuf-codegen",
+ "regex",
+]
+
+[[package]]
+name = "protobuf-build"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c852d9625b912c3e50480cdc701f60f49890b5d7ad46198dd583600f15e7c6ec"
+dependencies = [
+ "bitflags",
  "grpcio-compiler",
  "protobuf",
  "protobuf-codegen",
+ "protobuf-src",
  "regex",
 ]
 
@@ -4441,6 +4464,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "protobuf-src"
+version = "1.1.0+21.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7ac8852baeb3cc6fb83b93646fb93c0ffe5d14bf138c945ceb4b9948ee0e3c1"
+dependencies = [
+ "autotools",
+]
+
+[[package]]
 name = "quick-xml"
 version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4451,9 +4483,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.28.2"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ce5e73202a820a31f8a0ee32ada5e21029c81fd9e3ebf668a40832e4219d9d1"
+checksum = "81b9228215d82c7b61490fec1de287136b5de6f5700f6e58ea9ad61a7964ca51"
 dependencies = [
  "memchr",
  "serde",
@@ -4615,6 +4647,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_with",
+ "service",
  "slog",
  "slog-global",
  "smallvec",
@@ -4665,6 +4698,7 @@ dependencies = [
  "rand 0.8.5",
  "resource_control",
  "resource_metering",
+ "service",
  "slog",
  "slog-global",
  "smallvec",
@@ -4982,6 +5016,7 @@ dependencies = [
  "crossbeam-skiplist",
  "dashmap",
  "fail",
+ "file_system",
  "futures 0.3.15",
  "kvproto",
  "lazy_static",
@@ -4995,9 +5030,11 @@ dependencies = [
  "serde",
  "slog",
  "slog-global",
+ "strum 0.20.0",
  "test_pd",
  "test_pd_client",
  "tikv_util",
+ "tokio-timer",
  "yatp",
 ]
 
@@ -5085,7 +5122,7 @@ dependencies = [
 [[package]]
 name = "rocksdb"
 version = "0.3.0"
-source = "git+https://github.com/yujuncen/rust-rocksdb.git?branch=iter-sst#61f439f80e81c61b9a4f33c701a917f3be6dc79d"
+source = "git+https://github.com/yujuncen/rust-rocksdb.git?branch=iter-sst#c8510ecc824975c588de7623dc61c7f634ceb069"
 dependencies = [
  "libc 0.2.146",
  "librocksdb_sys",
@@ -5548,6 +5585,7 @@ dependencies = [
  "engine_rocks_helper",
  "engine_traits",
  "error_code",
+ "fail",
  "file_system",
  "fs2",
  "futures 0.3.15",
@@ -5572,6 +5610,7 @@ dependencies = [
  "resource_metering",
  "security",
  "serde_json",
+ "service",
  "signal-hook",
  "slog",
  "slog-global",
@@ -5584,6 +5623,15 @@ dependencies = [
  "toml",
  "txn_types",
  "yatp",
+]
+
+[[package]]
+name = "service"
+version = "0.0.1"
+dependencies = [
+ "atomic",
+ "crossbeam",
+ "tikv_util",
 ]
 
 [[package]]
@@ -5814,6 +5862,7 @@ name = "sst_importer"
 version = "0.1.0"
 dependencies = [
  "api_version",
+ "collections",
  "crc32fast",
  "dashmap",
  "encryption",
@@ -6011,9 +6060,8 @@ checksum = "20518fe4a4c9acf048008599e464deb21beeae3d3578418951a189c235a7a9a8"
 
 [[package]]
 name = "sysinfo"
-version = "0.26.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ade661fa5e048ada64ad7901713301c21d2dbc5b65ee7967de8826c111452960"
+version = "0.26.9"
+source = "git+https://github.com/tikv/sysinfo?branch=0.26-fix-cpu#5a1bcf08816979624ef2ad79cfb896de432a9501"
 dependencies = [
  "cfg-if 1.0.0",
  "core-foundation-sys",
@@ -6251,6 +6299,7 @@ dependencies = [
  "resource_metering",
  "security",
  "server",
+ "service",
  "slog",
  "slog-global",
  "tempfile",
@@ -6298,6 +6347,7 @@ dependencies = [
  "resource_metering",
  "security",
  "server",
+ "service",
  "slog",
  "slog-global",
  "tempfile",
@@ -6423,6 +6473,8 @@ dependencies = [
  "resource_metering",
  "security",
  "serde_json",
+ "server",
+ "service",
  "slog",
  "slog-global",
  "sst_importer",
@@ -6604,6 +6656,7 @@ dependencies = [
  "log_wrappers",
  "match-template",
  "protobuf",
+ "resource_control",
  "slog",
  "slog-global",
  "smallvec",
@@ -6750,6 +6803,7 @@ dependencies = [
  "serde_derive",
  "serde_ignored",
  "serde_json",
+ "service",
  "slog",
  "slog-global",
  "smallvec",
@@ -7867,7 +7921,7 @@ checksum = "541b12c998c5b56aa2b4e6f18f03664eef9a4fd0a246a55594efae6cc2d964b5"
 [[package]]
 name = "yatp"
 version = "0.0.1"
-source = "git+https://github.com/tikv/yatp.git?branch=master#5523a9a6a4d0d6242bdb02b0a344f7ee1477b39b"
+source = "git+https://github.com/tikv/yatp.git?branch=master#5572a78702572087cab8ddcdd1fe30e5bf76ae42"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-skiplist",

@@ -6,7 +6,7 @@ use std::{
     fmt,
     fs::OpenOptions,
     sync::{atomic::*, mpsc, Arc, Mutex, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use async_channel::SendError;
@@ -30,6 +30,7 @@ use kvproto::{
 use online_config::OnlineConfig;
 use raft::StateRole;
 use raftstore::{coprocessor::RegionInfoProvider, store::RegionReadProgressRegistry};
+use resource_control::{with_resource_limiter, ResourceGroupManager, ResourceLimiter};
 use tikv::{
     config::BackupConfig,
     storage::{
@@ -41,7 +42,9 @@ use tikv::{
     },
 };
 use tikv_util::{
-    box_err, debug, error, error_unknown, impl_display_as_debug, info,
+    box_err, debug, error, error_unknown,
+    future::RescheduleChecker,
+    impl_display_as_debug, info,
     store::find_peer,
     time::{Instant, Limiter},
     warn,
@@ -60,6 +63,8 @@ use crate::{
 };
 
 const BACKUP_BATCH_LIMIT: usize = 1024;
+// task yield duration when resource limit is on.
+const TASK_YIELD_DURATION: Duration = Duration::from_millis(10);
 
 #[derive(Clone)]
 struct Request {
@@ -79,6 +84,8 @@ struct Request {
     cipher: CipherInfo,
     replica_read: bool,
     backup_mode: BackupMode,
+    resource_group_name: String,
+    source_tag: String,
 }
 
 // Backup Operation corrosponsed to backup service
@@ -133,6 +140,10 @@ impl Task {
             cf: req.get_cf().to_owned(),
         })?;
 
+        let mut source_tag: String = req.get_context().get_request_source().into();
+        if source_tag.is_empty() {
+            source_tag = "br".into();
+        }
         let task = Task {
             request: Request {
                 start_key: req.get_start_key().to_owned(),
@@ -149,6 +160,12 @@ impl Task {
                 compression_type: req.get_compression_type(),
                 compression_level: req.get_compression_level(),
                 replica_read: req.get_replica_read(),
+                resource_group_name: req
+                    .get_context()
+                    .get_resource_control_context()
+                    .get_resource_group_name()
+                    .to_owned(),
+                source_tag,
                 cipher: req.cipher_info.unwrap_or_else(|| {
                     let mut cipher = CipherInfo::default();
                     cipher.set_cipher_type(EncryptionMethod::Plaintext);
@@ -218,6 +235,7 @@ struct InMemBackupFiles<EK: KvEngine> {
     start_version: TimeStamp,
     end_version: TimeStamp,
     region: Region,
+    limiter: Option<Arc<ResourceLimiter>>,
 }
 
 #[derive(Debug)]
@@ -321,15 +339,6 @@ async fn save_backup_file_worker<EK: KvEngine>(
             response.set_api_version(codec.dst_api_ver);
             response
         };
-            let res = tx.unbounded_send(resp);
-            if let Err(e) = &res {
-                error_unknown!(?e; "backup failed to send response"; "region" => ?msg.region,
-                    "start_key" => &log_wrappers::Value::key(&msg.start_key),
-                    "end_key" => &log_wrappers::Value::key(&msg.end_key),);
-            }
-            res
-        };
-        let using_region_boundary = msg.files.is_atomic();
         if !msg.files.need_flush_keys() {
             let resp = response_by_files(vec![]);
             let res = send_and_log_error(resp);
@@ -356,7 +365,7 @@ async fn save_backup_file_worker<EK: KvEngine>(
             Result::Ok(files)
         };
 
-        let files = match msg.files.save(&storage, &file_prefix).await {
+        let files = match with_resource_limiter(msg.files.save(&storage, &file_prefix), msg.limiter).await {
             Ok(split_files) => convert_key_range(split_files),
             Err(e) => {
                 error_unknown!(?e; "backup save file failed");
@@ -464,6 +473,7 @@ impl BackupRange {
         cm: &ConcurrencyManager,
         saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
         progress: &flush_progress::Advancer<E::Local>,
+        limiter: Option<Arc<ResourceLimiter>>,
     ) -> Result<()> {
         // Firstly, create a snapshot to making sure out leadership (at least
         // consistency).
@@ -505,6 +515,7 @@ impl BackupRange {
             start_version: TimeStamp::zero(),
             end_version: backup_ts,
             region: r.clone(),
+            limiter,
         };
         metrics::BACKUP_FILE_FILES_PER_REGION.observe(ssts.len() as f64);
 
@@ -522,6 +533,7 @@ impl BackupRange {
         begin_ts: TimeStamp,
         saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
         storage_name: &str,
+        resource_limiter: Option<Arc<ResourceLimiter>>,
     ) -> Result<Statistics> {
         assert!(!self.codec.is_raw_kv);
         let snapshot = self.take_snapshot(&mut engine, backup_ts, &concurrency_manager)?;
@@ -549,6 +561,8 @@ impl BackupRange {
             .clone()
             .map_or_else(Vec::new, |k| k.into_raw().unwrap());
         let mut writer = writer_builder.build(next_file_start_key.clone(), storage_name)?;
+        let mut reschedule_checker =
+            RescheduleChecker::new(tokio::task::yield_now, TASK_YIELD_DURATION);
         loop {
             if let Err(e) = scanner.scan_entries(&mut batch) {
                 error!(?e; "backup scan entries failed");
@@ -578,6 +592,7 @@ impl BackupRange {
                     start_version: begin_ts,
                     end_version: backup_ts,
                     region: self.region.clone(),
+                    limiter: resource_limiter.clone(),
                 };
                 send_to_worker_with_metrics(&saver, msg).await?;
                 next_file_start_key = this_end_key;
@@ -593,6 +608,9 @@ impl BackupRange {
             if let Err(e) = writer.write(entries, true) {
                 error_unknown!(?e; "backup build sst failed");
                 return Err(e);
+            }
+            if resource_limiter.is_some() {
+                reschedule_checker.check().await;
             }
         }
         drop(snap_store);
@@ -621,6 +639,7 @@ impl BackupRange {
             start_version: begin_ts,
             end_version: backup_ts,
             region: self.region.clone(),
+            limiter: resource_limiter.clone(),
         };
         send_to_worker_with_metrics(&saver, msg).await?;
 
@@ -754,6 +773,7 @@ impl BackupRange {
             start_version: TimeStamp::zero(),
             end_version: TimeStamp::zero(),
             region: self.region.clone(),
+            limiter: None,
         };
         send_to_worker_with_metrics(&saver_tx, msg).await?;
         Ok(stat)
@@ -852,6 +872,7 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     softlimit: SoftLimitKeeper,
     api_version: ApiVersion,
     causal_ts_provider: Option<Arc<CausalTsProviderImpl>>, // used in rawkv apiv2 only
+    resource_ctl: Option<Arc<ResourceGroupManager>>,
 
     pub(crate) engine: E,
     pub(crate) region_info: R,
@@ -1009,6 +1030,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         api_version: ApiVersion,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
         read_progress: RegionReadProgressRegistry,
+        resource_ctl: Option<Arc<ResourceGroupManager>>,
     ) -> Endpoint<E, R> {
         let pool = ControlThreadPool::new();
         let rt = utils::create_tokio_runtime(config.io_thread_size, "backup-io").unwrap();
@@ -1031,6 +1053,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
             api_version,
             causal_ts_provider,
             flush_prog,
+            resource_ctl,
         }
     }
 
@@ -1073,14 +1096,13 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         let sst_max_size = self.config_manager.0.read().unwrap().sst_max_size.0;
         let limit = self.softlimit.limit();
         let prog = self.flush_prog.clone();
-
+        let resource_limiter = self.resource_ctl.as_ref().and_then(|r| {
+            r.get_resource_limiter(&request.resource_group_name, &request.source_tag)
+        });
         self.pool.borrow_mut().spawn(async move {
-            // Migrated to 2021 migration. This let statement is probably not needed, see
-            //   https://doc.rust-lang.org/edition-guide/rust-2021/disjoint-capture-in-closures.html
             let _ = &request;
             loop {
                 // when get the guard, release it until we finish scanning a batch,
-                // because if we were suspended during scanning,
                 // the region info have higher possibility to change (then we must compensate that by the fine-grained backup).
                 let guard = limit.guard().await;
                 if let Err(e) = guard {
@@ -1158,8 +1180,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             sst_max_size,
                             request.cipher.clone(),
                         );
-                        brange
-                            .backup(
+                        with_resource_limiter(brange.backup(
                                 writer_builder,
                                 engine,
                                 concurrency_manager.clone(),
@@ -1167,7 +1188,8 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                                 start_ts,
                                 saver_tx.clone(),
                                 _backend.name(),
-                            )
+                                resource_limiter.clone(),
+                            ), resource_limiter.clone())
                             .await
                     } else {
                         let res = brange.backup_files(
@@ -1176,6 +1198,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             backup_ts, &concurrency_manager,
                             saver_tx.clone(),
                             &prog
+                            resource_limiter.clone(),
                         ).await;
                         res.map(|_| Statistics::default())
                     };
@@ -1324,14 +1347,14 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Runnable for Endpoint<E
                 self.handle_backup_task(task);
             }
             Operation::Prepare(_persistent, mut tx) => {
-                self.io_pool.borrow().spawn(async move {
+                self.io_pool.spawn(async move {
                     let mut resp = PrepareResponse::new();
                     resp.set_unique_id(Uuid::new_v4().to_string());
                     let _ = tx.send(resp).await;
                 });
             }
             Operation::Cleanup(_unique_id, mut tx) => {
-                self.io_pool.borrow().spawn(async move {
+                self.io_pool.spawn(async move {
                     let _ = tx.send(CleanupResponse::new()).await;
                 });
             }
@@ -1625,6 +1648,7 @@ pub mod tests {
                 api_version,
                 causal_ts_provider,
                 RegionReadProgressRegistry::new(),
+                None,
             ),
         )
     }
@@ -1770,6 +1794,8 @@ pub mod tests {
                         cipher: CipherInfo::default(),
                         replica_read: false,
                         backup_mode: BackupMode::Scan,
+                        resource_group_name: "".into(),
+                        source_tag: "br".into(),
                     },
                     resp: tx,
                 };
@@ -1880,6 +1906,8 @@ pub mod tests {
                 cipher: CipherInfo::default(),
                 replica_read: false,
                 backup_mode: BackupMode::Scan,
+                resource_group_name: "".into(),
+                source_tag: "br".into(),
             },
             resp: tx,
         };
@@ -1910,6 +1938,8 @@ pub mod tests {
                 compression_level: 0,
                 cipher: CipherInfo::default(),
                 replica_read: true,
+                resource_group_name: "".into(),
+                source_tag: "br".into(),
             },
             resp: tx,
         };
@@ -2024,6 +2054,8 @@ pub mod tests {
                         compression_level: 0,
                         cipher: CipherInfo::default(),
                         replica_read: false,
+                        resource_group_name: "".into(),
+                        source_tag: "br".into(),
                     },
                     resp: tx,
                 };

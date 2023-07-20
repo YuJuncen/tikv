@@ -277,7 +277,6 @@ impl<ER: RaftEngine> DebuggerImplV2<ER> {
                 .name(format!("mvcc-recover-thread-{}", thread_index))
                 .spawn_wrapper(move || {
                     tikv_util::thread_group::set_properties(props);
-                    tikv_alloc::add_thread_memory_accessor();
 
                     let mut results = vec![];
                     for (region, tablet) in region_group.into_iter().zip(tablets) {
@@ -1216,13 +1215,10 @@ mod tests {
         cfg.storage.data_dir = path.to_str().unwrap().to_string();
         cfg.raft_store.raftdb_path = cfg.infer_raft_db_path(None).unwrap();
         cfg.raft_engine.mut_config().dir = cfg.infer_raft_engine_path(None).unwrap();
-        let cache = cfg
-            .storage
-            .block_cache
-            .build_shared_cache(cfg.storage.engine);
+        let cache = cfg.storage.block_cache.build_shared_cache();
         let env = cfg.build_shared_rocks_env(None, None).unwrap();
 
-        let factory = KvEngineFactoryBuilder::new(env, &cfg, cache).build();
+        let factory = KvEngineFactoryBuilder::new(env, &cfg, cache, None).build();
         let reg = TabletRegistry::new(Box::new(factory), path).unwrap();
 
         let raft_engine = RaftLogEngine::new(cfg.raft_engine.config(), None, None).unwrap();
@@ -1482,13 +1478,10 @@ mod tests {
         cfg.raft_store.raftdb_path = cfg.infer_raft_db_path(None).unwrap();
         cfg.raft_engine.mut_config().dir = cfg.infer_raft_engine_path(None).unwrap();
         cfg.gc.enable_compaction_filter = false;
-        let cache = cfg
-            .storage
-            .block_cache
-            .build_shared_cache(cfg.storage.engine);
+        let cache = cfg.storage.block_cache.build_shared_cache();
         let env = cfg.build_shared_rocks_env(None, None).unwrap();
 
-        let factory = KvEngineFactoryBuilder::new(env, &cfg, cache).build();
+        let factory = KvEngineFactoryBuilder::new(env, &cfg, cache, None).build();
         let reg = TabletRegistry::new(Box::new(factory), path).unwrap();
 
         let raft_engine = RaftLogEngine::new(cfg.raft_engine.config(), None, None).unwrap();

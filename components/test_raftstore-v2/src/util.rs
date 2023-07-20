@@ -22,7 +22,6 @@ use test_raftstore::{new_get_cmd, new_put_cf_cmd, new_request, new_snap_cmd, Con
 use tikv::{
     server::KvEngineFactoryBuilder,
     storage::{
-        config::EngineType,
         kv::{SnapContext, SnapshotExt},
         point_key_range, Engine, Snapshot,
     },
@@ -57,10 +56,7 @@ pub fn create_test_engine(
         data_key_manager_from_config(&cfg.security.encryption, dir.path().to_str().unwrap())
             .unwrap()
             .map(Arc::new);
-    let cache = cfg
-        .storage
-        .block_cache
-        .build_shared_cache(EngineType::RaftKv2);
+    let cache = cfg.storage.block_cache.build_shared_cache();
     let env = cfg
         .build_shared_rocks_env(key_manager.clone(), limiter)
         .unwrap();
@@ -75,8 +71,8 @@ pub fn create_test_engine(
         bootstrap_store(&raft_engine, cluster_id, store_id).unwrap();
     }
 
-    let builder =
-        KvEngineFactoryBuilder::new(env, &cfg.tikv, cache).sst_recovery_sender(Some(scheduler));
+    let builder = KvEngineFactoryBuilder::new(env, &cfg.tikv, cache, key_manager.clone())
+        .sst_recovery_sender(Some(scheduler));
 
     let factory = Box::new(builder.build());
     let rocks_statistics = factory.rocks_statistics();
@@ -416,11 +412,19 @@ pub fn put_with_timeout<T: Simulator<EK>, EK: KvEngine>(
 ) -> Result<RaftCmdResponse> {
     let mut region = cluster.get_region(key);
     let region_id = region.get_id();
-    let req = new_request(
+    let mut req = new_request(
         region_id,
         region.take_region_epoch(),
         vec![new_put_cf_cmd(CF_DEFAULT, key, value)],
         false,
+    );
+    req.mut_header().set_peer(
+        region
+            .get_peers()
+            .iter()
+            .find(|p| p.store_id == node_id)
+            .unwrap()
+            .clone(),
     );
     cluster.call_command_on_node(node_id, req, timeout)
 }

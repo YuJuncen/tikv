@@ -145,8 +145,8 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             mailbox,
             store_ctx.tablet_registry.clone(),
             read_scheduler,
-            store_ctx.schedulers.checkpoint.clone(),
             store_ctx.schedulers.tablet.clone(),
+            store_ctx.high_priority_pool.clone(),
             self.flush_state().clone(),
             sst_apply_state,
             self.storage().apply_trace().log_recovery(),
@@ -406,7 +406,10 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
         }
         self.region_buckets_info_mut()
             .add_bucket_flow(&apply_res.bucket_stat);
-        self.update_split_flow_control(&apply_res.metrics);
+        self.update_split_flow_control(
+            &apply_res.metrics,
+            ctx.cfg.region_split_check_diff().0 as i64,
+        );
         self.update_stat(&apply_res.metrics);
         ctx.store_stat.engine_total_bytes_written += apply_res.metrics.written_bytes;
         ctx.store_stat.engine_total_keys_written += apply_res.metrics.written_keys;
@@ -512,7 +515,6 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
                     let _ = self.apply_delete(delete.cf, u64::MAX, delete.key);
                 }
                 SimpleWrite::DeleteRange(dr) => {
-                    let use_delete_range = self.use_delete_range();
                     let _ = self
                         .apply_delete_range(
                             dr.cf,
@@ -520,7 +522,6 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
                             dr.start_key,
                             dr.end_key,
                             dr.notify_only,
-                            use_delete_range,
                         )
                         .await;
                 }
@@ -637,14 +638,12 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
                                 self.apply_delete(delete.cf, log_index, delete.key)?;
                             }
                             SimpleWrite::DeleteRange(dr) => {
-                                let use_delete_range = self.use_delete_range();
                                 self.apply_delete_range(
                                     dr.cf,
                                     log_index,
                                     dr.start_key,
                                     dr.end_key,
                                     dr.notify_only,
-                                    use_delete_range,
                                 )
                                 .await?;
                             }
@@ -692,7 +691,9 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
                 AdminCmdType::CompactLog => self.apply_compact_log(admin_req, log_index)?,
                 AdminCmdType::Split => self.apply_split(admin_req, log_index).await?,
                 AdminCmdType::BatchSplit => self.apply_batch_split(admin_req, log_index).await?,
-                AdminCmdType::PrepareMerge => self.apply_prepare_merge(admin_req, log_index)?,
+                AdminCmdType::PrepareMerge => {
+                    self.apply_prepare_merge(admin_req, log_index).await?
+                }
                 AdminCmdType::CommitMerge => self.apply_commit_merge(admin_req, log_index).await?,
                 AdminCmdType::RollbackMerge => self.apply_rollback_merge(admin_req, log_index)?,
                 AdminCmdType::TransferLeader => {
@@ -737,7 +738,6 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
                         self.apply_delete(delete.get_cf(), log_index, delete.get_key())?;
                     }
                     CmdType::DeleteRange => {
-                        let use_delete_range = self.use_delete_range();
                         let dr = r.get_delete_range();
                         self.apply_delete_range(
                             dr.get_cf(),
@@ -745,7 +745,6 @@ impl<EK: KvEngine, R: ApplyResReporter> Apply<EK, R> {
                             dr.get_start_key(),
                             dr.get_end_key(),
                             dr.get_notify_only(),
-                            use_delete_range,
                         )
                         .await?;
                     }
