@@ -949,7 +949,7 @@ impl<E: Engine> ImportSst for ImportSstService<E> {
 
             let resp = with_resource_limiter(
                 importer.download_dispatcher::<E::Local>(req, cipher, limiter, tablet.into_owned()),
-                limiter,
+                resource_limiter,
             )
             .await;
             crate::send_rpc_response!(Ok(resp), sink, label, timer);

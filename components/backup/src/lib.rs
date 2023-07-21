@@ -7,12 +7,12 @@ extern crate tikv_alloc;
 
 mod endpoint;
 mod errors;
+mod flush_progress;
 mod metrics;
 mod service;
 mod softlimit;
 mod utils;
 mod writer;
-mod flush_progress;
 
 pub use endpoint::{backup_file_name, Endpoint, Operation, Task};
 pub use errors::{Error, Result};

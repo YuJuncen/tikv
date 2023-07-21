@@ -515,7 +515,8 @@ impl SstImporter {
                 || {
                     let _ = file_system::remove_file(&path.temp);
                 },
-            )?
+            )
+            .await?
             .map(|(range, _)| range);
         Ok(res)
     }
@@ -614,7 +615,8 @@ impl SstImporter {
                             let _ = file_system::remove_file(&p);
                         }
                     },
-                )?
+                )
+                .await?
                 .map(|(_, info)| info);
             if let Some(info) = info {
                 sst.set_total_bytes(info.file_size());
@@ -639,7 +641,8 @@ impl SstImporter {
                             let _ = file_system::remove_file(&p);
                         }
                     },
-                )?
+                )
+                .await?
                 .map(|(_, info)| info);
             if let Some(info) = info {
                 sst.set_total_bytes(info.file_size());
@@ -1479,148 +1482,154 @@ impl SstImporter {
         Ok((range_start, range_end))
     }
 
-    fn do_rewrite_ext<E: KvEngine, Iter: Iterator, F>(
-        &self,
-        dst_file_name: &str,
-        start_rename_rewrite: &Instant,
-        rewrite_rule: &RewriteRule,
-        range_start: &Bound<Vec<u8>>,
-        range_end: &Bound<Vec<u8>>,
-        mut iter: Iter,
+    fn do_rewrite_ext<'a, E, I, F>(
+        &'a self,
+        dst_file_name: &'a str,
+        start_rename_rewrite: &'a Instant,
+        rewrite_rule: &'a RewriteRule,
+        range_start: &'a Bound<Vec<u8>>,
+        range_end: &'a Bound<Vec<u8>>,
+        mut iter: I,
         cf_name: CfName,
         engine: E,
         req_type: DownloadRequestType,
         clean_files: F,
-    ) -> Result<
-        Option<(
-            Range,
-            <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileInfo,
-        )>,
-    >
+    ) -> impl futures_util::Future<
+        Output = Result<
+            Option<(
+                Range,
+                <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileInfo,
+            )>,
+        >,
+    > + 'a
     where
-        F: FnOnce(),
+        E: KvEngine,
+        I: Iterator + 'a,
+        F: FnOnce() + 'a,
     {
-        let old_prefix = rewrite_rule.get_old_key_prefix();
-        let new_prefix = rewrite_rule.get_new_key_prefix();
-        // perform iteration and key rewrite.
-        let mut data_key = keys::DATA_PREFIX_KEY.to_vec();
-        let data_key_prefix_len = keys::DATA_PREFIX_KEY.len();
-        let mut user_key = new_prefix.to_vec();
-        let user_key_prefix_len = new_prefix.len();
-        let mut first_key = None;
+        async move {
+            let old_prefix = rewrite_rule.get_old_key_prefix();
+            let new_prefix = rewrite_rule.get_new_key_prefix();
+            // perform iteration and key rewrite.
+            let mut data_key = keys::DATA_PREFIX_KEY.to_vec();
+            let data_key_prefix_len = keys::DATA_PREFIX_KEY.len();
+            let mut user_key = new_prefix.to_vec();
+            let user_key_prefix_len = new_prefix.len();
+            let mut first_key = None;
 
-        match range_start {
-            Bound::Unbounded => iter.seek_to_first()?,
-            Bound::Included(s) => iter.seek(&keys::data_key(&s))?,
-            Bound::Excluded(_) => unreachable!(),
-        };
-        // SST writer must not be opened in gRPC threads, because it may be
-        // blocked for a long time due to IO, especially, when encryption at rest
-        // is enabled, and it leads to gRPC keepalive timeout.
-        let mut sst_writer = <E as SstExt>::SstWriterBuilder::new()
-            .set_db(&engine)
-            .set_cf(cf_name)
-            .set_compression_type(self.compression_types.get(cf_name).copied())
-            .build(dst_file_name)
-            .unwrap();
+            match range_start {
+                Bound::Unbounded => iter.seek_to_first()?,
+                Bound::Included(s) => iter.seek(&keys::data_key(&s))?,
+                Bound::Excluded(_) => unreachable!(),
+            };
+            // SST writer must not be opened in gRPC threads, because it may be
+            // blocked for a long time due to IO, especially, when encryption at rest
+            // is enabled, and it leads to gRPC keepalive timeout.
+            let mut sst_writer = <E as SstExt>::SstWriterBuilder::new()
+                .set_db(&engine)
+                .set_cf(cf_name)
+                .set_compression_type(self.compression_types.get(cf_name).copied())
+                .build(dst_file_name)
+                .unwrap();
 
-        let mut yield_check =
-            RescheduleChecker::new(tokio::task::yield_now, Duration::from_millis(10));
-        let mut count = 0;
-        while iter.valid()? {
-            let mut old_key = Cow::Borrowed(keys::origin_key(iter.key()));
-            let mut ts = None;
+            let mut yield_check =
+                RescheduleChecker::new(tokio::task::yield_now, Duration::from_millis(10));
+            let mut count = 0;
+            while iter.valid()? {
+                let mut old_key = Cow::Borrowed(keys::origin_key(iter.key()));
+                let mut ts = None;
 
-            if is_after_end_bound(old_key.as_ref(), &range_end) {
-                break;
-            }
+                if is_after_end_bound(old_key.as_ref(), &range_end) {
+                    break;
+                }
 
-            if req_type == DownloadRequestType::Keyspace {
-                ts = Some(Key::decode_ts_bytes_from(old_key.as_ref())?.to_owned());
-                old_key = {
-                    let mut key = old_key.to_vec();
-                    decode_bytes_in_place(&mut key, false)?;
-                    Cow::Owned(key)
-                };
-            }
+                if req_type == DownloadRequestType::Keyspace {
+                    ts = Some(Key::decode_ts_bytes_from(old_key.as_ref())?.to_owned());
+                    old_key = {
+                        let mut key = old_key.to_vec();
+                        decode_bytes_in_place(&mut key, false)?;
+                        Cow::Owned(key)
+                    };
+                }
 
-            if !old_key.starts_with(old_prefix) {
-                return Err(Error::WrongKeyPrefix {
-                    what: "Key in SST",
-                    key: keys::origin_key(iter.key()).to_vec(),
-                    prefix: old_prefix.to_vec(),
-                });
-            }
+                if !old_key.starts_with(old_prefix) {
+                    return Err(Error::WrongKeyPrefix {
+                        what: "Key in SST",
+                        key: keys::origin_key(iter.key()).to_vec(),
+                        prefix: old_prefix.to_vec(),
+                    });
+                }
 
-            data_key.truncate(data_key_prefix_len);
-            user_key.truncate(user_key_prefix_len);
-            user_key.extend_from_slice(&old_key[old_prefix.len()..]);
-            if req_type == DownloadRequestType::Keyspace {
-                data_key.extend(encode_bytes(&user_key));
-                data_key.extend(ts.unwrap());
-            } else {
-                data_key.extend_from_slice(&user_key);
-            }
+                data_key.truncate(data_key_prefix_len);
+                user_key.truncate(user_key_prefix_len);
+                user_key.extend_from_slice(&old_key[old_prefix.len()..]);
+                if req_type == DownloadRequestType::Keyspace {
+                    data_key.extend(encode_bytes(&user_key));
+                    data_key.extend(ts.unwrap());
+                } else {
+                    data_key.extend_from_slice(&user_key);
+                }
 
-            let mut value = Cow::Borrowed(iter.value());
+                let mut value = Cow::Borrowed(iter.value());
 
-            if rewrite_rule.new_timestamp != 0 {
-                data_key = Key::from_encoded(data_key)
-                    .truncate_ts()
-                    .map_err(|e| {
-                        Error::BadFormat(format!(
-                            "key {}: {}",
-                            log_wrappers::Value::key(keys::origin_key(iter.key())),
-                            e
-                        ))
-                    })?
-                    .append_ts(TimeStamp::new(rewrite_rule.new_timestamp))
-                    .into_encoded();
-                if cf_name == CF_WRITE {
-                    let mut write = WriteRef::parse(iter.value()).map_err(|e| {
-                        Error::BadFormat(format!(
-                            "write {}: {}",
-                            log_wrappers::Value::key(keys::origin_key(iter.key())),
-                            e
-                        ))
-                    })?;
-                    write.start_ts = TimeStamp::new(rewrite_rule.new_timestamp);
-                    value = Cow::Owned(write.to_bytes());
+                if rewrite_rule.new_timestamp != 0 {
+                    data_key = Key::from_encoded(data_key)
+                        .truncate_ts()
+                        .map_err(|e| {
+                            Error::BadFormat(format!(
+                                "key {}: {}",
+                                log_wrappers::Value::key(keys::origin_key(iter.key())),
+                                e
+                            ))
+                        })?
+                        .append_ts(TimeStamp::new(rewrite_rule.new_timestamp))
+                        .into_encoded();
+                    if cf_name == CF_WRITE {
+                        let mut write = WriteRef::parse(iter.value()).map_err(|e| {
+                            Error::BadFormat(format!(
+                                "write {}: {}",
+                                log_wrappers::Value::key(keys::origin_key(iter.key())),
+                                e
+                            ))
+                        })?;
+                        write.start_ts = TimeStamp::new(rewrite_rule.new_timestamp);
+                        value = Cow::Owned(write.to_bytes());
+                    }
+                }
+
+                sst_writer.put(&data_key, &value)?;
+                count += 1;
+                if count >= 1024 {
+                    count = 0;
+                    yield_check.check().await;
+                }
+                iter.next()?;
+                if first_key.is_none() {
+                    first_key = Some(keys::origin_key(&data_key).to_vec());
                 }
             }
 
-            sst_writer.put(&data_key, &value)?;
-            count += 1;
-            if count >= 1024 {
-                count = 0;
-                yield_check.check().await;
-            }
-            iter.next()?;
-            if first_key.is_none() {
-                first_key = Some(keys::origin_key(&data_key).to_vec());
-            }
-        }
+            clean_files();
 
-        clean_files();
-
-        IMPORTER_DOWNLOAD_DURATION
-            .with_label_values(&["rewrite"])
-            .observe(start_rename_rewrite.saturating_elapsed().as_secs_f64());
-
-        if let Some(start_key) = first_key {
-            let start_finish = Instant::now();
-            let info = sst_writer.finish()?;
             IMPORTER_DOWNLOAD_DURATION
-                .with_label_values(&["finish"])
-                .observe(start_finish.saturating_elapsed().as_secs_f64());
+                .with_label_values(&["rewrite"])
+                .observe(start_rename_rewrite.saturating_elapsed().as_secs_f64());
 
-            let mut final_range = Range::default();
-            final_range.set_start(start_key);
-            final_range.set_end(keys::origin_key(&data_key).to_vec());
-            Ok(Some((final_range, info)))
-        } else {
-            // nothing is written: prevents finishing the SST at all.
-            Ok(None)
+            if let Some(start_key) = first_key {
+                let start_finish = Instant::now();
+                let info = sst_writer.finish()?;
+                IMPORTER_DOWNLOAD_DURATION
+                    .with_label_values(&["finish"])
+                    .observe(start_finish.saturating_elapsed().as_secs_f64());
+
+                let mut final_range = Range::default();
+                final_range.set_start(start_key);
+                final_range.set_end(keys::origin_key(&data_key).to_vec());
+                Ok(Some((final_range, info)))
+            } else {
+                // nothing is written: prevents finishing the SST at all.
+                Ok(None)
+            }
         }
     }
 
