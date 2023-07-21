@@ -3,6 +3,7 @@ use std::collections::BinaryHeap;
 
 use engine_rocks::RocksSstIterator;
 use engine_traits::Iterator;
+use keys::validate_data_key;
 use txn_types::{Key, TimeStamp};
 
 #[derive(Eq, PartialEq)]
@@ -62,7 +63,7 @@ impl<'a> Iterator for MergeIterator<'a> {
                 // empty sst, so skip obtaining entry from it
                 continue;
             }
-            while Key::decode_ts_from(iter.key())? > self.resolved_ts {
+            while !validate_data_key(iter.key()) || Key::decode_ts_from(iter.key())? > self.resolved_ts {
                 if !iter.next()? {
                     continue 'next_iter;
                 }
@@ -84,8 +85,9 @@ impl<'a> Iterator for MergeIterator<'a> {
                 // empty sst, so skip obtaining entry from it
                 continue;
             }
-            while Key::decode_ts_from(iter.key())? > self.resolved_ts {
-                if !iter.next()? {
+
+            while !validate_data_key(iter.key()) || Key::decode_ts_from(iter.key())? > self.resolved_ts {
+                if !iter.next()?  {
                     continue 'next_iter;
                 }
             }
@@ -107,6 +109,9 @@ impl<'a> Iterator for MergeIterator<'a> {
         if let Some(Entry { from, .. }) = self.entry_cache.pop() {
             let iter = &mut self.sst_iters[from];
             while iter.next()? {
+                if !validate_data_key(iter.key()) {
+                    continue;
+                }
                 if Key::decode_ts_from(iter.key())? <= self.resolved_ts {
                     self.entry_cache
                         .push(Entry::new(Key::from_encoded_slice(iter.key()), from));
