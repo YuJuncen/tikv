@@ -1345,6 +1345,7 @@ impl SstImporter {
     ) -> Result<String> {
         // TODO: find the root cause why there is a duplicate download request at the nearly time.
         if path.temp.exists() {
+            info!("find the duplicate download request"; "path" => ?path, "meta" => ?meta, "name" => name);
             return Ok(path.temp.to_str().unwrap().to_string());
         }
         let file_crypter = crypter.map(|c| FileEncryptionInfo {
