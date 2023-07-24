@@ -535,12 +535,12 @@ impl BackupRange {
             start_key: self
                 .start_key
                 .to_owned()
-                .map(|k| k.into_raw())
+                .map(|k| k.into_raw().unwrap())
                 .unwrap_or_default(),
             end_key: self
                 .end_key
                 .to_owned()
-                .map(|k| k.into_raw())
+                .map(|k| k.into_raw().unwrap())
                 .unwrap_or_default(),
             start_version: TimeStamp::zero(),
             end_version: backup_ts,
