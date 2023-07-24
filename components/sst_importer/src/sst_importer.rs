@@ -1343,6 +1343,10 @@ impl SstImporter {
         speed_limiter: &Limiter,
         cache_key: &str,
     ) -> Result<String> {
+        // TODO: find the root cause why there is a duplicate download request at the nearly time.
+        if path.temp.exists() {
+            return Ok(path.temp.to_str().unwrap().to_string());
+        }
         let file_crypter = crypter.map(|c| FileEncryptionInfo {
             method: to_engine_encryption_method(c.cipher_type),
             key: c.cipher_key,
