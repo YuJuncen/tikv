@@ -28,6 +28,8 @@ pub fn rewrite_prefix(
     src: &[u8],
 ) -> Result<Vec<u8>, WrongPrefix> {
     if !src.starts_with(old_prefix) {
+        println!("key    : {:?}", src);
+        println!("prefix : {:?}", old_prefix);
         return Err(WrongPrefix);
     }
     let mut result = Vec::with_capacity(src.len() - old_prefix.len() + new_prefix.len());
