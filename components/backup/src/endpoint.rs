@@ -238,10 +238,24 @@ struct InMemBackupFiles<EK: KvEngine> {
     limiter: Option<Arc<ResourceLimiter>>,
 }
 
-#[derive(Debug)]
 enum BackupFile<EK: KvEngine> {
     BuiltByScan(KvWriter<EK>),
-    NativeSsts(Vec<SstMetaData>),
+    NativeSsts(
+        Vec<SstMetaData>,
+        // Hold the version so files won't be GCed.
+        // Actually we won't use them again, the indirection won't be really harmful for
+        // performance.
+        Vec<Box<dyn LsmVersion + Send + 'static>>,
+    ),
+}
+
+impl<EK: KvEngine + fmt::Debug> fmt::Debug for BackupFile<EK> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BuiltByScan(arg0) => f.debug_tuple("BuiltByScan").field(arg0).finish(),
+            Self::NativeSsts(arg0, _) => f.debug_tuple("NativeSsts").field(arg0).finish(),
+        }
+    }
 }
 
 impl<EK: KvEngine> BackupFile<EK> {
@@ -252,7 +266,7 @@ impl<EK: KvEngine> BackupFile<EK> {
     ) -> Result<Vec<File>> {
         match self {
             BackupFile::BuiltByScan(wrt) => wrt.save(ext_storage).await,
-            BackupFile::NativeSsts(sst_mds) => {
+            BackupFile::NativeSsts(sst_mds, _versions) => {
                 let tasks = sst_mds
                     .into_iter()
                     .map(|sst_md| Self::save_sst_metadata(ext_storage, native_sst_prefix, sst_md));
@@ -299,14 +313,7 @@ impl<EK: KvEngine> BackupFile<EK> {
     fn need_flush_keys(&self) -> bool {
         match self {
             BackupFile::BuiltByScan(wrt) => wrt.need_flush_keys(),
-            BackupFile::NativeSsts(ssts) => !ssts.is_empty(),
-        }
-    }
-
-    fn is_atomic(&self) -> bool {
-        match self {
-            BackupFile::BuiltByScan(_) => false,
-            BackupFile::NativeSsts(_) => true,
+            BackupFile::NativeSsts(ssts, _) => !ssts.is_empty(),
         }
     }
 }
@@ -490,6 +497,7 @@ impl BackupRange {
         // consistency).
         let _snap = self.take_snapshot(&mut engine, backup_ts, cm)?;
         let mut ssts = vec![];
+        let mut version_holders: Vec<Box<dyn LsmVersion + Send + 'static>> = vec![];
         let r = &self.region;
         progress.with(|prog| {
             if prog.check_resolved_ts(r.get_id(), backup_ts).is_err() {
@@ -527,11 +535,12 @@ impl BackupRange {
             for file in files {
                 ssts.push(file);
             }
+            version_holders.push(Box::new(version));
         }
         metrics::BACKUP_FILE_FIND_FILE_DURATION.observe(begin.saturating_elapsed_secs());
         metrics::BACKUP_FILE_FILES_PER_REGION.observe(ssts.len() as f64);
         let in_mem_file = InMemBackupFiles {
-            files: BackupFile::NativeSsts(ssts),
+            files: BackupFile::NativeSsts(ssts, version_holders),
             start_key: self
                 .start_key
                 .to_owned()

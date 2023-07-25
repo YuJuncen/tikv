@@ -57,7 +57,7 @@ fn is_overlapping(range: (&[u8], &[u8]), range2: (&[u8], &[u8])) -> bool {
     }
 }
 
-pub trait LsmVersion {
+pub trait LsmVersion: Send + 'static {
     fn get_all_files(&self) -> Result<Vec<SstMetaData>, String>;
 
     fn get_files_in_range(&self, start: &[u8], end: &[u8]) -> Result<Vec<SstMetaData>, String> {
