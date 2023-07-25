@@ -3,6 +3,7 @@ use std::collections::BinaryHeap;
 
 use engine_rocks::RocksSstIterator;
 use engine_traits::Iterator;
+use keys::validate_data_key;
 use txn_types::{Key, TimeStamp};
 
 #[derive(Eq, PartialEq)]
@@ -29,7 +30,7 @@ impl Ord for Entry {
 
 impl PartialOrd for Entry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(&other))
+        Some(self.cmp(other))
     }
 }
 
@@ -44,13 +45,12 @@ pub struct MergeIterator<'a> {
 impl<'a> MergeIterator<'a> {
     pub fn new(resolved_ts: u64, sst_iters: Vec<RocksSstIterator<'a>>) -> Self {
         let entry_cache = BinaryHeap::with_capacity(6);
-        let merge_iter = MergeIterator {
+        MergeIterator {
             resolved_ts: TimeStamp::new(resolved_ts),
             sst_iters,
 
             entry_cache,
-        };
-        merge_iter
+        }
     }
 }
 
@@ -62,7 +62,7 @@ impl<'a> Iterator for MergeIterator<'a> {
                 // empty sst, so skip obtaining entry from it
                 continue;
             }
-            while Key::decode_ts_from(iter.key())? > self.resolved_ts {
+            while !validate_data_key(iter.key()) || Key::decode_ts_from(iter.key())? > self.resolved_ts {
                 if !iter.next()? {
                     continue 'next_iter;
                 }
@@ -84,8 +84,9 @@ impl<'a> Iterator for MergeIterator<'a> {
                 // empty sst, so skip obtaining entry from it
                 continue;
             }
-            while Key::decode_ts_from(iter.key())? > self.resolved_ts {
-                if !iter.next()? {
+
+            while !validate_data_key(iter.key()) || Key::decode_ts_from(iter.key())? > self.resolved_ts {
+                if !iter.next()?  {
                     continue 'next_iter;
                 }
             }
@@ -107,6 +108,9 @@ impl<'a> Iterator for MergeIterator<'a> {
         if let Some(Entry { from, .. }) = self.entry_cache.pop() {
             let iter = &mut self.sst_iters[from];
             while iter.next()? {
+                if !validate_data_key(iter.key()) {
+                    continue;
+                }
                 if Key::decode_ts_from(iter.key())? <= self.resolved_ts {
                     self.entry_cache
                         .push(Entry::new(Key::from_encoded_slice(iter.key()), from));
@@ -139,7 +143,6 @@ mod tests {
         IterOptions, Iterator, KvEngine, RefIterable, SstExt, SstReader, SstWriter,
         SstWriterBuilder,
     };
-    use keys;
     use tempfile::TempDir;
     use tikv::storage::TestEngineBuilder;
     use txn_types::{Key, TimeStamp};
@@ -161,7 +164,7 @@ mod tests {
                 let raw = format!("test{k}");
                 let mut key = Key::from_encoded(raw.into_bytes());
                 key.append_ts_inplace(TimeStamp::new(10 - ts));
-                let dkey = keys::data_key(&key.as_encoded());
+                let dkey = keys::data_key(key.as_encoded());
                 let val = format!("for test {}, {}, {}.", name, k, 10 - ts);
                 writer.put(&dkey, val.as_bytes()).unwrap();
             }
@@ -174,7 +177,7 @@ mod tests {
         let mut readers = Vec::new();
         let mut iters = Vec::new();
         for name in names {
-            let dst_file_name = path.join(&name);
+            let dst_file_name = path.join(name);
             let sst_reader =
                 RocksSstReader::open_with_env(dst_file_name.to_str().unwrap(), None).unwrap();
             sst_reader.verify_checksum().unwrap();
@@ -277,13 +280,12 @@ struct BinaryIterator<'a> {
 impl<'a> BinaryIterator<'a> {
     pub fn new(resolved_ts: u64, sst_iters: Vec<RocksSstIterator<'a>>) -> Self {
         let entry_cache = Vec::with_capacity(6);
-        let merge_iter = BinaryIterator {
+        BinaryIterator {
             resolved_ts: TimeStamp::new(resolved_ts),
             sst_iters,
 
             entry_cache,
-        };
-        merge_iter
+        }
     }
 
     fn iter_key(&self, pos: usize) -> &[u8] {
@@ -339,15 +341,15 @@ impl<'a> BinaryIterator<'a> {
     }
 
     fn peek(&self) -> usize {
-        return self.entry_cache[0];
+        self.entry_cache[0]
     }
 
     fn heap(&mut self) {
-        let end = self.entry_cache.len() - 1;
-        if end <= 0 {
+        if self.entry_cache.len() <= 1 {
             return;
         }
 
+        let end = self.entry_cache.len() - 1;
         let mut parent = (end - 1) / 2;
         loop {
             self.sift_down(parent);
