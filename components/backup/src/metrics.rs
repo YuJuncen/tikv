@@ -66,18 +66,10 @@ lazy_static! {
 
     // File based backup metrics.
     // NOTE: perhaps increase the range of buckets when implemented for v2.
-    pub static ref BACKUP_FILE_FLUSH_DURATION: Histogram = register_histogram!(
-        "tikv_backup_file_flush_duration",
-        "The time cost of flushing rocksdb during file based backup.",
-        // up to 4s.
-        exponential_buckets(0.001, 2.0, 12).unwrap()
-    )
-    .unwrap();
-    pub static ref BACKUP_FILE_FIND_FILE_DURATION: Histogram = register_histogram!(
-        "tikv_backup_file_find_file_duration",
-        "The time cost of finding file from rocksdb during file based backup.",
-        // up to 1s.
-        exponential_buckets(0.001, 2.0, 10).unwrap()
+    pub static ref BACKUP_FILE_LEVEL: Histogram = register_histogram!(
+        "tikv_backup_file_level",
+        "The level of files being backed up.",
+        linear_buckets(0.0, 1.0, 7).unwrap()
     )
     .unwrap();
     pub static ref BACKUP_FILE_FILES_PER_REGION: Histogram = register_histogram!(

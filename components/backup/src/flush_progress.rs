@@ -10,7 +10,32 @@ use std::{
 
 use engine_traits::{MiscExt, CF_DEFAULT, CF_WRITE};
 use raftstore::store::RegionReadProgressRegistry;
+use tikv_util::{box_err, time::Instant};
 use txn_types::TimeStamp;
+
+use crate::{metrics, Error};
+
+pub trait Guardian: Send + Sync + Clone + 'static {
+    fn ensure(&self, region: u64, target_rts: TimeStamp) -> crate::errors::Result<()>;
+}
+
+#[derive(Clone, Copy)]
+pub struct SafePlace;
+
+impl Guardian for SafePlace {
+    fn ensure(&self, _region: u64, _target_rts: TimeStamp) -> crate::errors::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Unsupported;
+
+impl Guardian for Unsupported {
+    fn ensure(&self, _region: u64, _target_rts: TimeStamp) -> crate::errors::Result<()> {
+        Err(Error::Other("flush_progress is not yet supported.".into()))
+    }
+}
 
 #[derive(PartialEq, Eq, Debug, Copy, Clone)]
 pub struct FlushProgress {
@@ -18,8 +43,36 @@ pub struct FlushProgress {
     resolved_ts: TimeStamp,
 }
 
-#[derive(Clone)]
+impl<E: MiscExt + Send + Sync + 'static> Guardian for Advancer<E> {
+    fn ensure(&self, r: u64, target_rts: TimeStamp) -> crate::errors::Result<()> {
+        self.with(|prog| {
+            if prog.check_resolved_ts(r, target_rts).is_err() {
+                let begin = Instant::now();
+                prog.advance_progress()?;
+                metrics::BACKUP_RANGE_HISTOGRAM_VEC
+                    .with_label_values(&["flush"])
+                    .observe(begin.saturating_elapsed_secs());
+            }
+            if let Err(reason) = prog.check_resolved_ts(r, target_rts) {
+                prog.hint_advance_resolved_ts(r);
+                return Result::Err(Error::Other(box_err!(
+                    "resolved ts not ready for region {}, reason is {:?}",
+                    r,
+                    reason
+                )));
+            }
+            Result::Ok(())
+        })
+    }
+}
+
 pub struct Advancer<E>(Arc<Mutex<AdvancerCore<E>>>);
+
+impl<E> Clone for Advancer<E> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
 
 impl<E> Advancer<E> {
     pub fn new(core: AdvancerCore<E>) -> Self {

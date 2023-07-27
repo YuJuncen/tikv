@@ -937,7 +937,7 @@ where
             self.concurrency_manager.clone(),
             self.core.config.storage.api_version(),
             self.causal_ts_provider.clone(),
-            unimplemented!(),
+            backup::flush_progress::Unsupported,
             self.resource_manager.clone(),
         );
         self.cfg_controller.as_mut().unwrap().register(
