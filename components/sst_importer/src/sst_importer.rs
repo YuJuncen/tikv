@@ -55,7 +55,8 @@ use crate::{
     import_mode::{ImportModeSwitcher, RocksDbMetricsFn},
     import_mode2::{HashRange, ImportModeSwitcherV2},
     metrics::*,
-    sst_merge_iter::MergeIterator,
+    rewrite::{do_pre_rewrite, is_after_end_bound, try_skip_rewriting, EntryRewrite},
+    sst_merge_iter::{MergeIterator, SstEntryScanner},
     sst_writer::{RawSstWriter, TxnSstWriter},
     util, Config, ConfigManager as ImportConfigManager, Error, Result,
 };
@@ -467,7 +468,7 @@ impl SstImporter {
         let path = self.dir.join(meta)?;
 
         let dst_file_name = self
-            .do_download_ext(
+            .do_download(
                 &path,
                 meta,
                 backend,
@@ -482,14 +483,10 @@ impl SstImporter {
         let sst_reader = self.generate_sst_reader_with_verify(&dst_file_name)?;
         let sst_iter = sst_reader.iter(IterOptions::default())?;
 
-        let (range_start, range_end) = self
-            .do_pre_rewrite_ext(meta, rewrite_rule, ext.req_type)
-            .await?;
+        let (range_start, range_end) = do_pre_rewrite(meta, rewrite_rule, ext.req_type).await?;
 
         let start_rename_rewrite = Instant::now();
-        if let Some(range) = self.try_skip_rewriting(
-            &path,
-            &start_rename_rewrite,
+        if let Some(range) = try_skip_rewriting(
             meta,
             sst_iter,
             &range_start,
@@ -497,12 +494,34 @@ impl SstImporter {
             rewrite_rule,
             ext.req_type,
         )? {
+            if let Some(key_manager) = &self.key_manager {
+                let temp_str = path
+                    .temp
+                    .to_str()
+                    .ok_or_else(|| Error::InvalidSstPath(path.temp.clone()))?;
+                let save_str = path
+                    .save
+                    .to_str()
+                    .ok_or_else(|| Error::InvalidSstPath(path.save.clone()))?;
+                key_manager.link_file(temp_str, save_str)?;
+                let r = file_system::rename(&path.temp, &path.save);
+                let del_file = if r.is_ok() { temp_str } else { save_str };
+                if let Err(e) = key_manager.delete_file(del_file, None) {
+                    warn!("fail to remove encryption metadata during 'do_download'"; "err" => ?e);
+                }
+                r?;
+            } else {
+                file_system::rename(&path.temp, &path.save)?;
+            }
+            IMPORTER_DOWNLOAD_DURATION
+                .with_label_values(&["rename"])
+                .observe(start_rename_rewrite.saturating_elapsed().as_secs_f64());
             return Ok(Some(range));
         }
 
         let sst_iter = sst_reader.iter(IterOptions::default())?;
         let res = self
-            .do_rewrite_ext(
+            .do_scan_rewrite(
                 path.save.to_str().unwrap(),
                 &start_rename_rewrite,
                 rewrite_rule,
@@ -516,8 +535,7 @@ impl SstImporter {
                     let _ = file_system::remove_file(&path.temp);
                 },
             )
-            .await?
-            .map(|(range, _)| range);
+            .await?;
         Ok(res)
     }
 
@@ -543,13 +561,12 @@ impl SstImporter {
         let mut sst_write_readers = Vec::new();
         let mut dst_default = None;
         let mut dst_write = None;
-        let mut clean_default_path = Vec::new();
-        let mut clean_write_path = Vec::new();
+        let mut clean_path = Vec::new();
         for (name, meta) in metas {
             let path = self.dir.join(meta)?;
 
             let dst_file_name = self
-                .do_download_ext(
+                .do_download(
                     &path,
                     meta,
                     backend,
@@ -566,13 +583,13 @@ impl SstImporter {
                 if dst_write.is_none() {
                     dst_write = Some((path.save.to_str().unwrap().to_string(), meta.clone()));
                 }
-                clean_write_path.push(path.temp);
+                clean_path.push(path.temp);
                 sst_write_readers.push(sst_reader);
             } else if meta.get_cf_name() == CF_DEFAULT {
                 if dst_default.is_none() {
                     dst_default = Some((path.save.to_str().unwrap().to_string(), meta.clone()));
                 }
-                clean_default_path.push(path.temp);
+                clean_path.push(path.temp);
                 sst_default_readers.push(sst_reader);
             } else {
                 warn!("invalid cf name for SstMeta"; "meta" => ?meta);
@@ -592,62 +609,41 @@ impl SstImporter {
         let default_iter = MergeIterator::new(resolved_ts, sst_default_iters);
         let write_iter = MergeIterator::new(resolved_ts, sst_write_iters);
 
-        let (range_start, range_end) = self
-            .do_pre_rewrite_ext(basic_meta, rewrite_rule, ext.req_type)
-            .await?;
+        let (range_start, range_end) =
+            do_pre_rewrite(basic_meta, rewrite_rule, ext.req_type).await?;
 
         let mut res_sst = Vec::new();
-        let start_rename_rewrite = Instant::now();
-        if let Some((file_name, mut sst)) = dst_default {
+        if let (
+            Some((default_file_name, mut default_sst)),
+            Some((write_file_name, mut write_sst)),
+        ) = (dst_default, dst_write)
+        {
             let res = self
-                .do_rewrite_ext(
-                    &file_name,
-                    &start_rename_rewrite,
+                .do_file_rewrite(
+                    &default_file_name,
+                    &write_file_name,
                     rewrite_rule,
                     &range_start,
                     &range_end,
-                    default_iter,
-                    CF_DEFAULT,
-                    engine.clone(),
-                    ext.req_type,
-                    move || {
-                        for p in clean_default_path {
-                            let _ = file_system::remove_file(p);
-                        }
-                    },
-                )
-                .await?;
-            if let Some((range, info)) = res {
-                sst.set_total_bytes(info.file_size());
-                sst.set_total_kvs(info.num_entries());
-                sst.set_range(range);
-                res_sst.push(sst);
-            }
-        }
-        if let Some((file_name, mut sst)) = dst_write {
-            let res = self
-                .do_rewrite_ext(
-                    &file_name,
-                    &start_rename_rewrite,
-                    rewrite_rule,
-                    &range_start,
-                    &range_end,
-                    write_iter,
-                    CF_WRITE,
+                    SstEntryScanner::new(default_iter, write_iter),
                     engine,
                     ext.req_type,
                     move || {
-                        for p in clean_write_path {
+                        for p in clean_path {
                             let _ = file_system::remove_file(p);
                         }
                     },
                 )
                 .await?;
-            if let Some((range, info)) = res {
-                sst.set_total_bytes(info.file_size());
-                sst.set_total_kvs(info.num_entries());
-                sst.set_range(range);
-                res_sst.push(sst);
+            if let Some((range, default_info, write_info)) = res {
+                default_sst.set_total_bytes(default_info.file_size());
+                default_sst.set_total_kvs(write_info.num_entries());
+                default_sst.set_range(range.clone());
+                res_sst.push(default_sst);
+                write_sst.set_total_bytes(write_info.file_size());
+                write_sst.set_total_kvs(write_info.num_entries());
+                write_sst.set_range(range);
+                res_sst.push(write_sst);
             }
         }
 
@@ -1318,6 +1314,7 @@ impl SstImporter {
         rewrite_rule: &RewriteRule,
         crypter: Option<CipherInfo>,
         speed_limiter: Limiter,
+        resolved_ts: u64,
         engine: E,
     ) -> Result<Vec<SstMeta>> {
         self._download_rt.block_on(self.download_file_ext(
@@ -1328,12 +1325,12 @@ impl SstImporter {
             crypter,
             speed_limiter,
             engine,
-            u64::MAX,
+            resolved_ts,
             DownloadExt::default(),
         ))
     }
 
-    async fn do_download_ext(
+    async fn do_download(
         &self,
         path: &ImportPath,
         meta: &SstMeta,
@@ -1343,11 +1340,6 @@ impl SstImporter {
         speed_limiter: &Limiter,
         cache_key: &str,
     ) -> Result<String> {
-        // TODO: find the root cause why there is a duplicate download request at the nearly time.
-        if path.temp.exists() {
-            info!("find the duplicate download request"; "path" => ?path, "meta" => ?meta, "name" => name);
-            return Ok(path.temp.to_str().unwrap().to_string());
-        }
         let file_crypter = crypter.map(|c| FileEncryptionInfo {
             method: to_engine_encryption_method(c.cipher_type),
             key: c.cipher_key,
@@ -1381,142 +1373,7 @@ impl SstImporter {
         Ok(dst_file_name.to_string())
     }
 
-    fn try_skip_rewriting<Iter: Iterator>(
-        &self,
-        path: &ImportPath,
-        start_rename_rewrite: &Instant,
-        meta: &SstMeta,
-        mut iter: Iter,
-        range_start: &Bound<Vec<u8>>,
-        range_end: &Bound<Vec<u8>>,
-        rewrite_rule: &RewriteRule,
-        req_type: DownloadRequestType,
-    ) -> Result<Option<Range>> {
-        // read the first and last keys from the SST, determine if we could
-        // simply move the entire SST instead of iterating and generate a new one.
-        let direct_retval = (|| -> Result<Option<_>> {
-            if rewrite_rule.old_key_prefix != rewrite_rule.new_key_prefix
-                || rewrite_rule.new_timestamp != 0
-            {
-                // must iterate if we perform key rewrite
-                return Ok(None);
-            }
-            if !iter.seek_to_first()? {
-                let mut range = meta.get_range().clone();
-                if req_type == DownloadRequestType::Keyspace {
-                    *range.mut_start() = encode_bytes(&range.take_start());
-                    *range.mut_end() = encode_bytes(&range.take_end());
-                }
-                // the SST is empty, so no need to iterate at all (should be impossible?)
-                return Ok(Some(range));
-            }
-
-            let start_key = keys::origin_key(iter.key());
-            if is_before_start_bound(start_key, range_start) {
-                // SST's start is before the range to consume, so needs to iterate to skip over
-                return Ok(None);
-            }
-            let start_key = start_key.to_vec();
-
-            // seek to end and fetch the last (inclusive) key of the SST.
-            iter.seek_to_last()?;
-            let last_key = keys::origin_key(iter.key());
-            if is_after_end_bound(last_key, range_end) {
-                // SST's end is after the range to consume
-                return Ok(None);
-            }
-
-            // range contained the entire SST, no need to iterate, just moving the file is
-            // ok
-            let mut range = Range::default();
-            range.set_start(start_key);
-            range.set_end(last_key.to_vec());
-            Ok(Some(range))
-        })()?;
-
-        if let Some(range) = direct_retval {
-            if let Some(key_manager) = &self.key_manager {
-                let temp_str = path
-                    .temp
-                    .to_str()
-                    .ok_or_else(|| Error::InvalidSstPath(path.temp.clone()))?;
-                let save_str = path
-                    .save
-                    .to_str()
-                    .ok_or_else(|| Error::InvalidSstPath(path.save.clone()))?;
-                key_manager.link_file(temp_str, save_str)?;
-                let r = file_system::rename(&path.temp, &path.save);
-                let del_file = if r.is_ok() { temp_str } else { save_str };
-                if let Err(e) = key_manager.delete_file(del_file, None) {
-                    warn!("fail to remove encryption metadata during 'do_download'"; "err" => ?e);
-                }
-                r?;
-            } else {
-                file_system::rename(&path.temp, &path.save)?;
-            }
-            IMPORTER_DOWNLOAD_DURATION
-                .with_label_values(&["rename"])
-                .observe(start_rename_rewrite.saturating_elapsed().as_secs_f64());
-            return Ok(Some(range));
-        }
-        Ok(None)
-    }
-
-    async fn do_pre_rewrite_ext(
-        &self,
-        meta: &SstMeta,
-        rewrite_rule: &RewriteRule,
-        req_type: DownloadRequestType,
-    ) -> Result<(Bound<Vec<u8>>, Bound<Vec<u8>>)> {
-        // undo key rewrite so we could compare with the keys inside SST
-        let old_prefix = rewrite_rule.get_old_key_prefix();
-        let new_prefix = rewrite_rule.get_new_key_prefix();
-        let req_type = req_type;
-
-        debug!("rewrite file";
-            "old_prefix" => log_wrappers::Value::key(old_prefix),
-            "new_prefix" => log_wrappers::Value::key(new_prefix),
-            "req_type" => ?req_type,
-        );
-
-        let range_start = meta.get_range().get_start();
-        let range_end = meta.get_range().get_end();
-
-        println!("start key  : {}", log_wrappers::Value::key(range_start));
-        println!("end key    : {}", log_wrappers::Value::key(range_end));
-        println!("old prefix : {}", log_wrappers::Value::key(old_prefix));
-        println!("new prefix : {}", log_wrappers::Value::key(new_prefix));
-
-        let range_start_bound = key_to_bound(range_start);
-        let range_end_bound = if meta.get_end_key_exclusive() {
-            key_to_exclusive_bound(range_end)
-        } else {
-            key_to_bound(range_end)
-        };
-
-        let mut range_start =
-            keys::rewrite::rewrite_prefix_of_start_bound(new_prefix, old_prefix, range_start_bound)
-                .map_err(|_| Error::WrongKeyPrefix {
-                    what: "SST start range",
-                    key: range_start.to_vec(),
-                    prefix: new_prefix.to_vec(),
-                })?;
-        let mut range_end =
-            keys::rewrite::rewrite_prefix_of_end_bound(new_prefix, old_prefix, range_end_bound)
-                .map_err(|_| Error::WrongKeyPrefix {
-                    what: "SST end range",
-                    key: range_end.to_vec(),
-                    prefix: new_prefix.to_vec(),
-                })?;
-
-        if req_type == DownloadRequestType::Keyspace {
-            range_start = keys::rewrite::encode_bound(range_start);
-            range_end = keys::rewrite::encode_bound(range_end);
-        }
-        Ok((range_start, range_end))
-    }
-
-    fn do_rewrite_ext<'a, E, I, F>(
+    pub fn do_scan_rewrite<'a, E, I, F>(
         &'a self,
         dst_file_name: &'a str,
         start_rename_rewrite: &'a Instant,
@@ -1528,14 +1385,7 @@ impl SstImporter {
         engine: E,
         req_type: DownloadRequestType,
         clean_files: F,
-    ) -> impl futures_util::Future<
-        Output = Result<
-            Option<(
-                Range,
-                <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileInfo,
-            )>,
-        >,
-    > + 'a
+    ) -> impl futures_util::Future<Output = Result<Option<Range>>> + 'a
     where
         E: KvEngine,
         I: Iterator + 'a,
@@ -1553,7 +1403,7 @@ impl SstImporter {
 
             match range_start {
                 Bound::Unbounded => iter.seek_to_first()?,
-                Bound::Included(s) => iter.seek(&keys::data_key(&s))?,
+                Bound::Included(s) => iter.seek(&keys::data_key(s))?,
                 Bound::Excluded(_) => unreachable!(),
             };
             // SST writer must not be opened in gRPC threads, because it may be
@@ -1573,7 +1423,7 @@ impl SstImporter {
                 let mut old_key = Cow::Borrowed(keys::origin_key(iter.key()));
                 let mut ts = None;
 
-                if is_after_end_bound(old_key.as_ref(), &range_end) {
+                if is_after_end_bound(old_key.as_ref(), range_end) {
                     break;
                 }
 
@@ -1651,7 +1501,7 @@ impl SstImporter {
 
             if let Some(start_key) = first_key {
                 let start_finish = Instant::now();
-                let info = sst_writer.finish()?;
+                let _ = sst_writer.finish()?;
                 IMPORTER_DOWNLOAD_DURATION
                     .with_label_values(&["finish"])
                     .observe(start_finish.saturating_elapsed().as_secs_f64());
@@ -1659,7 +1509,157 @@ impl SstImporter {
                 let mut final_range = Range::default();
                 final_range.set_start(start_key);
                 final_range.set_end(keys::origin_key(&data_key).to_vec());
-                Ok(Some((final_range, info)))
+                Ok(Some(final_range))
+            } else {
+                // nothing is written: prevents finishing the SST at all.
+                Ok(None)
+            }
+        }
+    }
+
+    #[inline]
+    fn adjust_key<'a>(
+        key: &'a [u8],
+        old_prefix: &[u8],
+        range_end: &Bound<Vec<u8>>,
+        req_type: DownloadRequestType,
+    ) -> Result<Option<(Cow<'a, [u8]>, Option<Vec<u8>>)>> {
+        let mut old_key = Cow::Borrowed(keys::origin_key(key));
+        let mut ts = None;
+
+        if is_after_end_bound(old_key.as_ref(), range_end) {
+            return Ok(None);
+        }
+
+        if req_type == DownloadRequestType::Keyspace {
+            ts = Some(Key::decode_ts_bytes_from(old_key.as_ref())?.to_owned());
+            old_key = {
+                let mut key = old_key.to_vec();
+                decode_bytes_in_place(&mut key, false)?;
+                Cow::Owned(key)
+            };
+        }
+
+        if !old_key.starts_with(old_prefix) {
+            return Err(Error::WrongKeyPrefix {
+                what: "Key in SST",
+                key: key.to_vec(),
+                prefix: old_prefix.to_vec(),
+            });
+        }
+
+        Ok(Some((old_key, ts)))
+    }
+
+    fn do_file_rewrite<'a, E, I, F>(
+        &'a self,
+        dst_default_file_name: &'a str,
+        dst_write_file_name: &'a str,
+        rewrite_rule: &'a RewriteRule,
+        range_start: &'a Bound<Vec<u8>>,
+        range_end: &'a Bound<Vec<u8>>,
+        mut iter: SstEntryScanner<I>,
+        engine: E,
+        req_type: DownloadRequestType,
+        clean_files: F,
+    ) -> impl futures_util::Future<
+        Output = Result<
+            Option<(
+                Range,
+                <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileInfo,
+                <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileInfo,
+            )>,
+        >,
+    > + 'a
+    where
+        E: KvEngine,
+        I: Iterator + 'a,
+        F: FnOnce() + 'a,
+    {
+        async move {
+            let start_rename_rewrite = Instant::now();
+            let old_prefix = rewrite_rule.get_old_key_prefix();
+            let new_prefix = rewrite_rule.get_new_key_prefix();
+            // perform iteration and key rewrite.
+            let mut entry_rewrite = EntryRewrite::new(new_prefix, old_prefix.len(), req_type);
+
+            let mut first_key = None;
+
+            match range_start {
+                Bound::Unbounded => iter.seek_to_first()?,
+                Bound::Included(s) => iter.seek(&keys::data_key(s))?,
+                Bound::Excluded(_) => unreachable!(),
+            };
+            // SST writer must not be opened in gRPC threads, because it may be
+            // blocked for a long time due to IO, especially, when encryption at rest
+            // is enabled, and it leads to gRPC keepalive timeout.
+            let mut sst_default_writer = <E as SstExt>::SstWriterBuilder::new()
+                .set_db(&engine)
+                .set_cf(CF_DEFAULT)
+                .set_compression_type(self.compression_types.get(CF_DEFAULT).copied())
+                .build(dst_default_file_name)
+                .unwrap();
+            let mut sst_write_writer = <E as SstExt>::SstWriterBuilder::new()
+                .set_db(&engine)
+                .set_cf(CF_WRITE)
+                .set_compression_type(self.compression_types.get(CF_WRITE).copied())
+                .build(dst_write_file_name)
+                .unwrap();
+
+            let mut yield_check =
+                RescheduleChecker::new(tokio::task::yield_now, Duration::from_millis(10));
+            let mut count = 0;
+            while iter.read()? {
+                let (old_key, ts) =
+                    match Self::adjust_key(iter.write_key(), old_prefix, range_end, req_type)? {
+                        None => break,
+                        Some(r) => r,
+                    };
+                let key = entry_rewrite.rewrite_key(&old_key, ts);
+                sst_write_writer.put(key, iter.write_value())?;
+
+                let (old_key, ts) =
+                    match Self::adjust_key(iter.default_key(), old_prefix, range_end, req_type)? {
+                        None => {
+                            return Err(Error::Engine(box_err!(
+                                "default key not found: {}",
+                                log_wrappers::Value::key(iter.write_key())
+                            )));
+                        }
+                        Some(r) => r,
+                    };
+                let key = entry_rewrite.rewrite_key(&old_key, ts);
+                sst_default_writer.put(key, iter.default_value())?;
+
+                count += 1;
+                if count >= 1024 {
+                    count = 0;
+                    yield_check.check().await;
+                }
+                iter.next_write()?;
+                if first_key.is_none() {
+                    first_key = Some(keys::origin_key(entry_rewrite.data_key()).to_vec());
+                }
+            }
+
+            clean_files();
+
+            IMPORTER_DOWNLOAD_DURATION
+                .with_label_values(&["rewrite"])
+                .observe(start_rename_rewrite.saturating_elapsed().as_secs_f64());
+
+            if let Some(start_key) = first_key {
+                let start_finish = Instant::now();
+                let info_default = sst_default_writer.finish()?;
+                let info_write = sst_write_writer.finish()?;
+                IMPORTER_DOWNLOAD_DURATION
+                    .with_label_values(&["finish"])
+                    .observe(start_finish.saturating_elapsed().as_secs_f64());
+
+                let mut final_range = Range::default();
+                final_range.set_start(start_key);
+                final_range.set_end(keys::origin_key(entry_rewrite.data_key()).to_vec());
+                Ok(Some((final_range, info_default, info_write)))
             } else {
                 // nothing is written: prevents finishing the SST at all.
                 Ok(None)
@@ -1739,38 +1739,6 @@ impl SstImporter {
     }
 }
 
-fn key_to_bound(key: &[u8]) -> Bound<&[u8]> {
-    if key.is_empty() {
-        Bound::Unbounded
-    } else {
-        Bound::Included(key)
-    }
-}
-
-fn key_to_exclusive_bound(key: &[u8]) -> Bound<&[u8]> {
-    if key.is_empty() {
-        Bound::Unbounded
-    } else {
-        Bound::Excluded(key)
-    }
-}
-
-fn is_before_start_bound<K: AsRef<[u8]>>(value: &[u8], bound: &Bound<K>) -> bool {
-    match bound {
-        Bound::Unbounded => false,
-        Bound::Included(b) => *value < *b.as_ref(),
-        Bound::Excluded(b) => *value <= *b.as_ref(),
-    }
-}
-
-fn is_after_end_bound<K: AsRef<[u8]>>(value: &[u8], bound: &Bound<K>) -> bool {
-    match bound {
-        Bound::Unbounded => false,
-        Bound::Included(b) => *value > *b.as_ref(),
-        Bound::Excluded(b) => *value >= *b.as_ref(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1779,7 +1747,7 @@ mod tests {
         usize,
     };
 
-    use engine_rocks::{RocksExternalSstFileInfo, RocksSstIterator};
+    use engine_rocks::RocksExternalSstFileInfo;
     use engine_traits::{
         collect, EncryptionMethod, Error as TraitError, ExternalSstFileInfo, Iterable, Iterator,
         RefIterable, SstReader, SstWriter, CF_DEFAULT, DATA_CFS,
@@ -2074,8 +2042,8 @@ mod tests {
 
     fn get_encoded_origin_key(key: &[u8], ts: u64) -> Vec<u8> {
         txn_types::Key::from_raw(key)
-                .append_ts(TimeStamp::new(ts))
-                .into_encoded()
+            .append_ts(TimeStamp::new(ts))
+            .into_encoded()
     }
 
     fn get_write_value(
@@ -3292,7 +3260,7 @@ mod tests {
 
         let step = key_end + key_dup;
         for num in 1..file_num {
-            ts_base = ts_base + step;
+            ts_base += step;
             let (meta1, meta2) = create_sample_external_sst_file_txn_default_and_write_impl(
                 num,
                 key_start,
@@ -3346,7 +3314,8 @@ mod tests {
                     &get_write_value(WriteType::Put, start_ts, None),
                 )?;
                 // println!("key: {}", Key::from_encoded(get_encoded_key(key, start_ts)));
-                sst_default_writer.put(&get_encoded_key(key.as_bytes(), start_ts), key.as_bytes())?;
+                sst_default_writer
+                    .put(&get_encoded_key(key.as_bytes(), start_ts), key.as_bytes())?;
             }
         }
 
@@ -3383,6 +3352,7 @@ mod tests {
         key_end: usize,
         key_dup: usize,
         ts: usize,
+        resolved_ts: u64,
         rewrite_rule: Option<&RewriteRule>,
         sst_file_write_path: PathBuf,
         sst_file_default_path: PathBuf,
@@ -3398,7 +3368,10 @@ mod tests {
         default_iter.seek_to_first().unwrap();
 
         let (old_prefix, new_prefix) = match rewrite_rule {
-            Some(rewrite_rule) => (String::from_utf8(rewrite_rule.get_old_key_prefix().to_vec()).unwrap(), String::from_utf8(rewrite_rule.get_new_key_prefix().to_vec()).unwrap()),
+            Some(rewrite_rule) => (
+                String::from_utf8(rewrite_rule.get_old_key_prefix().to_vec()).unwrap(),
+                String::from_utf8(rewrite_rule.get_new_key_prefix().to_vec()).unwrap(),
+            ),
             None => (String::from("key_"), String::from("key_")),
         };
         let mut valid = write_iter.valid()? && default_iter.valid()?;
@@ -3406,19 +3379,32 @@ mod tests {
         for key in range_start..range_end {
             let mut ts_base = ts + file_num * step;
             for _ in 1..file_num {
-                ts_base = ts_base - step;
+                ts_base -= step;
                 for dup in 0..key_dup {
                     assert!(valid);
                     let start_ts = (ts_base + key_end - key + key_dup - dup) as u64;
                     let commit_ts = start_ts + 10;
+                    if commit_ts > resolved_ts {
+                        continue;
+                    };
                     let key_new = format!("{}{}", new_prefix, key);
                     let key_old = format!("{}{}", old_prefix, key);
-                    //println!("key: {}", Key::from_encoded(get_encoded_key(key.as_bytes(), commit_ts)));
-                    assert_eq!(write_iter.key(), &get_encoded_key(key_new.as_bytes(), commit_ts));
-                    assert_eq!(write_iter.value(), &get_write_value(WriteType::Put, start_ts, None));
+                    // println!("key: {}", Key::from_encoded(get_encoded_key(key_new.as_bytes(),
+                    // commit_ts)));
+                    assert_eq!(
+                        write_iter.key(),
+                        &get_encoded_key(key_new.as_bytes(), commit_ts)
+                    );
+                    assert_eq!(
+                        write_iter.value(),
+                        &get_write_value(WriteType::Put, start_ts, None)
+                    );
 
                     // println!("key: {}", Key::from_encoded(get_encoded_key(key, start_ts)));
-                    assert_eq!(default_iter.key(), &get_encoded_key(key_new.as_bytes(), start_ts));
+                    assert_eq!(
+                        default_iter.key(),
+                        &get_encoded_key(key_new.as_bytes(), start_ts)
+                    );
                     assert_eq!(default_iter.value(), key_old.as_bytes());
 
                     valid = write_iter.next()? && default_iter.next()?;
@@ -3454,6 +3440,7 @@ mod tests {
                 &new_rewrite_rule(b"", b"", 0),
                 None,
                 Limiter::new(f64::INFINITY),
+                u64::MAX,
                 db,
             )
             .unwrap();
@@ -3467,7 +3454,19 @@ mod tests {
         let sst_file_default_path = importer.dir.join(&default_meta).unwrap().save;
         assert!(sst_file_default_path.is_file());
 
-        verify_sample_external_sst_file_txn_default_and_write(6, 10, 30, 30, 3, 10, None, sst_file_write_path, sst_file_default_path).unwrap();
+        verify_sample_external_sst_file_txn_default_and_write(
+            6,
+            10,
+            30,
+            30,
+            3,
+            10,
+            u64::MAX,
+            None,
+            sst_file_write_path,
+            sst_file_default_path,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3482,11 +3481,10 @@ mod tests {
             create_sample_external_sst_file_txn_default_and_write(6, 10, 30, 3, 10).unwrap();
         let db = create_sst_test_engine().unwrap();
 
-        
         vmetas.iter_mut().for_each(|(_, meta)| {
             let mut range = Range::default();
-            range.set_start(get_encoded_origin_key(format!("key_15").as_bytes(), 0));
-            range.set_end(get_encoded_origin_key(format!("key_25").as_bytes(), 0));
+            range.set_start(get_encoded_origin_key("key_15".to_string().as_bytes(), 0));
+            range.set_end(get_encoded_origin_key("key_25".to_string().as_bytes(), 0));
             meta.set_range(range);
         });
 
@@ -3496,8 +3494,14 @@ mod tests {
             metas.insert(name, meta);
         }
 
-        println!("range start : {}", log_wrappers::Value::key(meta.get_range().get_start()));
-        println!("range end   : {}", log_wrappers::Value::key(meta.get_range().get_end()));
+        println!(
+            "range start : {}",
+            log_wrappers::Value::key(meta.get_range().get_start())
+        );
+        println!(
+            "range end   : {}",
+            log_wrappers::Value::key(meta.get_range().get_end())
+        );
         let res_metas = importer
             .download_file::<TestEngine>(
                 &meta,
@@ -3506,6 +3510,7 @@ mod tests {
                 &new_rewrite_rule(b"", b"", 0),
                 None,
                 Limiter::new(f64::INFINITY),
+                u64::MAX,
                 db,
             )
             .unwrap();
@@ -3519,7 +3524,19 @@ mod tests {
         let sst_file_default_path = importer.dir.join(&default_meta).unwrap().save;
         assert!(sst_file_default_path.is_file());
 
-        verify_sample_external_sst_file_txn_default_and_write(6, 16, 26, 30, 3, 10, None, sst_file_write_path, sst_file_default_path).unwrap();
+        verify_sample_external_sst_file_txn_default_and_write(
+            6,
+            16,
+            26,
+            30,
+            3,
+            10,
+            u64::MAX,
+            None,
+            sst_file_write_path,
+            sst_file_default_path,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -3534,11 +3551,10 @@ mod tests {
             create_sample_external_sst_file_txn_default_and_write(6, 10, 30, 3, 10).unwrap();
         let db = create_sst_test_engine().unwrap();
 
-        
         vmetas.iter_mut().for_each(|(_, meta)| {
             let mut range = Range::default();
-            range.set_start(get_encoded_origin_key(format!("val_15").as_bytes(), 0));
-            range.set_end(get_encoded_origin_key(format!("val_25").as_bytes(), 0));
+            range.set_start(get_encoded_origin_key("val_15".to_string().as_bytes(), 0));
+            range.set_end(get_encoded_origin_key("val_25".to_string().as_bytes(), 0));
             meta.set_range(range);
         });
 
@@ -3548,8 +3564,14 @@ mod tests {
             metas.insert(name, meta);
         }
 
-        println!("range start : {}", log_wrappers::Value::key(meta.get_range().get_start()));
-        println!("range end   : {}", log_wrappers::Value::key(meta.get_range().get_end()));
+        println!(
+            "range start : {}",
+            log_wrappers::Value::key(meta.get_range().get_start())
+        );
+        println!(
+            "range end   : {}",
+            log_wrappers::Value::key(meta.get_range().get_end())
+        );
         let rewrite_rule = new_rewrite_rule(b"key_", b"val_", 0);
         let res_metas = importer
             .download_file::<TestEngine>(
@@ -3559,6 +3581,7 @@ mod tests {
                 &rewrite_rule,
                 None,
                 Limiter::new(f64::INFINITY),
+                u64::MAX,
                 db,
             )
             .unwrap();
@@ -3572,7 +3595,90 @@ mod tests {
         let sst_file_default_path = importer.dir.join(&default_meta).unwrap().save;
         assert!(sst_file_default_path.is_file());
 
-        verify_sample_external_sst_file_txn_default_and_write(6, 16, 26, 30, 3, 10, Some(&rewrite_rule), sst_file_write_path, sst_file_default_path).unwrap();
+        verify_sample_external_sst_file_txn_default_and_write(
+            6,
+            16,
+            26,
+            30,
+            3,
+            10,
+            u64::MAX,
+            Some(&rewrite_rule),
+            sst_file_write_path,
+            sst_file_default_path,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_download_file_merged_with_rewrite_rule_and_resolved_ts() {
+        // performs the download.
+        let importer_dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default();
+        let importer = SstImporter::new(&cfg, &importer_dir, None, ApiVersion::V1, false).unwrap();
+
+        // creates a sample SST file.
+        let (_ext_sst_dir, backend, mut vmetas) =
+            create_sample_external_sst_file_txn_default_and_write(6, 10, 30, 30, 10).unwrap();
+        let db = create_sst_test_engine().unwrap();
+
+        vmetas.iter_mut().for_each(|(_, meta)| {
+            let mut range = Range::default();
+            range.set_start(get_encoded_origin_key("val_15".to_string().as_bytes(), 0));
+            range.set_end(get_encoded_origin_key("val_25".to_string().as_bytes(), 0));
+            meta.set_range(range);
+        });
+
+        let meta = vmetas[0].1.clone();
+        let mut metas = HashMap::new();
+        for (name, meta) in vmetas {
+            metas.insert(name, meta);
+        }
+
+        println!(
+            "range start : {}",
+            log_wrappers::Value::key(meta.get_range().get_start())
+        );
+        println!(
+            "range end   : {}",
+            log_wrappers::Value::key(meta.get_range().get_end())
+        );
+        let rewrite_rule = new_rewrite_rule(b"key_", b"val_", 0);
+        let res_metas = importer
+            .download_file::<TestEngine>(
+                &meta,
+                &metas,
+                &backend,
+                &rewrite_rule,
+                None,
+                Limiter::new(f64::INFINITY),
+                99,
+                db,
+            )
+            .unwrap();
+
+        let (default_meta, write_meta) = (res_metas[0].clone(), res_metas[1].clone());
+
+        // verifies that the file is saved to the correct place.
+        // (the file size may be changed, so not going to check the file size)
+        let sst_file_write_path = importer.dir.join(&write_meta).unwrap().save;
+        assert!(sst_file_write_path.is_file());
+        let sst_file_default_path = importer.dir.join(&default_meta).unwrap().save;
+        assert!(sst_file_default_path.is_file());
+
+        verify_sample_external_sst_file_txn_default_and_write(
+            6,
+            16,
+            26,
+            30,
+            30,
+            10,
+            99,
+            Some(&rewrite_rule),
+            sst_file_write_path,
+            sst_file_default_path,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -5831,6 +5831,7 @@ name = "sst_importer"
 version = "0.1.0"
 dependencies = [
  "api_version",
+ "codec",
  "collections",
  "crc32fast",
  "dashmap",

@@ -15,6 +15,7 @@ extern crate tikv_alloc;
 mod config;
 mod errors;
 mod import_file;
+mod rewrite;
 mod sst_merge_iter;
 mod sst_writer;
 mod util;

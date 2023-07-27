@@ -1,10 +1,13 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
-use std::collections::BinaryHeap;
+use std::{cmp::Ordering, collections::BinaryHeap};
 
+use codec::prelude::NumberDecoder;
 use engine_rocks::RocksSstIterator;
 use engine_traits::Iterator;
 use keys::validate_data_key;
 use txn_types::{Key, TimeStamp};
+
+use crate::{Error, Result};
 
 #[derive(Eq, PartialEq)]
 struct Entry {
@@ -62,7 +65,9 @@ impl<'a> Iterator for MergeIterator<'a> {
                 // empty sst, so skip obtaining entry from it
                 continue;
             }
-            while !validate_data_key(iter.key()) || Key::decode_ts_from(iter.key())? > self.resolved_ts {
+            while !validate_data_key(iter.key())
+                || Key::decode_ts_from(iter.key())? > self.resolved_ts
+            {
                 if !iter.next()? {
                     continue 'next_iter;
                 }
@@ -84,9 +89,10 @@ impl<'a> Iterator for MergeIterator<'a> {
                 // empty sst, so skip obtaining entry from it
                 continue;
             }
-
-            while !validate_data_key(iter.key()) || Key::decode_ts_from(iter.key())? > self.resolved_ts {
-                if !iter.next()?  {
+            while !validate_data_key(iter.key())
+                || Key::decode_ts_from(iter.key())? > self.resolved_ts
+            {
+                if !iter.next()? {
                     continue 'next_iter;
                 }
             }
@@ -382,7 +388,9 @@ impl<'a> Iterator for BinaryIterator<'a> {
                 // empty sst, so skip obtaining entry from it
                 continue;
             }
-            while Key::decode_ts_from(iter.key())? > self.resolved_ts {
+            while !validate_data_key(iter.key())
+                || Key::decode_ts_from(iter.key())? > self.resolved_ts
+            {
                 if !iter.next()? {
                     continue 'next_iter;
                 }
@@ -404,7 +412,9 @@ impl<'a> Iterator for BinaryIterator<'a> {
                 // empty sst, so skip obtaining entry from it
                 continue;
             }
-            while Key::decode_ts_from(iter.key())? > self.resolved_ts {
+            while !validate_data_key(iter.key())
+                || Key::decode_ts_from(iter.key())? > self.resolved_ts
+            {
                 if !iter.next()? {
                     continue 'next_iter;
                 }
@@ -427,7 +437,9 @@ impl<'a> Iterator for BinaryIterator<'a> {
         if let Some(from) = self.pop() {
             let iter = &mut self.sst_iters[from];
             while iter.next()? {
-                if Key::decode_ts_from(iter.key())? <= self.resolved_ts {
+                if validate_data_key(iter.key())
+                    && Key::decode_ts_from(iter.key())? <= self.resolved_ts
+                {
                     self.push(from);
                     break;
                 }
@@ -446,5 +458,124 @@ impl<'a> Iterator for BinaryIterator<'a> {
 
     fn valid(&self) -> engine_traits::Result<bool> {
         Ok(!self.entry_cache.is_empty())
+    }
+}
+// struct SstWriteDispather {
+// default_writer: SstWriter,
+// write_writer: SstWriter,
+// }
+//
+// impl SstWriteDispatcher {
+// pub fn new(default_dst_file_name: &str, write_dst_file_name: &str) -> Self {
+// SstWriteDispather {
+// default_writer,
+// write_writer,
+// }
+// }
+// }
+
+pub struct SstEntryScanner<I: Iterator> {
+    default_iter: I,
+    write_iter: I,
+}
+
+impl<I: Iterator> SstEntryScanner<I> {
+    pub fn new(default_iter: I, write_iter: I) -> Self {
+        SstEntryScanner {
+            default_iter,
+            write_iter,
+        }
+    }
+
+    pub fn seek_to_first(&mut self) -> Result<bool> {
+        Ok(self.write_iter.seek_to_first()? && self.default_iter.seek_to_first()?)
+    }
+
+    pub fn seek(&mut self, key: &[u8]) -> Result<bool> {
+        Ok(self.write_iter.seek(key)? && self.default_iter.seek(key)?)
+    }
+
+    pub fn next_write(&mut self) -> Result<bool> {
+        self.write_iter.next().map_err(Error::from)
+    }
+
+    // NOTICE: equivalent to WriteRef::parse, but only parse one field.
+    fn start_ts(&self) -> Result<TimeStamp> {
+        let val = self.write_iter.value();
+        let mut start_ts_pos = &val[1..];
+        start_ts_pos
+            .read_var_u64()
+            .map(|ts| ts.into())
+            .map_err(|e| {
+                Error::BadFormat(format!(
+                    "write {}: {}",
+                    log_wrappers::Value::key(keys::origin_key(self.write_iter.key())),
+                    e
+                ))
+            })
+    }
+
+    fn write_valid(&self) -> Result<bool> {
+        self.write_iter.valid().map_err(Error::from)
+    }
+
+    // equal to Iterator::valid(), and advance the default iter.
+    pub fn read(&mut self) -> Result<bool> {
+        if !self.write_valid()? {
+            return Ok(false);
+        }
+        let (wkey, commit_ts) = Key::split_on_ts_for(self.write_iter.key())?;
+        let start_ts = self.start_ts()?;
+        println!(
+            "read write key: {}, commit_ts: {}, start_ts: {}",
+            log_wrappers::Value::key(wkey),
+            commit_ts,
+            start_ts
+        );
+        // seek to the same user key from default
+        loop {
+            if !self.default_iter.valid()? {
+                return Err(Error::Engine(box_err!(
+                    "default not found. key: {}, ts: {}",
+                    log_wrappers::Value::key(wkey),
+                    commit_ts
+                )));
+            }
+            let (dkey, dstart_ts) = Key::split_on_ts_for(self.default_iter.key())?;
+            match (dkey.cmp(wkey), dstart_ts.cmp(&start_ts)) {
+                (Ordering::Equal, Ordering::Equal) => return Ok(true),
+                (Ordering::Greater, _) | (Ordering::Equal, Ordering::Less) => {
+                    return Err(Error::Engine(box_err!(
+                        "default not found. key: {}, ts: {}",
+                        log_wrappers::Value::key(wkey),
+                        commit_ts
+                    )));
+                }
+                (Ordering::Less, _) | (Ordering::Equal, Ordering::Greater) => {
+                    self.default_iter.next()?;
+                    continue;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn write_key(&self) -> &[u8] {
+        self.write_iter.key()
+    }
+
+    #[inline]
+    pub fn write_value(&self) -> &[u8] {
+        self.write_iter.value()
+    }
+
+    #[inline]
+    pub fn default_key(&self) -> &[u8] {
+        self.default_iter.key()
+    }
+
+    #[inline]
+    pub fn default_value(&self) -> &[u8] {
+        self.default_iter.value()
     }
 }
