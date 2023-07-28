@@ -14,7 +14,7 @@ use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{
     name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, LsmVersion, SstCompressionType,
-    SstMetaData, VersionedLsmExt, CF_DEFAULT, CF_WRITE,
+    SstMetaData, VersionedLsmExt, CF_DEFAULT, CF_WRITE, SstExt,
 };
 use external_storage::{BackendConfig, HdfsConfig, UnpinReader};
 use external_storage_export::{create_storage, ExternalStorage};
@@ -59,7 +59,7 @@ use crate::{
     metrics::*,
     softlimit::{CpuStatistics, SoftLimit, SoftLimitByCpu},
     utils::{ControlThreadPool, KeyValueCodec},
-    writer::{BackupWriterBuilder, CfNameWrap},
+    writer::{BackupWriterBuilder, CfNameWrap, CopyWriter},
     Error, *,
 };
 
@@ -201,14 +201,7 @@ pub struct BackupRange {
 enum KvWriter<EK: KvEngine> {
     Txn(BackupWriter<EK>),
     Raw(BackupRawKvWriter<EK>),
-    Copy(
-        Vec<SstMetaData>,
-        // Hold the version so files won't be GCed.
-        // Actually we won't use them again, the indirection won't be really harmful for
-        // performance.
-        Vec<Box<dyn LsmVersion + Send + 'static>>,
-        u64,
-    ),
+    Copy(CopyWriter<EK>),
 }
 
 impl<EK: KvEngine> std::fmt::Debug for KvWriter<EK> {
@@ -226,64 +219,15 @@ impl<EK: KvEngine> KvWriter<EK> {
         match self {
             Self::Txn(writer) => writer.save(storage).await,
             Self::Raw(writer) => writer.save(storage).await,
-            Self::Copy(sst_mds, _versions, store_id) => {
-                let prefix = format!("{store_id}");
-                let tasks = sst_mds
-                    .into_iter()
-                    .map(|sst_md| Self::save_sst_metadata(storage, &prefix, sst_md));
-                let files = futures::future::try_join_all(tasks).await?;
-                Ok(files)
-            }
+            Self::Copy(writer) => writer.save(storage).await,
         }
-    }
-    async fn save_sst_metadata(
-        ext_storage: &dyn ExternalStorage,
-        prefix: &str,
-        sst_md: SstMetaData,
-    ) -> Result<File> {
-        fail::fail_point!("file_backup_save_sst_metadata");
-        let now = Instant::now();
-        let file = OpenOptions::new().read(true).open(sst_md.abs_path)?;
-        let (checksumed_file, hasher) =
-            Sha256Reader::new(file).map_err(|err| Error::Other(format!("{err}").into()))?;
-        let name = format!("{}_L{}_{}", prefix, sst_md.level, sst_md.name);
-        // TODO: rate limit, encryption, better file layout.
-        ext_storage
-            .write(
-                &name,
-                UnpinReader(Box::new(AllowStdIo::new(checksumed_file))),
-                sst_md.size,
-            )
-            .await?;
-        let hash = hasher
-            .lock()
-            .unwrap()
-            .finish()
-            .map(|d| d.to_vec())
-            .unwrap_or_else(|err| {
-                warn!("cannot hash for file"; "file" => %name, "err" => %err);
-                Default::default()
-            });
-        let mut out_file = File::new();
-        out_file.set_size(sst_md.size);
-        out_file.set_sha256(hash);
-        out_file.set_cf(sst_md.column_family.to_owned());
-        out_file.set_name(name);
-        BACKUP_RANGE_HISTOGRAM_VEC
-            .with_label_values(&["save-unchanged"])
-            .observe(now.saturating_elapsed_secs());
-        BACKUP_RANGE_SIZE_HISTOGRAM_VEC
-            .with_label_values(&[sst_md.column_family])
-            .observe(sst_md.size as f64);
-        BACKUP_FILE_LEVEL.observe(sst_md.level as f64);
-        Ok(out_file)
     }
 
     fn need_flush_keys(&self) -> bool {
         match self {
             Self::Txn(writer) => writer.need_flush_keys(),
             Self::Raw(_) => true,
-            Self::Copy(ssts, ..) => !ssts.is_empty(),
+            Self::Copy(writer) => writer.need_flush_keys(),
         }
     }
 }
@@ -469,13 +413,14 @@ impl BackupRange {
         saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
         guardian: &G,
         limiter: Option<Arc<ResourceLimiter>>,
+        rate_limiter: Limiter,
         store_id: u64,
     ) -> Result<()> {
         // Firstly, create a snapshot to making sure out leadership (at least
         // consistency).
         let _snap = self.take_snapshot(&mut engine, backup_ts, cm)?;
         let mut ssts = vec![];
-        let mut version_holders: Vec<Box<dyn LsmVersion + Send + 'static>> = vec![];
+        let mut version_holders: Vec<Box<dyn LsmVersion>> = vec![];
         let r = &self.region;
 
         guardian.ensure(r.id, backup_ts)?;
@@ -506,7 +451,7 @@ impl BackupRange {
             .observe(begin.saturating_elapsed_secs());
         metrics::BACKUP_FILE_FILES_PER_REGION.observe(ssts.len() as f64);
         let in_mem_file = InMemBackupFiles {
-            files: KvWriter::Copy(ssts, version_holders, store_id),
+            files: KvWriter::Copy(CopyWriter::new(ssts, store_id, rate_limiter, CipherInfo::new(), version_holders)),
             start_key: self
                 .start_key
                 .to_owned()
@@ -1203,6 +1148,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static, G: flush_progress::Guar
                             saver_tx.clone(),
                             &prog,
                             resource_limiter.clone(),
+                            request.limiter.clone(),
                             store_id, 
                         ).await;
                         res.map(|_| Statistics::default())

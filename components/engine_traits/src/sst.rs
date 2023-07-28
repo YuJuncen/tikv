@@ -20,7 +20,7 @@ pub trait SstExt: Sized {
 }
 
 /// SstReader is used to read an SST file.
-pub trait SstReader: RefIterable + Sized {
+pub trait SstReader: RefIterable + Sized + Send {
     fn open(path: &str) -> Result<Self>;
     fn open_encrypted<E: EncryptionKeyManager>(path: &str, mgr: Arc<E>) -> Result<Self>;
     fn verify_checksum(&self) -> Result<()>;

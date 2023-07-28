@@ -1,15 +1,15 @@
 // Copyright 2019 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{fmt::Display, io::Read};
+use std::{fmt::Display, io::Read, marker::PhantomData};
 
 use encryption::{EncrypterReader, Iv};
 use engine_traits::{
-    CfName, ExternalSstFileInfo, KvEngine, SstCompressionType, SstExt, SstWriter, SstWriterBuilder,
-    CF_DEFAULT, CF_WRITE,
+    CfName, ExternalSstFileInfo, KvEngine, LsmVersion, SstCompressionType, SstExt, SstMetaData,
+    SstWriter, SstWriterBuilder, CF_DEFAULT, CF_WRITE,
 };
 use external_storage_export::{ExternalStorage, UnpinReader};
-use file_system::Sha256Reader;
-use futures_util::io::AllowStdIo;
+use file_system::{OpenOptions, Sha256Reader};
+use futures_util::{io::AllowStdIo, Future};
 use kvproto::{
     brpb::{CipherInfo, File},
     metapb::Region,
@@ -45,6 +45,89 @@ impl From<CfName> for CfNameWrap {
 impl From<CfNameWrap> for CfName {
     fn from(w: CfNameWrap) -> CfName {
         w.0
+    }
+}
+
+pub struct CopyWriter<E: Send + 'static> {
+    ssts: Vec<SstMetaData>,
+    store_id: u64,
+    limiter: Limiter,
+    _encryption: CipherInfo,
+
+    _version_holder: Vec<Box<dyn LsmVersion>>,
+    _phantom: PhantomData<E>,
+}
+
+impl<E: SstExt + Send + 'static> CopyWriter<E> {
+    pub fn new(
+        ssts: Vec<SstMetaData>,
+        store_id: u64,
+        limiter: Limiter,
+        _encryption: CipherInfo,
+        _version_holder: Vec<Box<dyn LsmVersion>>,
+    ) -> Self {
+        Self {
+            ssts,
+            store_id,
+            limiter,
+            _encryption,
+            _version_holder,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub async fn save(mut self, storage: &dyn ExternalStorage) -> Result<Vec<File>> {
+        let tasks = std::mem::take(&mut self.ssts)
+            .into_iter()
+            .map(|sst_md| self.save_one(storage, sst_md))
+            .collect::<Vec<_>>();
+        let files = futures::future::try_join_all(tasks).await?;
+        Ok(files)
+    }
+
+    fn save_one<'a>(
+        &self,
+        ext_storage: &'a dyn ExternalStorage,
+        sst_md: SstMetaData,
+    ) -> impl Future<Output = Result<File>> + Send + 'a {
+        use engine_traits::SstReader;
+        let store_id = self.store_id;
+        let limiter = self.limiter.clone();
+
+        async move {
+            fail::fail_point!("file_backup_save_sst_metadata");
+            let now = Instant::now();
+            let file = OpenOptions::new().read(true).open(sst_md.abs_path)?;
+            let name = format!("{}/L{}_{}", store_id, sst_md.level, sst_md.name);
+
+            // TODO: rate limit, encryption, better file layout.
+            let reader = E::SstReader::open(&name)?;
+            // TODO: handle encrypted sst files.
+            reader.verify_checksum()?;
+            ext_storage
+                .write(
+                    &name,
+                    UnpinReader(Box::new(limiter.limit(AllowStdIo::new(file)))),
+                    sst_md.size,
+                )
+                .await?;
+            let mut out_file = File::new();
+            out_file.set_size(sst_md.size);
+            out_file.set_cf(sst_md.column_family.to_owned());
+            out_file.set_name(name);
+            BACKUP_RANGE_HISTOGRAM_VEC
+                .with_label_values(&["save-unchanged"])
+                .observe(now.saturating_elapsed_secs());
+            BACKUP_RANGE_SIZE_HISTOGRAM_VEC
+                .with_label_values(&[sst_md.column_family])
+                .observe(sst_md.size as f64);
+            BACKUP_FILE_LEVEL.observe(sst_md.level as f64);
+            Ok(out_file)
+        }
+    }
+
+    pub fn need_flush_keys(&self) -> bool {
+        !self.ssts.is_empty()
     }
 }
 
