@@ -4,7 +4,6 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     fmt,
-    fs::OpenOptions,
     sync::{atomic::*, mpsc, Arc, Mutex, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,13 +13,12 @@ use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{
     name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, LsmVersion, SstCompressionType,
-    SstMetaData, VersionedLsmExt, CF_DEFAULT, CF_WRITE, SstExt,
+    VersionedLsmExt, CF_DEFAULT, CF_WRITE,
 };
 use external_storage::{BackendConfig, HdfsConfig, UnpinReader};
 use external_storage_export::{create_storage, ExternalStorage};
-use file_system::Sha256Reader;
 use futures::{channel::mpsc::*, executor::block_on};
-use futures_util::{io::AllowStdIo, SinkExt};
+use futures_util::{SinkExt};
 use kvproto::{
     brpb::*,
     encryptionpb::EncryptionMethod,
@@ -29,7 +27,7 @@ use kvproto::{
 };
 use online_config::OnlineConfig;
 use raft::StateRole;
-use raftstore::{coprocessor::RegionInfoProvider, store::RegionReadProgressRegistry};
+use raftstore::coprocessor::RegionInfoProvider;
 use resource_control::{with_resource_limiter, ResourceGroupManager, ResourceLimiter};
 use tikv::{
     config::BackupConfig,

@@ -97,12 +97,16 @@ impl<E: SstExt + Send + 'static> CopyWriter<E> {
         async move {
             fail::fail_point!("file_backup_save_sst_metadata");
             let now = Instant::now();
-            let file = OpenOptions::new().read(true).open(sst_md.abs_path)?;
+            let file = OpenOptions::new().read(true).open(&sst_md.abs_path)?;
             let name = format!("{}/L{}_{}", store_id, sst_md.level, sst_md.name);
 
-            // TODO: rate limit, encryption, better file layout.
-            let reader = E::SstReader::open(&name)?;
             // TODO: handle encrypted sst files.
+            let reader = E::SstReader::open(
+                sst_md
+                    .abs_path
+                    .to_str()
+                    .expect("Deployed at non-utf-8 encodable path, which is unsupported."),
+            )?;
             reader.verify_checksum()?;
             ext_storage
                 .write(
