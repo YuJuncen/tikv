@@ -2,9 +2,15 @@
 
 use std::{thread, time::Duration};
 
+use engine_rocks::raw::CompactOptions;
+use engine_traits::CF_WRITE;
+use external_storage_export::make_local_backend;
 use futures::{executor::block_on, StreamExt};
-use kvproto::{brpb::Error_oneof_detail, kvrpcpb::*};
-use tempfile::Builder;
+use kvproto::{
+    brpb::{BackupMode, Error_oneof_detail},
+    kvrpcpb::*,
+};
+use tempfile::{Builder, TempDir};
 use test_backup::*;
 use txn_types::TimeStamp;
 
@@ -52,5 +58,29 @@ fn backup_blocked_by_memory_lock() {
     fail::remove("raftkv_async_write_finish");
     th.join().unwrap();
 
+    suite.stop();
+}
+
+#[test]
+fn test_file_based_backup_compaction() {
+    let mut suite = TestSuite::new(3, 144 * 1024 * 1024, ApiVersion::V1);
+    suite.must_kv_put(1_000, 4);
+    let ts = suite.alloc_ts();
+    let tmp = TempDir::new().unwrap();
+    fail::cfg("file_backup_save_sst_metadata", "pause").unwrap();
+    let resp = suite.backup_with(|req| {
+        req.set_end_version(ts.into_inner());
+        req.set_mode(BackupMode::File);
+        req.set_storage_backend(make_local_backend(tmp.path()));
+    });
+    for eng in suite.cluster.engines.values() {
+        let cf = eng.kv.as_inner().cf_handle(CF_WRITE).unwrap();
+        eng.kv.as_inner().compact_range_cf(cf, None, None);
+    }
+    fail::remove("file_backup_save_sst_metadata");
+
+    let resp = block_on(resp.collect::<Vec<_>>());
+    println!("{:?}", resp);
+    assert!(!resp[0].has_error());
     suite.stop();
 }

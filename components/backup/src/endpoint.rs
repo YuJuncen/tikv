@@ -4,7 +4,6 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     fmt,
-    fs::OpenOptions,
     sync::{atomic::*, mpsc, Arc, Mutex, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,13 +13,12 @@ use causal_ts::{CausalTsProvider, CausalTsProviderImpl};
 use concurrency_manager::ConcurrencyManager;
 use engine_traits::{
     name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, LsmVersion, SstCompressionType,
-    SstMetaData, VersionedLsmExt, CF_DEFAULT, CF_WRITE,
+    VersionedLsmExt, CF_DEFAULT, CF_WRITE,
 };
 use external_storage::{BackendConfig, HdfsConfig, UnpinReader};
 use external_storage_export::{create_storage, ExternalStorage};
-use file_system::Sha256Reader;
 use futures::{channel::mpsc::*, executor::block_on};
-use futures_util::{io::AllowStdIo, SinkExt};
+use futures_util::{SinkExt};
 use kvproto::{
     brpb::*,
     encryptionpb::EncryptionMethod,
@@ -29,7 +27,7 @@ use kvproto::{
 };
 use online_config::OnlineConfig;
 use raft::StateRole;
-use raftstore::{coprocessor::RegionInfoProvider, store::RegionReadProgressRegistry};
+use raftstore::coprocessor::RegionInfoProvider;
 use resource_control::{with_resource_limiter, ResourceGroupManager, ResourceLimiter};
 use tikv::{
     config::BackupConfig,
@@ -55,10 +53,11 @@ use txn_types::{Key, Lock, TimeStamp};
 use uuid::Uuid;
 
 use crate::{
+    flush_progress::Guardian,
     metrics::*,
     softlimit::{CpuStatistics, SoftLimit, SoftLimitByCpu},
     utils::{ControlThreadPool, KeyValueCodec},
-    writer::{BackupWriterBuilder, CfNameWrap},
+    writer::{BackupWriterBuilder, CfNameWrap, CopyWriter},
     Error, *,
 };
 
@@ -200,6 +199,7 @@ pub struct BackupRange {
 enum KvWriter<EK: KvEngine> {
     Txn(BackupWriter<EK>),
     Raw(BackupRawKvWriter<EK>),
+    Copy(CopyWriter<EK>),
 }
 
 impl<EK: KvEngine> std::fmt::Debug for KvWriter<EK> {
@@ -207,6 +207,7 @@ impl<EK: KvEngine> std::fmt::Debug for KvWriter<EK> {
         match self {
             Self::Txn(_) => f.debug_tuple("Txn").finish(),
             Self::Raw(_) => f.debug_tuple("Raw").finish(),
+            Self::Copy(..) => f.debug_tuple("Copy").finish(),
         }
     }
 }
@@ -216,6 +217,7 @@ impl<EK: KvEngine> KvWriter<EK> {
         match self {
             Self::Txn(writer) => writer.save(storage).await,
             Self::Raw(writer) => writer.save(storage).await,
+            Self::Copy(writer) => writer.save(storage).await,
         }
     }
 
@@ -223,13 +225,14 @@ impl<EK: KvEngine> KvWriter<EK> {
         match self {
             Self::Txn(writer) => writer.need_flush_keys(),
             Self::Raw(_) => true,
+            Self::Copy(writer) => writer.need_flush_keys(),
         }
     }
 }
 
 #[derive(Debug)]
 struct InMemBackupFiles<EK: KvEngine> {
-    files: BackupFile<EK>,
+    files: KvWriter<EK>,
     start_key: Vec<u8>,
     end_key: Vec<u8>,
     start_version: TimeStamp,
@@ -238,94 +241,12 @@ struct InMemBackupFiles<EK: KvEngine> {
     limiter: Option<Arc<ResourceLimiter>>,
 }
 
-enum BackupFile<EK: KvEngine> {
-    BuiltByScan(KvWriter<EK>),
-    NativeSsts(
-        Vec<SstMetaData>,
-        // Hold the version so files won't be GCed.
-        // Actually we won't use them again, the indirection won't be really harmful for
-        // performance.
-        Vec<Box<dyn LsmVersion + Send + 'static>>,
-    ),
-}
-
-impl<EK: KvEngine + fmt::Debug> fmt::Debug for BackupFile<EK> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BuiltByScan(arg0) => f.debug_tuple("BuiltByScan").field(arg0).finish(),
-            Self::NativeSsts(arg0, _) => f.debug_tuple("NativeSsts").field(arg0).finish(),
-        }
-    }
-}
-
-impl<EK: KvEngine> BackupFile<EK> {
-    async fn save(
-        self,
-        ext_storage: &dyn ExternalStorage,
-        native_sst_prefix: &str,
-    ) -> Result<Vec<File>> {
-        match self {
-            BackupFile::BuiltByScan(wrt) => wrt.save(ext_storage).await,
-            BackupFile::NativeSsts(sst_mds, _versions) => {
-                let tasks = sst_mds
-                    .into_iter()
-                    .map(|sst_md| Self::save_sst_metadata(ext_storage, native_sst_prefix, sst_md));
-                let files = futures::future::try_join_all(tasks).await?;
-                Ok(files)
-            }
-        }
-    }
-
-    async fn save_sst_metadata(
-        ext_storage: &dyn ExternalStorage,
-        prefix: &str,
-        sst_md: SstMetaData,
-    ) -> Result<File> {
-        let file = OpenOptions::new().read(true).open(sst_md.abs_path)?;
-        let (checksumed_file, hasher) =
-            Sha256Reader::new(file).map_err(|err| Error::Other(format!("{err}").into()))?;
-        let name = format!("{}_{}", prefix, sst_md.name);
-        // TODO: rate limit, encryption, better file layout.
-        ext_storage
-            .write(
-                &name,
-                UnpinReader(Box::new(AllowStdIo::new(checksumed_file))),
-                sst_md.size,
-            )
-            .await?;
-        let hash = hasher
-            .lock()
-            .unwrap()
-            .finish()
-            .map(|d| d.to_vec())
-            .unwrap_or_else(|err| {
-                warn!("cannot hash for file"; "file" => %name, "err" => %err);
-                Default::default()
-            });
-        let mut out_file = File::new();
-        out_file.set_size(sst_md.size);
-        out_file.set_sha256(hash);
-        out_file.set_cf(sst_md.column_family.to_owned());
-        out_file.set_name(name);
-        Ok(out_file)
-    }
-
-    fn need_flush_keys(&self) -> bool {
-        match self {
-            BackupFile::BuiltByScan(wrt) => wrt.need_flush_keys(),
-            BackupFile::NativeSsts(ssts, _) => !ssts.is_empty(),
-        }
-    }
-}
-
 async fn save_backup_file_worker<EK: KvEngine>(
     rx: async_channel::Receiver<InMemBackupFiles<EK>>,
     tx: UnboundedSender<BackupResponse>,
     storage: Arc<dyn ExternalStorage>,
     codec: KeyValueCodec,
-    store_id: u64,
 ) {
-    let file_prefix = format!("{store_id}");
 
     while let Ok(msg) = rx.recv().await {
         let send_and_log_error = |resp| {
@@ -381,9 +302,7 @@ async fn save_backup_file_worker<EK: KvEngine>(
             Result::Ok(files)
         };
 
-        let files = match with_resource_limiter(msg.files.save(&storage, &file_prefix), msg.limiter)
-            .await
-        {
+        let files = match with_resource_limiter(msg.files.save(&storage), msg.limiter).await {
             Ok(split_files) => convert_key_range(split_files),
             Err(e) => {
                 error_unknown!(?e; "backup save file failed");
@@ -483,38 +402,26 @@ impl BackupRange {
         Ok(snapshot)
     }
 
-    async fn backup_files<E: Engine>(
+    async fn backup_files<E: Engine, G: Guardian>(
         &self,
         mut engine: E,
         db: E::Local,
         backup_ts: TimeStamp,
         cm: &ConcurrencyManager,
         saver: async_channel::Sender<InMemBackupFiles<E::Local>>,
-        progress: &flush_progress::Advancer<E::Local>,
+        guardian: &G,
         limiter: Option<Arc<ResourceLimiter>>,
+        rate_limiter: Limiter,
+        store_id: u64,
     ) -> Result<()> {
         // Firstly, create a snapshot to making sure out leadership (at least
         // consistency).
         let _snap = self.take_snapshot(&mut engine, backup_ts, cm)?;
         let mut ssts = vec![];
-        let mut version_holders: Vec<Box<dyn LsmVersion + Send + 'static>> = vec![];
+        let mut version_holders: Vec<Box<dyn LsmVersion>> = vec![];
         let r = &self.region;
-        progress.with(|prog| {
-            if prog.check_resolved_ts(r.get_id(), backup_ts).is_err() {
-                let begin = Instant::now();
-                prog.advance_progress()?;
-                metrics::BACKUP_FILE_FLUSH_DURATION.observe(begin.saturating_elapsed_secs());
-            }
-            if let Err(reason) = prog.check_resolved_ts(r.get_id(), backup_ts) {
-                prog.hint_advance_resolved_ts(r.get_id());
-                return Result::Err(Error::Other(box_err!(
-                    "resolved ts not ready for region {}, reason is {:?}",
-                    r.get_id(),
-                    reason
-                )));
-            }
-            Result::Ok(())
-        })?;
+
+        guardian.ensure(r.id, backup_ts)?;
         let begin = Instant::now();
         for cf in [CF_DEFAULT, CF_WRITE] {
             let version = db.lock_current_version(cf)?;
@@ -537,10 +444,12 @@ impl BackupRange {
             }
             version_holders.push(Box::new(version));
         }
-        metrics::BACKUP_FILE_FIND_FILE_DURATION.observe(begin.saturating_elapsed_secs());
+        metrics::BACKUP_RANGE_HISTOGRAM_VEC
+            .with_label_values(&["find_file"])
+            .observe(begin.saturating_elapsed_secs());
         metrics::BACKUP_FILE_FILES_PER_REGION.observe(ssts.len() as f64);
         let in_mem_file = InMemBackupFiles {
-            files: BackupFile::NativeSsts(ssts, version_holders),
+            files: KvWriter::Copy(CopyWriter::new(ssts, store_id, rate_limiter, CipherInfo::new(), version_holders)),
             start_key: self
                 .start_key
                 .to_owned()
@@ -624,7 +533,7 @@ impl BackupRange {
                 )?;
                 let this_start_key = next_file_start_key.clone();
                 let msg = InMemBackupFiles {
-                    files: BackupFile::BuiltByScan(KvWriter::Txn(writer)),
+                    files: KvWriter::Txn(writer),
                     start_key: this_start_key,
                     end_key: this_end_key.clone(),
                     start_version: begin_ts,
@@ -668,7 +577,7 @@ impl BackupRange {
             .observe(take);
 
         let msg = InMemBackupFiles {
-            files: BackupFile::BuiltByScan(KvWriter::Txn(writer)),
+            files: KvWriter::Txn(writer),
             start_key: next_file_start_key,
             end_key: self
                 .end_key
@@ -805,7 +714,7 @@ impl BackupRange {
         let start_key = self.codec.decode_backup_key(self.start_key.clone())?;
         let end_key = self.codec.decode_backup_key(self.end_key.clone())?;
         let msg = InMemBackupFiles {
-            files: BackupFile::BuiltByScan(KvWriter::Raw(writer)),
+            files: KvWriter::Raw(writer),
             start_key,
             end_key,
             start_version: TimeStamp::zero(),
@@ -900,7 +809,8 @@ impl SoftLimitKeeper {
 /// The endpoint of backup.
 ///
 /// It coordinates backup tasks and dispatches them to different workers.
-pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
+pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static, G: flush_progress::Guardian>
+{
     store_id: u64,
     pool: RefCell<ControlThreadPool>,
     io_pool: Runtime,
@@ -915,7 +825,7 @@ pub struct Endpoint<E: Engine, R: RegionInfoProvider + Clone + 'static> {
     pub(crate) engine: E,
     pub(crate) region_info: R,
 
-    flush_prog: flush_progress::Advancer<E::Local>,
+    flush_prog: G,
 }
 
 /// The progress of a backup task
@@ -1057,7 +967,9 @@ impl<R: RegionInfoProvider> Progress<R> {
     }
 }
 
-impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
+impl<E: Engine, R: RegionInfoProvider + Clone + 'static, G: flush_progress::Guardian>
+    Endpoint<E, R, G>
+{
     pub fn new(
         store_id: u64,
         engine: E,
@@ -1067,17 +979,14 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
         concurrency_manager: ConcurrencyManager,
         api_version: ApiVersion,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
-        read_progress: RegionReadProgressRegistry,
+        flush_prog: G,
         resource_ctl: Option<Arc<ResourceGroupManager>>,
-    ) -> Endpoint<E, R> {
+    ) -> Endpoint<E, R, G> {
         let pool = ControlThreadPool::new();
         let rt = utils::create_tokio_runtime(config.io_thread_size, "backup-io").unwrap();
         let config_manager = ConfigManager(Arc::new(RwLock::new(config)));
         let softlimit = SoftLimitKeeper::new(config_manager.clone());
         rt.spawn(softlimit.clone().run());
-        // TODO: handle v2.
-        let prog = flush_progress::AdvancerCore::new(read_progress, engine.kv_engine().unwrap());
-        let flush_prog = flush_progress::Advancer::new(prog);
         Endpoint {
             store_id,
             engine,
@@ -1237,6 +1146,8 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             saver_tx.clone(),
                             &prog,
                             resource_limiter.clone(),
+                            request.limiter.clone(),
+                            store_id, 
                         ).await;
                         res.map(|_| Statistics::default())
                     };
@@ -1365,13 +1276,14 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                 resp.clone(),
                 backend.clone(),
                 codec,
-                self.store_id,
             ));
         }
     }
 }
 
-impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Runnable for Endpoint<E, R> {
+impl<E: Engine, R: RegionInfoProvider + Clone + 'static, G: Guardian> Runnable
+    for Endpoint<E, R, G>
+{
     type Task = Operation;
 
     fn run(&mut self, op: Operation) {
@@ -1644,7 +1556,10 @@ pub mod tests {
         }
     }
 
-    pub fn new_endpoint() -> (TempDir, Endpoint<RocksEngine, MockRegionInfoProvider>) {
+    pub fn new_endpoint() -> (
+        TempDir,
+        Endpoint<RocksEngine, MockRegionInfoProvider, flush_progress::SafePlace>,
+    ) {
         new_endpoint_with_limiter(None, ApiVersion::V1, false, None)
     }
 
@@ -1653,7 +1568,10 @@ pub mod tests {
         api_version: ApiVersion,
         is_raw_kv: bool,
         causal_ts_provider: Option<Arc<CausalTsProviderImpl>>,
-    ) -> (TempDir, Endpoint<RocksEngine, MockRegionInfoProvider>) {
+    ) -> (
+        TempDir,
+        Endpoint<RocksEngine, MockRegionInfoProvider, flush_progress::SafePlace>,
+    ) {
         let temp = TempDir::new().unwrap();
         let rocks = TestEngineBuilder::new()
             .path(temp.path())
@@ -1685,7 +1603,7 @@ pub mod tests {
                 concurrency_manager,
                 api_version,
                 causal_ts_provider,
-                RegionReadProgressRegistry::new(),
+                flush_progress::SafePlace,
                 None,
             ),
         )

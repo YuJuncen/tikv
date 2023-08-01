@@ -1,10 +1,13 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
 use std::{cmp::Ordering, collections::BinaryHeap};
 
+use codec::prelude::NumberDecoder;
 use engine_rocks::RocksSstIterator;
 use engine_traits::Iterator;
 use keys::validate_data_key;
 use txn_types::{Key, TimeStamp, WriteRef, WriteType};
+
+use crate::{Error, Result};
 
 use crate::{Error, Result};
 

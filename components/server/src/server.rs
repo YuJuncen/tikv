@@ -1161,6 +1161,11 @@ where
             .unwrap()
             .region_read_progress
             .clone();
+        let prog = backup::flush_progress::AdvancerCore::new(
+            region_read_progress,
+            engines.engine.kv_engine().unwrap(),
+        );
+        let flush_prog = backup::flush_progress::Advancer::new(prog);
         let backup_endpoint = backup::Endpoint::new(
             servers.node.id(),
             engines.engine.clone(),
@@ -1170,7 +1175,7 @@ where
             self.concurrency_manager.clone(),
             self.core.config.storage.api_version(),
             self.causal_ts_provider.clone(),
-            region_read_progress,
+            flush_prog,
             self.resource_manager.clone(),
         );
         self.cfg_controller.as_mut().unwrap().register(

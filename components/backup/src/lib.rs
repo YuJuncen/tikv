@@ -7,7 +7,6 @@ extern crate tikv_alloc;
 
 mod endpoint;
 mod errors;
-mod flush_progress;
 mod metrics;
 mod service;
 mod softlimit;
@@ -18,3 +17,5 @@ pub use endpoint::{backup_file_name, Endpoint, Operation, Task};
 pub use errors::{Error, Result};
 pub use service::Service;
 pub use writer::{BackupRawKvWriter, BackupWriter};
+
+pub mod flush_progress;
