@@ -265,6 +265,11 @@ impl ImportDir {
         self.get_import_path(file_name.to_str().unwrap())
     }
 
+    pub fn save_path_with_cf(&self, meta: &SstMeta, cf_name: &str) -> Result<PathBuf> {
+        let file_name = sst_meta_with_cf_name_to_path(meta, cf_name)?;
+        Ok(self.root_dir.join(file_name))
+    }
+
     pub fn create(
         &self,
         meta: &SstMeta,
@@ -467,6 +472,18 @@ pub fn sst_meta_to_path(meta: &SstMeta) -> Result<PathBuf> {
         meta.get_region_epoch().get_conf_ver(),
         meta.get_region_epoch().get_version(),
         meta.get_cf_name(),
+        SST_SUFFIX,
+    )))
+}
+
+pub fn sst_meta_with_cf_name_to_path(meta: &SstMeta, cf_name: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(format!(
+        "{}_{}_{}_{}_{}{}",
+        UuidBuilder::from_slice(meta.get_uuid())?.build(),
+        meta.get_region_id(),
+        meta.get_region_epoch().get_conf_ver(),
+        meta.get_region_epoch().get_version(),
+        cf_name,
         SST_SUFFIX,
     )))
 }

@@ -5,7 +5,9 @@ use codec::prelude::NumberDecoder;
 use engine_rocks::RocksSstIterator;
 use engine_traits::Iterator;
 use keys::validate_data_key;
-use txn_types::{Key, TimeStamp};
+use txn_types::{Key, TimeStamp, WriteRef, WriteType};
+
+use crate::{Error, Result};
 
 use crate::{Error, Result};
 
@@ -499,44 +501,44 @@ impl<I: Iterator> SstEntryScanner<I> {
         self.write_iter.next().map_err(Error::from)
     }
 
-    // NOTICE: equivalent to WriteRef::parse, but only parse one field.
-    fn start_ts(&self) -> Result<TimeStamp> {
-        let val = self.write_iter.value();
-        let mut start_ts_pos = &val[1..];
-        start_ts_pos
-            .read_var_u64()
-            .map(|ts| ts.into())
-            .map_err(|e| {
-                Error::BadFormat(format!(
-                    "write {}: {}",
-                    log_wrappers::Value::key(keys::origin_key(self.write_iter.key())),
-                    e
-                ))
-            })
+    pub fn next_default(&mut self) -> Result<bool> {
+        self.default_iter.next().map_err(Error::from)
     }
 
-    fn write_valid(&self) -> Result<bool> {
+    // NOTICE: equivalent to WriteRef::parse, but only parse one field.
+    fn start_ts(&self) -> Result<Option<TimeStamp>> {
+        let val = self.write_iter.value();
+        let write_ref = WriteRef::parse(val).map_err(|e| {
+            Error::BadFormat(format!(
+                "write {}: {}",
+                log_wrappers::Value::key(keys::origin_key(self.write_iter.key())),
+                e
+            ))
+        })?;
+
+        if write_ref.write_type == WriteType::Put && write_ref.short_value.is_none() {
+            return Ok(Some(write_ref.start_ts))
+        }
+
+        Ok(None)
+    }
+
+    pub fn write_valid(&self) -> Result<bool> {
         self.write_iter.valid().map_err(Error::from)
     }
 
     // equal to Iterator::valid(), and advance the default iter.
     pub fn read(&mut self) -> Result<bool> {
-        if !self.write_valid()? {
-            return Ok(false);
-        }
         let (wkey, commit_ts) = Key::split_on_ts_for(self.write_iter.key())?;
-        let start_ts = self.start_ts()?;
-        println!(
-            "read write key: {}, commit_ts: {}, start_ts: {}",
-            log_wrappers::Value::key(wkey),
-            commit_ts,
-            start_ts
-        );
+        let start_ts = match self.start_ts()? {
+            Some(ts) => ts,
+            None => return Ok(false),
+        };
         // seek to the same user key from default
         loop {
             if !self.default_iter.valid()? {
                 return Err(Error::Engine(box_err!(
-                    "default not found. key: {}, ts: {}",
+                    "default not found(end). key: {}, ts: {}",
                     log_wrappers::Value::key(wkey),
                     commit_ts
                 )));
@@ -546,9 +548,12 @@ impl<I: Iterator> SstEntryScanner<I> {
                 (Ordering::Equal, Ordering::Equal) => return Ok(true),
                 (Ordering::Greater, _) | (Ordering::Equal, Ordering::Less) => {
                     return Err(Error::Engine(box_err!(
-                        "default not found. key: {}, ts: {}",
+                        "default not found(not match). key: {}, cts: {}, sts: {}, next dkey: {}, next ts: {}",
                         log_wrappers::Value::key(wkey),
-                        commit_ts
+                        commit_ts,
+                        start_ts,
+                        log_wrappers::Value::key(dkey),
+                        dstart_ts
                     )));
                 }
                 (Ordering::Less, _) | (Ordering::Equal, Ordering::Greater) => {

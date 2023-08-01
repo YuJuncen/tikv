@@ -539,6 +539,17 @@ impl SstImporter {
         Ok(res)
     }
 
+    fn generate_sst_meta_from_basic(
+        sst: &SstMeta,
+        cf_name: CfName,
+        range: Range,
+    ) -> SstMeta {
+        let mut dst_sst = sst.clone();
+        dst_sst.set_cf_name(cf_name.to_string());
+        dst_sst.set_range(range);
+        dst_sst
+    }
+
     pub async fn download_file_ext<E: KvEngine>(
         &self,
         basic_meta: &SstMeta,
@@ -559,8 +570,6 @@ impl SstImporter {
         );
         let mut sst_default_readers = Vec::new();
         let mut sst_write_readers = Vec::new();
-        let mut dst_default = None;
-        let mut dst_write = None;
         let mut clean_path = Vec::new();
         for (name, meta) in metas {
             let path = self.dir.join(meta)?;
@@ -580,15 +589,9 @@ impl SstImporter {
             // now validate the SST file.
             let sst_reader = self.generate_sst_reader_with_verify(&dst_file_name)?;
             if meta.get_cf_name() == CF_WRITE {
-                if dst_write.is_none() {
-                    dst_write = Some((path.save.to_str().unwrap().to_string(), meta.clone()));
-                }
                 clean_path.push(path.temp);
                 sst_write_readers.push(sst_reader);
             } else if meta.get_cf_name() == CF_DEFAULT {
-                if dst_default.is_none() {
-                    dst_default = Some((path.save.to_str().unwrap().to_string(), meta.clone()));
-                }
                 clean_path.push(path.temp);
                 sst_default_readers.push(sst_reader);
             } else {
@@ -613,37 +616,35 @@ impl SstImporter {
             do_pre_rewrite(basic_meta, rewrite_rule, ext.req_type).await?;
 
         let mut res_sst = Vec::new();
-        if let (
-            Some((default_file_name, mut default_sst)),
-            Some((write_file_name, mut write_sst)),
-        ) = (dst_default, dst_write)
-        {
-            let res = self
-                .do_file_rewrite(
-                    &default_file_name,
-                    &write_file_name,
-                    rewrite_rule,
-                    &range_start,
-                    &range_end,
-                    SstEntryScanner::new(default_iter, write_iter),
-                    engine,
-                    ext.req_type,
-                    move || {
-                        for p in clean_path {
-                            let _ = file_system::remove_file(p);
-                        }
-                    },
-                )
-                .await?;
-            if let Some((range, default_info, write_info)) = res {
-                default_sst.set_total_bytes(default_info.file_size());
-                default_sst.set_total_kvs(write_info.num_entries());
-                default_sst.set_range(range.clone());
-                res_sst.push(default_sst);
-                write_sst.set_total_bytes(write_info.file_size());
-                write_sst.set_total_kvs(write_info.num_entries());
-                write_sst.set_range(range);
-                res_sst.push(write_sst);
+        if sst_write_readers.is_empty() {
+            warn!("nothing to rewrite"; "sst" => ?metas);
+            return Ok(res_sst);
+        }
+
+        let default_file_name = self.dir.save_path_with_cf(basic_meta, CF_DEFAULT)?.to_str().unwrap().to_string();
+        let write_file_name = self.dir.save_path_with_cf(basic_meta, CF_WRITE)?.to_str().unwrap().to_string();
+        let mut iter = SstEntryScanner::new(default_iter, write_iter);
+        let res = self
+            .do_file_rewrite(
+                &default_file_name,
+                &write_file_name,
+                rewrite_rule,
+                &range_start,
+                &range_end,
+                &mut iter,
+                engine,
+                ext.req_type,
+                move || {
+                    for p in clean_path {
+                        let _ = file_system::remove_file(p);
+                    }
+                },
+            )
+            .await?;
+        if let Some((write_range, default_range_op)) = res {
+            res_sst.push(Self::generate_sst_meta_from_basic(basic_meta, CF_WRITE, write_range));
+            if let Some(default_range) = default_range_op {
+                res_sst.push(Self::generate_sst_meta_from_basic(basic_meta, CF_DEFAULT, default_range));
             }
         }
 
@@ -1558,7 +1559,7 @@ impl SstImporter {
         rewrite_rule: &'a RewriteRule,
         range_start: &'a Bound<Vec<u8>>,
         range_end: &'a Bound<Vec<u8>>,
-        mut iter: SstEntryScanner<I>,
+        iter: &'a mut SstEntryScanner<I>,
         engine: E,
         req_type: DownloadRequestType,
         clean_files: F,
@@ -1566,8 +1567,7 @@ impl SstImporter {
         Output = Result<
             Option<(
                 Range,
-                <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileInfo,
-                <<E as SstExt>::SstWriter as SstWriter>::ExternalSstFileInfo,
+                Option<Range>,
             )>,
         >,
     > + 'a
@@ -1581,9 +1581,11 @@ impl SstImporter {
             let old_prefix = rewrite_rule.get_old_key_prefix();
             let new_prefix = rewrite_rule.get_new_key_prefix();
             // perform iteration and key rewrite.
-            let mut entry_rewrite = EntryRewrite::new(new_prefix, old_prefix.len(), req_type);
+            let mut write_entry_rewrite = EntryRewrite::new(new_prefix, old_prefix.len(), req_type);
+            let mut default_entry_rewrite = EntryRewrite::new(new_prefix, old_prefix.len(), req_type);
 
-            let mut first_key = None;
+            let mut first_write_key = None;
+            let mut first_default_key = None;
 
             match range_start {
                 Bound::Unbounded => iter.seek_to_first()?,
@@ -1609,27 +1611,36 @@ impl SstImporter {
             let mut yield_check =
                 RescheduleChecker::new(tokio::task::yield_now, Duration::from_millis(10));
             let mut count = 0;
-            while iter.read()? {
+            while iter.write_valid()? {
                 let (old_key, ts) =
                     match Self::adjust_key(iter.write_key(), old_prefix, range_end, req_type)? {
                         None => break,
                         Some(r) => r,
                     };
-                let key = entry_rewrite.rewrite_key(&old_key, ts);
+                let key = write_entry_rewrite.rewrite_key(&old_key, ts);
                 sst_write_writer.put(key, iter.write_value())?;
+                if first_write_key.is_none() {
+                    first_write_key = Some(keys::origin_key(key).to_vec());
+                }
 
-                let (old_key, ts) =
-                    match Self::adjust_key(iter.default_key(), old_prefix, range_end, req_type)? {
-                        None => {
-                            return Err(Error::Engine(box_err!(
-                                "default key not found: {}",
-                                log_wrappers::Value::key(iter.write_key())
-                            )));
-                        }
-                        Some(r) => r,
+                if iter.read()? {
+                    let (old_key, ts) =
+                        match Self::adjust_key(iter.default_key(), old_prefix, range_end, req_type)? {
+                            None => {
+                                return Err(Error::Engine(box_err!(
+                                    "default key not found: {}",
+                                    log_wrappers::Value::key(iter.write_key())
+                                )));
+                            }
+                            Some(r) => r,
                     };
-                let key = entry_rewrite.rewrite_key(&old_key, ts);
-                sst_default_writer.put(key, iter.default_value())?;
+                    let key = default_entry_rewrite.rewrite_key(&old_key, ts);
+                    sst_default_writer.put(key, iter.default_value())?;
+                    iter.next_default()?;
+                    if first_default_key.is_none() {
+                        first_default_key = Some(keys::origin_key(key).to_vec());
+                    }
+                }
 
                 count += 1;
                 if count >= 1024 {
@@ -1637,9 +1648,6 @@ impl SstImporter {
                     yield_check.check().await;
                 }
                 iter.next_write()?;
-                if first_key.is_none() {
-                    first_key = Some(keys::origin_key(entry_rewrite.data_key()).to_vec());
-                }
             }
 
             clean_files();
@@ -1648,18 +1656,34 @@ impl SstImporter {
                 .with_label_values(&["rewrite"])
                 .observe(start_rename_rewrite.saturating_elapsed().as_secs_f64());
 
-            if let Some(start_key) = first_key {
+            if let Some(start_write_key) = first_write_key {
                 let start_finish = Instant::now();
-                let info_default = sst_default_writer.finish()?;
-                let info_write = sst_write_writer.finish()?;
+
+                let write_range = {
+                    sst_write_writer.finish()?;
+                
+                    let mut final_range = Range::default();
+                    final_range.set_start(start_write_key);
+                    final_range.set_end(keys::origin_key(write_entry_rewrite.data_key()).to_vec());
+                    final_range
+                };
+
+                let default_range = if let Some(start_default_key) = first_default_key {
+                    sst_default_writer.finish()?;
+
+                    let mut final_range = Range::default();
+                    final_range.set_start(start_default_key);
+                    final_range.set_end(keys::origin_key(default_entry_rewrite.data_key()).to_vec());
+                    Some(final_range)
+                } else {
+                    None
+                };
+
                 IMPORTER_DOWNLOAD_DURATION
                     .with_label_values(&["finish"])
                     .observe(start_finish.saturating_elapsed().as_secs_f64());
 
-                let mut final_range = Range::default();
-                final_range.set_start(start_key);
-                final_range.set_end(keys::origin_key(entry_rewrite.data_key()).to_vec());
-                Ok(Some((final_range, info_default, info_write)))
+                Ok(Some((write_range, default_range)))
             } else {
                 // nothing is written: prevents finishing the SST at all.
                 Ok(None)
