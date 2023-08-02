@@ -19,7 +19,7 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use encryption::{to_engine_encryption_method, DataKeyManager};
 use engine_rocks::{get_env, RocksSstReader};
 use engine_traits::{
-    name_to_cf, util::check_key_in_range, CfName, EncryptionKeyManager, ExternalSstFileInfo,
+    name_to_cf, util::check_key_in_range, CfName, EncryptionKeyManager,
     FileEncryptionInfo, IterOptions, Iterator, KvEngine, RefIterable, SstCompressionType, SstExt,
     SstMetaInfo, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT, CF_WRITE,
 };
@@ -642,10 +642,10 @@ impl SstImporter {
             )
             .await?;
         if let Some((write_range, default_range_op)) = res {
-            res_sst.push(Self::generate_sst_meta_from_basic(basic_meta, CF_WRITE, write_range));
             if let Some(default_range) = default_range_op {
                 res_sst.push(Self::generate_sst_meta_from_basic(basic_meta, CF_DEFAULT, default_range));
             }
+            res_sst.push(Self::generate_sst_meta_from_basic(basic_meta, CF_WRITE, write_range));
         }
 
         Ok(res_sst)
