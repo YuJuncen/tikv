@@ -15,7 +15,7 @@ use engine_traits::{
     name_to_cf, raw_ttl::ttl_current_ts, CfName, KvEngine, LsmVersion, SstCompressionType,
     VersionedLsmExt, CF_DEFAULT, CF_WRITE,
 };
-use external_storage::{BackendConfig, HdfsConfig, UnpinReader};
+use external_storage::{BackendConfig, HdfsConfig};
 use external_storage_export::{create_storage, ExternalStorage};
 use futures::{channel::mpsc::*, executor::block_on};
 use futures_util::{SinkExt};
@@ -439,7 +439,7 @@ impl BackupRange {
                         .unwrap_or_default(),
                 ),
             )?;
-            for file in files {
+            for file in dbg!(files) {
                 ssts.push(file);
             }
             version_holders.push(Box::new(version));
@@ -448,17 +448,20 @@ impl BackupRange {
             .with_label_values(&["find_file"])
             .observe(begin.saturating_elapsed_secs());
         metrics::BACKUP_FILE_FILES_PER_REGION.observe(ssts.len() as f64);
+        ssts.retain(|sst| {
+            sst.mvcc_properties.as_ref().map(|mvcc| mvcc.min_ts <= backup_ts).unwrap_or(true)
+        });
         let in_mem_file = InMemBackupFiles {
             files: KvWriter::Copy(CopyWriter::new(ssts, store_id, rate_limiter, CipherInfo::new(), version_holders)),
             start_key: self
                 .start_key
                 .to_owned()
-                .map(|k| k.into_raw().unwrap())
+                .and_then(|k| k.into_raw().ok())
                 .unwrap_or_default(),
             end_key: self
                 .end_key
                 .to_owned()
-                .map(|k| k.into_raw().unwrap())
+                .and_then(|k| k.into_raw().ok())
                 .unwrap_or_default(),
             start_version: TimeStamp::zero(),
             end_version: backup_ts,

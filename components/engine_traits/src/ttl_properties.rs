@@ -2,7 +2,7 @@
 
 use crate::errors::Result;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TtlProperties {
     pub max_expire_ts: Option<u64>,
     pub min_expire_ts: Option<u64>,

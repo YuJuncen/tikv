@@ -114,8 +114,12 @@ impl Iterator for PanicEngineIterator {
 pub struct PanicVersion;
 
 impl LsmVersion for PanicVersion {
-    fn get_all_files(&self) -> std::result::Result<Vec<SstMetaData>, String> {
-        unimplemented!()
+    fn get_files_in_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+    ) -> std::result::Result<Vec<SstMetaData>, String> {
+        panic!()
     }
 }
 

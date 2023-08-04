@@ -514,7 +514,7 @@ impl<I: Iterator> SstEntryScanner<I> {
         })?;
 
         if write_ref.write_type == WriteType::Put && write_ref.short_value.is_none() {
-            return Ok(Some(write_ref.start_ts))
+            return Ok(Some(write_ref.start_ts));
         }
 
         Ok(None)

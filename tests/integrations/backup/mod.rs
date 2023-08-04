@@ -648,5 +648,38 @@ fn test_file_based_backup() {
     });
     let resp = block_on(resp.collect::<Vec<_>>());
     println!("{:?}", resp);
-    assert!(!resp[0].has_error());
+    assert_eq!(resp.len(), 10);
+    for (i, r) in resp.into_iter().enumerate() {
+        assert!(!r.has_error(), "resp[{}] = {:?}", i, r);
+    }
+    suite.stop();
+}
+
+#[test]
+fn test_file_based_backup_filter_out_l0() {
+    let mut suite = TestSuite::new(3, 144 * 1024 * 1024, ApiVersion::V1);
+    suite.must_kv_put(1_000, 4);
+    suite.flush_cf(CF_WRITE);
+    let ts = suite.alloc_ts();
+    suite.must_kv_put(2_000, 4);
+    suite.flush_cf(CF_WRITE);
+    let tmp = TempDir::new().unwrap();
+    let resp = suite.backup_with(|req| {
+        req.set_end_version(ts.into_inner());
+        req.set_mode(BackupMode::File);
+        req.set_storage_backend(make_local_backend(tmp.path()));
+    });
+    let resp = block_on(resp.collect::<Vec<_>>());
+    println!("{:?}", resp);
+    for (i, r) in resp.into_iter().enumerate() {
+        assert!(!r.has_error(), "resp[{}] = {:?}", i, r);
+        assert_eq!(
+            r.files.iter().filter(|file| file.cf == CF_WRITE).count(),
+            1,
+            "resp[{}] = {:?}",
+            i,
+            r
+        );
+    }
+    suite.stop();
 }

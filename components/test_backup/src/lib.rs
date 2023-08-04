@@ -9,9 +9,12 @@ use std::{
 };
 
 use api_version::{dispatch_api_version, keyspace::KvPair, ApiV1, KvFormat, RawValue};
-use backup::{Operation, Task};
+use backup::{
+    flush_progress::{Advancer, AdvancerCore},
+    Operation, Task,
+};
 use collections::HashMap;
-use engine_traits::{CfName, IterOptions, CF_DEFAULT, CF_WRITE, DATA_KEY_PREFIX_LEN};
+use engine_traits::{CfName, IterOptions, MiscExt, CF_DEFAULT, CF_WRITE, DATA_KEY_PREFIX_LEN};
 use external_storage_export::make_local_backend;
 use futures::{channel::mpsc as future_mpsc, executor::block_on};
 use grpcio::{ChannelBuilder, Environment};
@@ -119,7 +122,14 @@ impl TestSuite {
                 sim.security_mgr.clone(),
             );
             worker.start(rts_endpoint);
-
+            let advancer = Advancer::new(AdvancerCore::new(
+                cluster.store_metas[id]
+                    .lock()
+                    .unwrap()
+                    .region_read_progress
+                    .clone(),
+                engines.kv.clone(),
+            ));
             // Create and run backup endpoints.
             let backup_endpoint = backup::Endpoint::new(
                 *id,
@@ -135,11 +145,7 @@ impl TestSuite {
                 sim.get_concurrency_manager(*id),
                 api_version,
                 None,
-                cluster.store_metas[id]
-                    .lock()
-                    .unwrap()
-                    .region_read_progress
-                    .clone(),
+                advancer,
                 None,
             );
             let mut worker = bg_worker.lazy_build(format!("backup-{}", id));
@@ -480,6 +486,12 @@ impl TestSuite {
         req.set_ranges(protobuf::RepeatedField::from_vec(vec![range]));
         let response = self.tikv_cli.raw_checksum(&req).unwrap();
         (response.checksum, response.total_kvs, response.total_bytes)
+    }
+
+    pub fn flush_cf(&self, cf: CfName) {
+        for eng in self.cluster.engines.values() {
+            eng.kv.flush_cf(cf, true).expect("failed to flush");
+        }
     }
 }
 

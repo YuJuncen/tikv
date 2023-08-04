@@ -6,7 +6,7 @@ use txn_types::TimeStamp;
 
 use crate::TtlProperties;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvccProperties {
     pub min_ts: TimeStamp,     // The minimal timestamp.
     pub max_ts: TimeStamp,     // The maximal timestamp.
