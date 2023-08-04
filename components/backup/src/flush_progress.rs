@@ -20,6 +20,8 @@ pub trait Guardian: Send + Sync + Clone + 'static {
 }
 
 #[derive(Clone, Copy)]
+/// Where the user believe all files should already be flushed.
+/// We will skip all checking.
 pub struct SafePlace;
 
 impl Guardian for SafePlace {
@@ -48,7 +50,7 @@ impl<E: MiscExt + Send + Sync + 'static> Guardian for Advancer<E> {
         self.with(|prog| {
             if prog.check_resolved_ts(r, target_rts).is_err() {
                 let begin = Instant::now();
-                prog.advance_progress()?;
+                prog.advance_progress(r, target_rts)?;
                 metrics::BACKUP_RANGE_HISTOGRAM_VEC
                     .with_label_values(&["flush"])
                     .observe(begin.saturating_elapsed_secs());
@@ -158,7 +160,11 @@ impl<E> AdvancerCore<E> {
 }
 
 impl<E: MiscExt> AdvancerCore<E> {
-    pub fn advance_progress(&mut self) -> crate::errors::Result<()> {
+    pub fn advance_progress(
+        &mut self,
+        region: u64,
+        resolved_ts: TimeStamp,
+    ) -> crate::errors::Result<()> {
         let current = self.read_progress.with(|r| {
             r.iter()
                 .map(|(id, prog)| {
@@ -171,6 +177,17 @@ impl<E: MiscExt> AdvancerCore<E> {
                 })
                 .collect::<HashMap<_, _>>()
         });
+        if current
+            .get(&region)
+            .map(|prog| prog.resolved_ts < resolved_ts)
+            .unwrap_or(true)
+        {
+            return Err(Error::Other(box_err!(
+                "the region {} is not resolved to {}",
+                region,
+                resolved_ts
+            )));
+        }
         self.engine.flush_cfs(&[CF_DEFAULT, CF_WRITE], true)?;
         self.last_flush = current;
         Ok(())
