@@ -2,11 +2,15 @@
 
 use std::{collections::HashSet, time::Duration};
 
+use futures::executor::block_on;
 use kvproto::raft_cmdpb::{CmdType, PutRequest, RaftCmdRequest, Request};
 use raft::prelude::MessageType;
 use raftstore::store::Callback;
-use test_backup::disk_snap::{assert_success, must_wait_apply_success, Suite};
+use test_backup::disk_snap::{
+    assert_failure, assert_failure_because, assert_success, must_wait_apply_success, Suite,
+};
 use test_raftstore::{must_contains_error, Direction, RegionPacketFilter, Simulator};
+use test_util::eventually;
 use tikv_util::HandyRwLock;
 
 #[test]
@@ -15,17 +19,97 @@ fn test_basic() {
     let mut call = suite.prepare_backup(1);
     call.prepare(60);
     let resp = suite.try_split(b"k");
-    println!("{:?}", resp.response.get_header().get_error());
+    debug!("Failed to split"; "err" => ?resp.response.get_header().get_error());
     must_contains_error(
         &resp.response,
-        "rejecting proposing admin commands while preparing snapshot backup",
+        "[Suspended] Preparing disk snapshot backup",
     );
 }
 
 #[test]
+fn test_conf_change() {
+    let mut suite = Suite::new(4);
+    let the_region = suite.cluster.get_region(b"");
+    let last_peer = the_region.peers.last().unwrap();
+    let res = block_on(
+        suite
+            .cluster
+            .async_remove_peer(the_region.get_id(), last_peer.clone())
+            .unwrap(),
+    );
+    assert_success(&res);
+    eventually(Duration::from_millis(100), Duration::from_secs(2), || {
+        let r = suite.cluster.get_region(b"");
+        !r.peers.iter().any(|p| p.id == last_peer.id)
+    });
+    let mut calls = vec![];
+    for i in 1..=4 {
+        let mut call = suite.prepare_backup(i);
+        call.prepare(60);
+        calls.push(call);
+    }
 
+    let the_region = suite.cluster.get_region(b"");
+    let res2 = block_on(
+        suite
+            .cluster
+            .async_remove_peer(the_region.get_id(), last_peer.clone())
+            .unwrap(),
+    );
+    assert_failure_because(&res2, "rejected by coprocessor");
+    let last_peer = the_region.peers.last().unwrap();
+    calls.into_iter().for_each(|c| assert!(c.send_finalize()));
+    let res3 = block_on(
+        suite
+            .cluster
+            .async_remove_peer(the_region.get_id(), last_peer.clone())
+            .unwrap(),
+    );
+    assert_success(&res3);
+    eventually(Duration::from_millis(100), Duration::from_secs(2), || {
+        let r = suite.cluster.get_region(b"");
+        !r.peers.iter().any(|p| p.id == last_peer.id)
+    });
+}
+
+#[test]
+fn test_transfer_leader() {
+    let mut suite = Suite::new(3);
+    let mut calls = vec![];
+    for i in 1..=3 {
+        let mut call = suite.prepare_backup(i);
+        call.prepare(60);
+        calls.push(call);
+    }
+    let region = suite.cluster.get_region(b"");
+    let leader = suite.cluster.leader_of_region(region.get_id()).unwrap();
+    let new_leader = region.peers.iter().find(|r| r.id != leader.id).unwrap();
+    let res = suite
+        .cluster
+        .try_transfer_leader(region.id, new_leader.clone());
+    assert_failure_because(&res, "[Suspended] Preparing disk snapshot backup");
+    calls.into_iter().for_each(|c| assert!(c.send_finalize()));
+    let res = suite
+        .cluster
+        .try_transfer_leader(region.id, new_leader.clone());
+    assert_success(&res);
+}
+
+#[test]
+fn test_prepare_merge() {
+    let mut suite = Suite::new(1);
+    suite.split(b"k");
+    let source = suite.cluster.get_region(b"a");
+    let target = suite.cluster.get_region(b"z");
+    assert_ne!(source.id, target.id);
+    let mut call = suite.prepare_backup(1);
+    call.prepare(60);
+    let resp = suite.cluster.try_merge(source.id, target.id);
+    assert_failure(&resp);
+}
+
+#[test]
 fn test_wait_apply() {
-    test_util::init_log_for_test();
     let mut suite = Suite::new(3);
     for key in 'a'..'k' {
         suite.split(&[key as u8]);
@@ -76,7 +160,6 @@ fn test_wait_apply() {
         )
         .unwrap();
     }
-    // Hacking: assume all leaders are in one store.
     let mut call = suite.prepare_backup(ld_sid.unwrap());
     call.prepare(60);
 
@@ -102,7 +185,7 @@ fn test_wait_apply() {
         let v = suite.cluster.must_get(&k);
         // Due to we have wait to it applied, this write result must be observable.
         assert_eq!(v.as_deref(), Some(b"meow?".as_slice()), "{res:?}");
-        assert!(removed, "{:?} {:?}", regions_ok, res);
+        assert!(removed, "{regions_ok:?} {res:?}");
     }
 
     suite.cluster.clear_send_filters();
