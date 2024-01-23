@@ -33,7 +33,7 @@ use crate::{
     router::{Router, TaskSelector},
     subscription_track::{CheckpointType, Ref, RefMut, ResolveResult, SubscriptionTracer},
     try_send,
-    utils::{self, CallbackWaitGroup, Work},
+    utils::{self, WaitGroup, Work},
     Task,
 };
 
@@ -309,7 +309,7 @@ pub struct RegionSubscriptionManager<S, R> {
 
     messenger: WeakSender<ObserveOp>,
     scan_pool_handle: ScanPoolHandle,
-    scans: Arc<CallbackWaitGroup>,
+    scans: Arc<WaitGroup>,
 }
 
 /// Create a pool for doing initial scanning.
@@ -361,7 +361,7 @@ where
             subs: initial_loader.tracing,
             messenger: tx.downgrade(),
             scan_pool_handle,
-            scans: CallbackWaitGroup::new(),
+            scans: WaitGroup::new(),
             failure_count: HashMap::new(),
             memory_manager: Arc::clone(&initial_loader.quota),
         };
@@ -370,8 +370,10 @@ where
     }
 
     /// wait initial scanning get finished.
-    pub fn wait(&self, timeout: Duration) -> future![bool] {
-        tokio::time::timeout(timeout, self.scans.wait()).map(|result| result.is_err())
+    pub async fn wait(&self, timeout: Duration) -> bool {
+        tokio::time::timeout(timeout, self.scans.wait())
+            .map(|result| result.is_err())
+            .await
     }
 
     fn issue_fatal_of(&self, region: &Region, err: Error) {
@@ -840,7 +842,7 @@ mod test {
         router::{Router, RouterInner},
         subscription_manager::{OOM_BACKOFF_BASE, OOM_BACKOFF_JITTER_SECS},
         subscription_track::{CheckpointType, SubscriptionTracer},
-        utils::CallbackWaitGroup,
+        utils::WaitGroup,
         BackupStreamResolver, ObserveOp, Task,
     };
 
@@ -884,7 +886,7 @@ mod test {
         use futures::executor::block_on;
 
         use super::ScanCmd;
-        use crate::{subscription_manager::spawn_executors, utils::CallbackWaitGroup};
+        use crate::{subscription_manager::spawn_executors, utils::WaitGroup};
 
         fn should_finish_in(f: impl FnOnce() + Send + 'static, d: std::time::Duration) {
             let (tx, rx) = futures::channel::oneshot::channel();
@@ -901,7 +903,7 @@ mod test {
         }
 
         let pool = spawn_executors(FuncInitialScan(|_, _, _| Ok(Statistics::default())), 1);
-        let wg = CallbackWaitGroup::new();
+        let wg = WaitGroup::new();
         let (tx, _) = tokio::sync::mpsc::channel(1);
         fail::cfg("execute_scan_command_sleep_100", "return").unwrap();
         for _ in 0..100 {
@@ -1051,7 +1053,7 @@ mod test {
                 memory_manager,
                 messenger: tx.downgrade(),
                 scan_pool_handle: spawn_executors(init, 2),
-                scans: CallbackWaitGroup::new(),
+                scans: WaitGroup::new(),
             };
             let events = Arc::new(Mutex::new(vec![]));
             let ob_events = Arc::clone(&events);

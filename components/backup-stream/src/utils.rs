@@ -5,6 +5,7 @@ use std::{
     borrow::Borrow,
     cell::RefCell,
     collections::{hash_map::RandomState, BTreeMap, HashMap},
+    future::Future,
     ops::{Bound, RangeBounds},
     path::Path,
     sync::{
@@ -18,7 +19,10 @@ use std::{
 use async_compression::{tokio::write::ZstdEncoder, Level};
 use engine_rocks::ReadPerfInstant;
 use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
-use futures::{ready, task::Poll, FutureExt};
+use futures::{
+    ready,
+    task::{AtomicWaker, Poll},
+};
 use kvproto::{
     brpb::CompressionType,
     metapb::Region,
@@ -37,13 +41,12 @@ use tikv_util::{
 use tokio::{
     fs::File,
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
-    sync::{oneshot, Mutex, RwLock},
+    sync::{Mutex, RwLock},
 };
 use txn_types::{Key, Lock, LockType};
 
 use crate::{
     errors::{Error, Result},
-    metadata::store::BoxFuture,
     router::TaskSelector,
     Task,
 };
@@ -379,47 +382,49 @@ pub fn should_track_lock(l: &Lock) -> bool {
     }
 }
 
-pub struct CallbackWaitGroup {
+pub struct WaitGroup {
     running: AtomicUsize,
-    on_finish_all: std::sync::Mutex<Vec<Box<dyn FnOnce() + Send + 'static>>>,
+    waker: AtomicWaker,
 }
 
-impl CallbackWaitGroup {
+pub struct Wait<'a>(&'a WaitGroup);
+
+impl<'a> Future for Wait<'a> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.0.running.load(Ordering::Acquire) == 0 {
+            Poll::Ready(())
+        } else {
+            self.0.waker.register(cx.waker());
+            if self.0.running.load(Ordering::Acquire) == 0 {
+                // Wake the registered waker instead of return `Ready` directly,
+                // so we won't be accidentally wake up later.
+                self.0.waker.wake();
+            }
+            Poll::Pending
+        }
+    }
+}
+
+impl WaitGroup {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             running: AtomicUsize::new(0),
-            on_finish_all: std::sync::Mutex::default(),
+            waker: AtomicWaker::default(),
         })
     }
 
     fn work_done(&self) {
-        let last = self.running.fetch_sub(1, Ordering::SeqCst);
+        let last = self.running.fetch_sub(1, Ordering::AcqRel);
         if last == 1 {
-            self.on_finish_all
-                .lock()
-                .unwrap()
-                .drain(..)
-                .for_each(|x| x())
+            self.waker.wake()
         }
     }
 
     /// wait until all running tasks done.
-    pub fn wait(&self) -> BoxFuture<()> {
-        // Fast path: no uploading.
-        if self.running.load(Ordering::SeqCst) == 0 {
-            return Box::pin(futures::future::ready(()));
-        }
-
-        let (tx, rx) = oneshot::channel();
-        self.on_finish_all.lock().unwrap().push(Box::new(move || {
-            // The waiter may timed out.
-            let _ = tx.send(());
-        }));
-        // try to acquire the lock again.
-        if self.running.load(Ordering::SeqCst) == 0 {
-            return Box::pin(futures::future::ready(()));
-        }
-        Box::pin(rx.map(|_| ()))
+    pub fn wait(&self) -> Wait<'_> {
+        Wait(self)
     }
 
     /// make a work, as long as the return value held, mark a work in the group
@@ -430,7 +435,7 @@ impl CallbackWaitGroup {
     }
 }
 
-pub struct Work(Arc<CallbackWaitGroup>);
+pub struct Work(Arc<WaitGroup>);
 
 impl Drop for Work {
     fn drop(&mut self) {
@@ -800,6 +805,8 @@ impl<D: std::fmt::Debug, T: Iterator<Item = D>> std::fmt::Debug for DebugIter<D,
 
 #[cfg(test)]
 mod test {
+    extern crate test;
+
     use std::{
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -811,9 +818,10 @@ mod test {
     use engine_traits::WriteOptions;
     use futures::executor::block_on;
     use kvproto::metapb::{Region, RegionEpoch};
+    use test::Bencher;
     use tokio::io::{AsyncWriteExt, BufReader};
 
-    use crate::utils::{is_in_range, CallbackWaitGroup, SegmentMap};
+    use crate::utils::{is_in_range, SegmentMap, WaitGroup};
 
     #[test]
     fn test_redact() {
@@ -923,7 +931,7 @@ mod test {
 
         fn run_case(c: Case) {
             for i in 0..c.repeat {
-                let wg = CallbackWaitGroup::new();
+                let wg = WaitGroup::new();
                 let cnt = Arc::new(AtomicUsize::new(c.bg_task));
                 for _ in 0..c.bg_task {
                     let cnt = cnt.clone();
@@ -949,10 +957,10 @@ mod test {
             },
             Case {
                 bg_task: 512,
-                repeat: 1,
+                repeat: 10,
             },
             Case {
-                bg_task: 2,
+                bg_task: 10,
                 repeat: 100000,
             },
             Case {
@@ -974,6 +982,31 @@ mod test {
         for case in cases {
             run_case(case)
         }
+    }
+
+    #[bench]
+    fn bench_wait_group(b: &mut Bencher) {
+        let wg = WaitGroup::new();
+        let cnt = Arc::new(AtomicUsize::new(0));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_time()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        b.iter(|| {
+            for _ in 0..10 {
+                let cnt = cnt.clone();
+                cnt.fetch_add(1, Ordering::Release);
+                let work = wg.clone().work();
+                tokio::spawn(async move {
+                    cnt.fetch_sub(1, Ordering::Release);
+                    drop(work);
+                });
+            }
+            block_on(wg.wait());
+            assert_eq!(cnt.load(Ordering::Acquire), 0);
+        });
     }
 
     #[test]
