@@ -8,3 +8,5 @@ edition = "2021"
 [dependencies]
 backup-stream = { workspace = true }
 tikv_util = { workspace = true }
+tempfile = "3.0"
+libc = "*"

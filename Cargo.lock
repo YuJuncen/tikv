@@ -2788,6 +2788,8 @@ name = "kylin-disk-test"
 version = "0.1.0"
 dependencies = [
  "backup-stream",
+ "libc 0.1.12",
+ "tempfile",
  "tikv_util",
 ]
 
