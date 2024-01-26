@@ -26,7 +26,9 @@ use crate::{
     metadata::{store::MetaStore, Checkpoint, CheckpointProvider, MetadataClient},
     metrics,
     subscription_track::ResolveResult,
-    try_send, RegionCheckpointOperation, Task,
+    try_send,
+    utils::StopWatch,
+    ObserveOp, RegionCheckpointOperation, Task,
 };
 
 /// A manager for maintaining the last flush ts.
@@ -403,43 +405,48 @@ pub struct LastFlushTsOfRegion {
     pub checkpoint: TimeStamp,
 }
 
+#[derive(Clone, Copy)]
+pub struct FlushDoneContext {
+    pub start_sn: u64,
+    pub end_sn: u64,
+}
+
+pub struct ErrorContext<'a> {
+    pub error: &'a Error,
+    pub start_sn: u64,
+    pub current_sn: u64,
+
+    // Output fields.
+    pub retry_after: &'a mut Option<Duration>,
+}
+
 // Allow some type to
 #[async_trait::async_trait]
 pub trait FlushObserver: Send + 'static {
     /// The callback when the flush has advanced the resolver.
-    async fn before(&mut self, checkpoints: Vec<ResolveResult>);
+    async fn before_flush(&mut self) {}
     /// The callback when the flush is done. (Files are fully written to
     /// external storage.)
-    async fn after(&mut self, task: &str, rts: u64) -> Result<()>;
-    /// The optional callback to rewrite the resolved ts of this flush.
-    /// Because the default method (collect all leader resolved ts in the store,
-    /// and use the minimal TS.) may lead to resolved ts rolling back, if we
-    /// desire a stronger consistency, we can rewrite a safer resolved ts here.
-    /// Note the new resolved ts cannot be greater than the old resolved ts.
-    async fn rewrite_resolved_ts(
-        &mut self,
-        #[allow(unused_variables)] _task: &str,
-    ) -> Option<TimeStamp> {
-        None
+    async fn after_flush_done(&mut self, ctx: FlushDoneContext) -> Result<()> {
+        Ok(())
     }
+    /// The callback when the flushing encountering an error.
+    fn on_err(&mut self, ctx: ErrorContext<'_>) {}
 }
 
-pub struct BasicFlushObserver<PD> {
+pub struct SafePointUpdater<PD> {
     pd_cli: Arc<PD>,
     store_id: u64,
 }
 
-impl<PD> BasicFlushObserver<PD> {
+impl<PD> SafePointUpdater<PD> {
     pub fn new(pd_cli: Arc<PD>, store_id: u64) -> Self {
         Self { pd_cli, store_id }
     }
 }
 
-#[async_trait::async_trait]
-impl<PD: PdClient + 'static> FlushObserver for BasicFlushObserver<PD> {
-    async fn before(&mut self, _checkpoints: Vec<ResolveResult>) {}
-
-    async fn after(&mut self, task: &str, rts: u64) -> Result<()> {
+impl<PD: PdClient + 'static> SafePointUpdater<PD> {
+    async fn update_gc_safe_point(&mut self, task: &str, rts: u64) {
         if let Err(err) = self
             .pd_cli
             .update_service_safe_point(
@@ -464,66 +471,63 @@ impl<PD: PdClient + 'static> FlushObserver for BasicFlushObserver<PD> {
         metrics::STORE_CHECKPOINT_TS
             .with_label_values(&[task])
             .set(rts as _);
-        Ok(())
     }
 }
 
-pub struct CheckpointV3FlushObserver<S, O> {
+pub struct CheckpointV3FlushObserver<S, PD> {
     /// We should modify the rts (the local rts isn't right.)
     /// This should be a BasicFlushObserver or something likewise.
-    baseline: O,
+    safepoints: SafePointUpdater<PD>,
     sched: Scheduler<Task>,
     meta_cli: MetadataClient<S>,
-
-    checkpoints: Vec<ResolveResult>,
-    global_checkpoint_cache: HashMap<String, Checkpoint>,
     start_time: Instant,
+    checkpoints: Vec<ResolveResult>,
+    task_name: String,
 }
 
-impl<S, O> CheckpointV3FlushObserver<S, O> {
-    pub fn new(sched: Scheduler<Task>, meta_cli: MetadataClient<S>, baseline: O) -> Self {
+impl<S, PD> CheckpointV3FlushObserver<S, PD> {
+    pub fn new(
+        sched: Scheduler<Task>,
+        meta_cli: MetadataClient<S>,
+        baseline: SafePointUpdater<PD>,
+        task: String,
+        checkpoints: Vec<ResolveResult>,
+    ) -> Self {
         Self {
             sched,
             meta_cli,
-            checkpoints: vec![],
-            // We almost always have only one entry.
-            global_checkpoint_cache: HashMap::with_capacity(1),
-            baseline,
+            safepoints: baseline,
+            task_name: task,
             start_time: Instant::now(),
+            checkpoints,
         }
     }
 }
 
-impl<S, O> CheckpointV3FlushObserver<S, O>
+impl<S, PD> CheckpointV3FlushObserver<S, PD>
 where
     S: MetaStore + 'static,
-    O: FlushObserver + Send,
 {
     async fn get_checkpoint(&mut self, task: &str) -> Result<Checkpoint> {
-        let cp = match self.global_checkpoint_cache.get(task) {
-            Some(cp) => *cp,
-            None => {
-                let global_checkpoint = self.meta_cli.global_checkpoint_of_task(task).await?;
-                self.global_checkpoint_cache
-                    .insert(task.to_owned(), global_checkpoint);
-                global_checkpoint
-            }
-        };
-        Ok(cp)
+        let global_checkpoint = self.meta_cli.global_checkpoint_of_task(task).await?;
+        Ok(global_checkpoint)
     }
 }
 
 #[async_trait::async_trait]
-impl<S, O> FlushObserver for CheckpointV3FlushObserver<S, O>
+impl<S, PD> FlushObserver for CheckpointV3FlushObserver<S, PD>
 where
     S: MetaStore + 'static,
-    O: FlushObserver + Send,
+    PD: PdClient + 'static,
 {
-    async fn before(&mut self, checkpoints: Vec<ResolveResult>) {
-        self.checkpoints = checkpoints;
+    async fn before_flush(&mut self) {
+        info!(#"FlushObserver", "Started flushing.");
     }
 
-    async fn after(&mut self, task: &str, _rts: u64) -> Result<()> {
+    async fn after_flush_done(&mut self, ctx: &mut FlushDoneContext) -> Result<()> {
+        if ctx.start_sn != ctx.end_sn {
+            return Ok(());
+        }
         let resolve_task = Task::RegionCheckpointsOp(RegionCheckpointOperation::Resolved {
             checkpoints: std::mem::take(&mut self.checkpoints),
             start_time: self.start_time,
@@ -532,23 +536,12 @@ where
         try_send!(self.sched, resolve_task);
         try_send!(self.sched, flush_task);
 
-        let global_checkpoint = self.get_checkpoint(task).await?;
-        info!("getting global checkpoint from cache for updating."; "checkpoint" => ?global_checkpoint);
-        self.baseline
-            .after(task, global_checkpoint.ts.into_inner())
-            .await?;
+        let global_checkpoint = self.get_checkpoint(&self.task_name).await?;
+        info!(#"FlushObserver", "getting global checkpoint from cache for updating."; "checkpoint" => ?global_checkpoint);
+        self.safepoints
+            .update_gc_safe_point(&self.task_name, global_checkpoint.ts.into_inner())
+            .await;
         Ok(())
-    }
-
-    async fn rewrite_resolved_ts(&mut self, task: &str) -> Option<TimeStamp> {
-        let global_checkpoint = self
-            .get_checkpoint(task)
-            .await
-            .map_err(|err| err.report("failed to get resolved ts for rewriting"))
-            .ok()?;
-        info!("getting global checkpoint for updating."; "checkpoint" => ?global_checkpoint);
-        matches!(global_checkpoint.provider, CheckpointProvider::Global)
-            .then(|| global_checkpoint.ts)
     }
 }
 
@@ -567,7 +560,7 @@ pub mod tests {
     use pd_client::{PdClient, PdFuture};
     use txn_types::TimeStamp;
 
-    use super::{BasicFlushObserver, FlushObserver, RegionIdWithVersion};
+    use super::{FlushObserver, RegionIdWithVersion, SafePointUpdater};
     use crate::{
         subscription_track::{CheckpointType, ResolveResult},
         GetCheckpointResult,
@@ -795,15 +788,15 @@ pub mod tests {
     async fn test_after() {
         let store_id = 1;
         let pd_cli = Arc::new(MockPdClient::new());
-        let mut flush_observer = BasicFlushObserver::new(pd_cli.clone(), store_id);
+        let mut flush_observer = SafePointUpdater::new(pd_cli.clone(), store_id);
         let task = String::from("test");
         let rts = 12345;
 
         let r = flush_observer.after(&task, rts).await;
         assert_eq!(r.is_ok(), true);
 
-        let serivce_id = format!("backup-stream-{}-{}", task, store_id);
-        let r = pd_cli.get_service_safe_point(serivce_id).unwrap();
+        let service_id = format!("backup-stream-{}-{}", task, store_id);
+        let r = pd_cli.get_service_safe_point(service_id).unwrap();
         assert_eq!(r.into_inner(), rts - 1);
     }
 }

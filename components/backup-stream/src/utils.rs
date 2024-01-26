@@ -798,6 +798,52 @@ impl<D: std::fmt::Debug, T: Iterator<Item = D>> std::fmt::Debug for DebugIter<D,
     }
 }
 
+pub(crate) mod actor {
+    use tokio::sync::mpsc::Sender;
+
+    pub trait Actor: Send + 'static {
+        type Message: Send;
+
+        async fn on_bootstrap(&mut self, this: &Address<Self::Message>) {}
+        async fn on_stop(&mut self) {}
+
+        async fn on_msg(&mut self, msg: Self::Message, this: &Address<Self::Message>);
+    }
+
+    pub struct Address<M>(Sender<M>);
+
+    impl<M> Clone for Address<M> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone())
+        }
+    }
+
+    impl<M> Address<M> {
+        pub fn send(&self, message: M) {
+            self.0.send(message);
+        }
+    }
+
+    pub trait RunActor {
+        fn run_actor<M>(&self, a: impl Actor<Message = M>) -> Address<M>;
+    }
+
+    impl RunActor for tokio::runtime::Handle {
+        fn run_actor<M>(&self, a: impl Actor<Message = M>) -> Address<M> {
+            let (tx, rx) = tokio::sync::mpsc::channel(1024);
+            let this = tx.clone();
+            self.spawn(async move {
+                a.on_bootstrap(tx).await;
+                while let Some(msg) = rx.recv().await {
+                    a.on_msg(msg, tx).await;
+                }
+                a.on_stop().await;
+            });
+            Address(tx)
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::{

@@ -688,12 +688,12 @@ impl RouterInner {
 
 /// The handle of a temporary file.
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
-struct TempFileKey {
+pub struct TempFileKey {
     table_id: i64,
     region_id: u64,
     cf: CfName,
     cmd_type: CmdType,
-    is_meta: bool,
+    pub is_meta: bool,
 }
 
 pub enum FormatType {
@@ -809,7 +809,7 @@ impl TempFileKey {
         )
     }
 
-    fn file_name(store_id: u64, min_ts: u64, max_ts: u64, is_meta: bool) -> String {
+    pub fn file_name(store_id: u64, min_ts: u64, max_ts: u64, is_meta: bool) -> String {
         if is_meta {
             Self::path_to_schema_file(store_id, min_ts, max_ts)
         } else {
@@ -1365,19 +1365,19 @@ impl StreamTaskInfo {
 }
 
 /// A opened log file with some metadata.
-struct DataFile {
+pub struct DataFile {
     min_ts: TimeStamp,
     max_ts: TimeStamp,
     resolved_ts: TimeStamp,
     min_begin_ts: Option<TimeStamp>,
     sha256: Hasher,
     // TODO: use lz4 with async feature
-    inner: tempfiles::ForWrite,
+    pub inner: tempfiles::ForWrite,
     compression_type: CompressionType,
     start_key: Vec<u8>,
     end_key: Vec<u8>,
     number_of_entries: usize,
-    file_size: usize,
+    pub file_size: usize,
 }
 
 #[derive(Debug)]
@@ -1392,7 +1392,7 @@ pub struct MetadataInfo {
 }
 
 impl MetadataInfo {
-    fn with_capacity(cap: usize) -> Self {
+    pub fn with_capacity(cap: usize) -> Self {
         Self {
             file_groups: Vec::with_capacity(cap),
             min_resolved_ts: None,
@@ -1402,11 +1402,11 @@ impl MetadataInfo {
         }
     }
 
-    fn set_store_id(&mut self, store_id: u64) {
+    pub fn set_store_id(&mut self, store_id: u64) {
         self.store_id = store_id;
     }
 
-    fn push(&mut self, file: DataFileGroup) {
+    pub fn push(&mut self, file: DataFileGroup) {
         let rts = file.min_resolved_ts;
         self.min_resolved_ts = self.min_resolved_ts.map_or(Some(rts), |r| Some(r.min(rts)));
         self.min_ts = self
@@ -1418,7 +1418,7 @@ impl MetadataInfo {
         self.file_groups.push(file);
     }
 
-    fn marshal_to(self) -> Result<Vec<u8>> {
+    pub fn marshal_to(self) -> Result<Vec<u8>> {
         let mut metadata = Metadata::new();
         metadata.set_file_groups(self.file_groups.into());
         metadata.set_store_id(self.store_id as _);
@@ -1432,7 +1432,7 @@ impl MetadataInfo {
             .map_err(|err| Error::Other(box_err!("failed to marshal proto: {}", err)))
     }
 
-    fn path_to_meta(&self) -> String {
+    pub fn path_to_meta(&self) -> String {
         format!(
             "v1/backupmeta/{}-{}.meta",
             self.min_resolved_ts.unwrap_or_default(),
@@ -2094,7 +2094,7 @@ mod tests {
         check_on_events_result(&router.on_events(build_kv_event(10, 10)).await);
         let t = router.get_task_info("error_prone").await.unwrap();
         let _ = router.do_flush("error_prone", 42, TimeStamp::max()).await;
-        assert_eq!(t.total_size() > 0, true);
+        assert_gt!(t.total_size() > 0, true);
 
         t.set_flushing_status(true);
         let _ = router.do_flush("error_prone", 42, TimeStamp::max()).await;

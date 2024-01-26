@@ -9,6 +9,7 @@ pub mod config;
 mod endpoint;
 pub mod errors;
 mod event_loader;
+mod flush_manager;
 pub mod metadata;
 pub mod metrics;
 pub mod observer;
