@@ -127,7 +127,11 @@ where
             .expect("failed to create tokio runtime for backup stream worker.");
 
         let meta_client = MetadataClient::new(store, store_id);
-        let range_router = Router::new(scheduler.clone(), router::Config::from(config.clone()));
+        let range_router = Router::new(
+            store_id,
+            scheduler.clone(),
+            router::Config::from(config.clone()),
+        );
 
         // spawn a worker to watch task changes from etcd periodically.
         let meta_client_clone = meta_client.clone();
@@ -435,11 +439,6 @@ where
                 }
             }
         }
-    }
-
-    fn flush_observer(&self) -> impl FlushObserver {
-        let basic = SafePointUpdater::new(self.pd_client.clone(), self.store_id);
-        CheckpointV3FlushObserver::new(self.scheduler.clone(), self.meta_client.clone(), basic)
     }
 
     /// Convert a batch of events to the cmd batch, and update the resolver
@@ -822,32 +821,33 @@ where
         }
     }
 
-    fn do_flush(&self, task: String, min_ts: TimeStamp) -> future![Result<()>] {
-        let get_rts = self.get_resolved_regions(min_ts);
+    fn do_flush(&self, task: String, min_ts: TimeStamp) -> future![()] {
+        let resolved_regions = self.get_resolved_regions(min_ts);
         let router = self.range_router.clone();
-        let store_id = self.store_id;
-        let mut flush_ob = self.flush_observer();
+        let basic = SafePointUpdater::new(self.pd_client.clone(), self.store_id);
+        let sched = self.scheduler.clone();
+        let meta_cli = self.meta_client.clone();
+
         async move {
-            let mut resolved = get_rts.await?;
-            let mut new_rts = resolved.global_checkpoint();
-            fail::fail_point!("delay_on_flush");
-            flush_ob.before(resolved.take_resolve_result()).await;
-            if let Some(rewritten_rts) = flush_ob.rewrite_resolved_ts(&task).await {
-                info!("rewriting resolved ts"; "old" => %new_rts, "new" => %rewritten_rts);
-                new_rts = rewritten_rts.min(new_rts);
-            }
-            if let Some(rts) = router.do_flush(&task, store_id, new_rts).await {
-                info!("flushing and refreshing checkpoint ts.";
-                    "checkpoint_ts" => %rts,
-                    "task" => %task,
-                );
-                if rts == 0 {
-                    // We cannot advance the resolved ts for now.
-                    return Ok(());
+            let mut rrs = match resolved_regions.await {
+                Ok(rrs) => rrs,
+                Err(e) => {
+                    warn!(#"LogBackup", "Failed to resolve regions, probably shutting down, skip flush."; 
+                        "err" => %e, "task" => %task);
+                    return;
                 }
-                flush_ob.after(&task, rts).await?
+            };
+            let flush_ob = CheckpointV3FlushObserver::new(
+                sched,
+                meta_cli,
+                basic,
+                task.clone(),
+                rrs.take_resolve_result(),
+            );
+            let scheduled = router.async_flush(&task, Box::new(flush_ob)).await;
+            if !scheduled {
+                warn!(#"LogBackup", "Skipped a flush due to unknown reason."; "task" => %task);
             }
-            Ok(())
         }
     }
 
@@ -871,11 +871,7 @@ where
 
     fn on_flush_with_min_ts(&self, task: String, min_ts: TimeStamp) {
         self.pool
-            .spawn(root!("flush"; self.do_flush(task, min_ts).map(|r| {
-                if let Err(err) = r {
-                    err.report("during updating flush status")
-                }
-            }); min_ts = min_ts.into_inner()));
+            .spawn(root!("flush"; self.do_flush(task, min_ts); min_ts = min_ts.into_inner()));
     }
 
     fn update_global_checkpoint(&self, task: String) -> future![()] {

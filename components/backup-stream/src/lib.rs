@@ -3,6 +3,7 @@
 #![feature(result_flattening)]
 #![feature(assert_matches)]
 #![feature(test)]
+#![feature(trait_alias)]
 
 mod checkpoint_manager;
 pub mod config;

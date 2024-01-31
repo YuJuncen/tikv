@@ -799,14 +799,19 @@ impl<D: std::fmt::Debug, T: Iterator<Item = D>> std::fmt::Debug for DebugIter<D,
 }
 
 pub(crate) mod actor {
+    use std::panic::Location;
+
+    use tikv_util::warn;
     use tokio::sync::mpsc::Sender;
 
+    pub trait Message = 'static + Send + std::fmt::Debug;
+
+    #[async_trait::async_trait]
     pub trait Actor: Send + 'static {
-        type Message: Send;
+        type Message: Message;
 
-        async fn on_bootstrap(&mut self, this: &Address<Self::Message>) {}
+        async fn on_bootstrap(&mut self, _this: &Address<Self::Message>) {}
         async fn on_stop(&mut self) {}
-
         async fn on_msg(&mut self, msg: Self::Message, this: &Address<Self::Message>);
     }
 
@@ -818,24 +823,28 @@ pub(crate) mod actor {
         }
     }
 
-    impl<M> Address<M> {
-        pub fn send(&self, message: M) {
-            self.0.send(message);
+    impl<M: Message> Address<M> {
+        #[track_caller]
+        pub async fn send(&self, message: M) {
+            if let Err(err) = self.0.send(message).await {
+                warn!(#"LogBackupActors", "Dropped message."; "msg" => ?err, "loc" => ?Location::caller());
+            }
         }
     }
 
     pub trait RunActor {
-        fn run_actor<M>(&self, a: impl Actor<Message = M>) -> Address<M>;
+        fn run_actor<M: Message>(&self, a: impl Actor<Message = M>) -> Address<M>;
     }
 
     impl RunActor for tokio::runtime::Handle {
-        fn run_actor<M>(&self, a: impl Actor<Message = M>) -> Address<M> {
-            let (tx, rx) = tokio::sync::mpsc::channel(1024);
-            let this = tx.clone();
+        fn run_actor<M: Message>(&self, mut a: impl Actor<Message = M>) -> Address<M> {
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+            let this = Address(tx.clone());
             self.spawn(async move {
-                a.on_bootstrap(tx).await;
+                let mut a = a;
+                a.on_bootstrap(&this).await;
                 while let Some(msg) = rx.recv().await {
-                    a.on_msg(msg, tx).await;
+                    a.on_msg(msg, &this).await;
                 }
                 a.on_stop().await;
             });

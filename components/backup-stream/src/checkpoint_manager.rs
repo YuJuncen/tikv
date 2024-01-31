@@ -25,6 +25,7 @@ use crate::{
     future,
     metadata::{store::MetaStore, Checkpoint, CheckpointProvider, MetadataClient},
     metrics,
+    router::TaskSelector,
     subscription_track::ResolveResult,
     try_send,
     utils::StopWatch,
@@ -412,12 +413,27 @@ pub struct FlushDoneContext {
 }
 
 pub struct ErrorContext<'a> {
-    pub error: &'a Error,
+    pub error: &'a mut Option<Error>,
     pub start_sn: u64,
     pub current_sn: u64,
 
     // Output fields.
     pub retry_after: &'a mut Option<Duration>,
+}
+
+impl<'a> ErrorContext<'a> {
+    /// Take the error and prevent following observers to handle the error.
+    fn take_error(&self) -> Error {
+        self.error
+            .take()
+            .expect("BUG: This error has been taken by another observer")
+    }
+
+    fn error(&self) -> &Error {
+        self.error
+            .as_ref()
+            .expect("BUG: This error has been taken by another observer")
+    }
 }
 
 // Allow some type to
@@ -483,6 +499,7 @@ pub struct CheckpointV3FlushObserver<S, PD> {
     start_time: Instant,
     checkpoints: Vec<ResolveResult>,
     task_name: String,
+    failure_count: usize,
 }
 
 impl<S, PD> CheckpointV3FlushObserver<S, PD> {
@@ -500,6 +517,7 @@ impl<S, PD> CheckpointV3FlushObserver<S, PD> {
             task_name: task,
             start_time: Instant::now(),
             checkpoints,
+            failure_count: 0,
         }
     }
 }
@@ -524,7 +542,7 @@ where
         info!(#"FlushObserver", "Started flushing.");
     }
 
-    async fn after_flush_done(&mut self, ctx: &mut FlushDoneContext) -> Result<()> {
+    async fn after_flush_done(&mut self, ctx: FlushDoneContext) -> Result<()> {
         if ctx.start_sn != ctx.end_sn {
             return Ok(());
         }
@@ -542,6 +560,21 @@ where
             .update_gc_safe_point(&self.task_name, global_checkpoint.ts.into_inner())
             .await;
         Ok(())
+    }
+
+    fn on_err(&mut self, ctx: ErrorContext<'_>) {
+        const FLUSH_FAILURE_BECOME_FATAL_THRESHOLD: usize = 30;
+        self.failure_count += 1;
+        if self.failure_count > FLUSH_FAILURE_BECOME_FATAL_THRESHOLD {
+            *ctx.retry_after = None;
+            try_send!(
+                self.sched,
+                Task::FatalError(
+                    TaskSelector::ByName(self.task_name.to_owned()),
+                    Box::new(ctx.take_error())
+                )
+            );
+        }
     }
 }
 

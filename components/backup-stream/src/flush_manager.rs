@@ -58,10 +58,11 @@ struct PendingObserver {
     start_sn: u64,
 }
 
+#[derive(Debug)]
 pub struct FlushingFile {
-    key: TempFileKey,
-    fd: DataFile,
-    info: DataFileInfo,
+    pub key: TempFileKey,
+    pub fd: DataFile,
+    pub info: DataFileInfo,
 }
 
 pub enum Task {
@@ -72,8 +73,18 @@ pub enum Task {
     Retry,
 }
 
-pub struct FlushManagerHandle();
+impl std::fmt::Debug for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlushFiles { files, observer } => {
+                f.debug_struct("FlushFiles").field("files", files).finish()
+            }
+            Self::Retry => write!(f, "Retry"),
+        }
+    }
+}
 
+#[async_trait::async_trait]
 impl Actor for FlushManager {
     type Message = Task;
 
@@ -84,6 +95,7 @@ impl Actor for FlushManager {
                 mut observer,
             } => {
                 self.flush_sn += 1;
+                info!(#"FlushManager", "Start flushing."; "epoch" => self.flush_sn);
                 observer.before_flush().await;
 
                 self.pending_observers.push(PendingObserver {
@@ -100,6 +112,7 @@ impl Actor for FlushManager {
                 self.flush(this).await;
             }
             Task::Retry => {
+                info!(#"FlushManager", "Retry flushing."; "epoch" => self.flush_sn);
                 self.flush(this).await;
             }
         }
@@ -197,16 +210,21 @@ impl FlushManager {
                 let size = self.pending_observers.len();
                 info!(#"FlushManager", "Encountered flush error."; "err" => %err,
                         "current_epoch" => self.flush_sn, "pending_observer" => size);
+                let mut err = Some(err);
                 for po in self.pending_observers.iter_mut() {
                     let last_retry = retry_after;
                     let ctx = ErrorContext {
                         start_sn: po.start_sn,
                         current_sn: self.flush_sn,
-                        error: &err,
+                        error: &mut err,
 
                         retry_after: &mut retry_after,
                     };
                     po.obs.on_err(ctx);
+                    if err.is_none() {
+                        info!(#"FlushManager", "An observer has taken the error. Skip following observers.");
+                        break;
+                    }
                     retry_after = retry_after.max(last_retry);
                 }
                 if let Some(after) = retry_after {
