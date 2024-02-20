@@ -41,6 +41,7 @@ mod metrics;
 use metrics::EXT_STORAGE_CREATE_HISTOGRAM;
 mod export;
 pub use export::*;
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 pub fn record_storage_create(start: Instant, storage: &dyn ExternalStorage) {
     EXT_STORAGE_CREATE_HISTOGRAM
@@ -53,6 +54,12 @@ pub fn record_storage_create(start: Instant, storage: &dyn ExternalStorage) {
 /// async function in order to make rustc happy. (And reduce the length of
 /// signature of write.) see https://github.com/rust-lang/rust/issues/63033
 pub struct UnpinReader(pub Box<dyn AsyncRead + Unpin + Send>);
+
+impl<R: AsyncRead + Unpin + Send + 'static> From<R> for UnpinReader {
+    fn from(value: R) -> Self {
+        Self(Box::new(value))
+    }
+}
 
 pub type ExternalData<'a> = Box<dyn AsyncRead + Unpin + Send + 'a>;
 

@@ -29,11 +29,14 @@ pub use std::{
 use std::{
     io::{self, ErrorKind, Read, Write},
     path::Path,
+    pin::Pin,
     str::FromStr,
     sync::{Arc, Mutex},
+    task::ready,
 };
 
 pub use file::{File, OpenOptions};
+use futures_io::AsyncRead;
 pub use io_stats::{
     fetch_io_bytes, get_io_type, get_thread_io_bytes_total, init as init_io_stats_collector,
     set_io_type,
@@ -428,6 +431,19 @@ impl<R: Read> Read for Sha256Reader<R> {
         let len = self.reader.read(buf)?;
         self.hasher.lock().unwrap().update(&buf[..len])?;
         Ok(len)
+    }
+}
+
+// NOTE: this `Unpin` can be removed via some projection.
+impl<R: AsyncRead + Unpin> AsyncRead for Sha256Reader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let len = ready!(Pin::new(&mut self.reader).poll_read(cx, buf))?;
+        self.hasher.lock().unwrap().update(&buf[..len])?;
+        Ok(len).into()
     }
 }
 

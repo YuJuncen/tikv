@@ -28,6 +28,8 @@ pub enum Error {
     #[error("Out of quota for region {region_id}")]
     OutOfQuota { region_id: u64 },
 
+    #[error("KV Engine error {0}")]
+    Engine(#[from] engine_traits::Error),
     #[error("gRPC meet error {0}")]
     Grpc(#[from] GrpcError),
     #[error("Protobuf meet error {0}")]
@@ -72,6 +74,7 @@ impl ErrorCodeExt for Error {
             Error::ObserveCanceled(..) => OBSERVE_CANCELED,
             Error::OutOfQuota { .. } => OUT_OF_QUOTA,
             Error::Grpc(_) => GRPC,
+            Error::Engine(_) => ENGINE,
         }
     }
 }

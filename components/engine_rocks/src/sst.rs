@@ -4,8 +4,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use ::encryption::DataKeyManager;
 use engine_traits::{
-    Error, ExternalSstFileInfo, IterOptions, Iterator, RefIterable, Result, SstCompressionType,
-    SstExt, SstReader, SstWriter, SstWriterBuilder, CF_DEFAULT,
+    Code, Error, ExternalSstFileInfo, IterOptions, Iterator, MvccProperties, RefIterable, Result,
+    SstCompressionType, SstExt, SstReader, SstWriter, SstWriterBuilder, Status, CF_DEFAULT,
 };
 use fail::fail_point;
 use file_system::get_io_rate_limiter;
@@ -15,7 +15,7 @@ use rocksdb::{
     SstFileWriter, DB,
 };
 
-use crate::{engine::RocksEngine, get_env, options::RocksReadOptions, r2e};
+use crate::{engine::RocksEngine, get_env, options::RocksReadOptions, r2e, RocksMvccProperties};
 
 impl SstExt for RocksEngine {
     type SstReader = RocksSstReader;
@@ -44,6 +44,15 @@ impl RocksSstReader {
             result = p.compression_name().to_owned();
         });
         result
+    }
+
+    pub fn load_mvcc_properties(&self) -> Result<MvccProperties> {
+        let mut mvcc_props = Err(Error::Engine(Status::with_code(Code::NotFound)));
+        self.inner.read_table_properties(|ps| {
+            let up = ps.user_collected_properties();
+            mvcc_props = RocksMvccProperties::decode(up)
+        });
+        mvcc_props
     }
 }
 

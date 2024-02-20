@@ -52,6 +52,10 @@ define_error_codes! {
         "Error happened during executing gRPC",
         "This error is often relative to the network, please check the network connection and network config, say, TLS config."
     ),
+    ENGINE => ("Engine",
+        "Error happened during accessing the KV engine",
+        "This is an internal error and normally cannot be workarounded easily. Perhaps there are data corruption or bugs."
+    ),
 
     OTHER => ("Unknown",
         "Some random error happens.",

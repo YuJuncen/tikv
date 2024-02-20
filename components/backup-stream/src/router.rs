@@ -13,14 +13,16 @@ use std::{
     time::Duration,
 };
 
-use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use engine_traits::{CfName, MvccProperties, SstExt, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use external_storage::{create_storage, BackendConfig, ExternalStorage, UnpinReader};
-use futures::io::Cursor;
+use file_system::Sha256Reader;
+use futures::io::{AllowStdIo, Cursor};
 use kvproto::{
     brpb::{
         CompressionType, DataFileGroup, DataFileInfo, FileType, MetaVersion, Metadata,
         StreamBackupTaskInfo,
     },
+    import_sstpb::SstMeta,
     raft_cmdpb::CmdType,
 };
 use openssl::hash::{Hasher, MessageDigest};
@@ -316,6 +318,43 @@ impl ApplyEvent {
     }
 }
 
+enum SealedFile {
+    Stream { data_file: DataFile },
+    Sst { path: PathBuf, meta: SstMeta },
+}
+
+impl Display for SealedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SealedFile::Stream { data_file } => write!(
+                f,
+                "Stream(at_pool={}, len={})",
+                data_file.inner.path().display(),
+                self.len()
+            ),
+            SealedFile::Sst { path, meta } => {
+                write!(f, "Sst(at_fs={}, len={})", path.display(), meta.length)
+            }
+        }
+    }
+}
+
+impl SealedFile {
+    fn len(&self) -> u64 {
+        match self {
+            SealedFile::Stream { data_file } => data_file.file_size as _,
+            SealedFile::Sst { path, meta } => meta.length,
+        }
+    }
+
+    async fn sync(&mut self) -> Result<()> {
+        match self {
+            SealedFile::Stream { data_file: df } => df.inner.done().await,
+            SealedFile::Sst { .. } => Ok(()),
+        }
+    }
+}
+
 /// The shared version of router.
 #[derive(Debug, Clone)]
 pub struct Router(pub(crate) Arc<RouterInner>);
@@ -372,7 +411,7 @@ pub struct RouterInner {
     /// which range a point belongs to.
     ranges: SyncRwLock<SegmentMap<Vec<u8>, String>>,
     /// The temporary files associated to some task.
-    tasks: Mutex<HashMap<String, Arc<StreamTaskInfo>>>,
+    tasks: Mutex<HashMap<String, Arc<StreamDataCollector>>>,
     /// The temporary directory for all tasks.
     prefix: PathBuf,
 
@@ -478,7 +517,7 @@ impl RouterInner {
         // register task info
         let cfg = self.tempfile_config_for_task(&task);
         let stream_task =
-            StreamTaskInfo::new(task, ranges.clone(), merged_file_size_limit, cfg).await?;
+            StreamDataCollector::new(task, ranges.clone(), merged_file_size_limit, cfg).await?;
         frame!(self.tasks.lock())
             .await
             .insert(task_name.clone(), Arc::new(stream_task));
@@ -541,7 +580,7 @@ impl RouterInner {
     #[cfg(test)]
     pub(crate) async fn must_mut_task_info<F>(&self, task_name: &str, mutator: F)
     where
-        F: FnOnce(&mut StreamTaskInfo),
+        F: FnOnce(&mut StreamDataCollector),
     {
         let mut tasks = self.tasks.lock().await;
         let t = tasks.remove(task_name);
@@ -551,7 +590,7 @@ impl RouterInner {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_task_info(&self, task_name: &str) -> Result<Arc<StreamTaskInfo>> {
+    pub async fn get_task_info(&self, task_name: &str) -> Result<Arc<StreamDataCollector>> {
         let task_info = match frame!(self.tasks.lock()).await.get(task_name) {
             Some(t) => t.clone(),
             None => {
@@ -818,7 +857,7 @@ impl TempFileKey {
     }
 }
 
-pub struct StreamTaskInfo {
+pub struct StreamDataCollector {
     pub(crate) task: StreamTask,
     /// support external storage. eg local/s3.
     pub(crate) storage: Arc<dyn ExternalStorage>,
@@ -828,9 +867,9 @@ pub struct StreamTaskInfo {
     /// prefixed keys).
     files: SlotMap<TempFileKey, DataFile>,
     /// flushing_files contains files pending flush.
-    flushing_files: RwLock<Vec<(TempFileKey, DataFile, DataFileInfo)>>,
+    flushing_files: RwLock<Vec<(TempFileKey, SealedFile, DataFileInfo)>>,
     /// flushing_meta_files contains meta files pending flush.
-    flushing_meta_files: RwLock<Vec<(TempFileKey, DataFile, DataFileInfo)>>,
+    flushing_meta_files: RwLock<Vec<(TempFileKey, SealedFile, DataFileInfo)>>,
     /// last_flush_ts represents last time this task flushed to storage.
     last_flush_time: AtomicPtr<Instant>,
     /// The min resolved TS of all regions involved.
@@ -854,29 +893,35 @@ pub struct StreamTaskInfo {
     temp_file_pool: Arc<TempFilePool>,
 }
 
-impl Drop for StreamTaskInfo {
+impl Drop for StreamDataCollector {
     fn drop(&mut self) {
-        let (success, failed): (Vec<_>, Vec<_>) = self
-            .flushing_files
-            .get_mut()
-            .drain(..)
-            .chain(self.flushing_meta_files.get_mut().drain(..))
-            .map(|(_, f, _)| f.inner.path().to_owned())
+        let ffiles = std::mem::take(self.flushing_files.get_mut());
+        let mffiles = std::mem::take(self.flushing_meta_files.get_mut());
+        let all_flush_files = ffiles.into_iter().chain(mffiles);
+        let files = std::mem::take(self.files.get_mut());
+        let count_group = |(succ, fail), succeed| {
+            if succeed {
+                (succ + 1, fail)
+            } else {
+                (succ, fail + 1)
+            }
+        };
+
+        let (success, failed) = all_flush_files
+            .map(|(_, f, _)| self.remove_sealed(&f))
+            .fold((0, 0), count_group);
+        info!("stream task info dropped[1/2], removing flushing_temp files"; "success" => %success, "failure" => %failed);
+
+        let (success, failed) = files
+            .into_values()
+            .map(|f| f.into_inner().inner.path().to_owned())
             .map(|p| self.temp_file_pool.remove(&p))
-            .partition(|r| *r);
-        info!("stream task info dropped[1/2], removing flushing_temp files"; "success" => %success.len(), "failure" => %failed.len());
-        let (success, failed): (Vec<_>, Vec<_>) = self
-            .files
-            .get_mut()
-            .drain()
-            .map(|(_, f)| f.into_inner().inner.path().to_owned())
-            .map(|p| self.temp_file_pool.remove(&p))
-            .partition(|r| *r);
-        info!("stream task info dropped[2/2], removing temp files"; "success" => %success.len(), "failure" => %failed.len());
+            .fold((0, 0), count_group);
+        info!("stream task info dropped[2/2], removing temp files"; "success" => %success, "failure" => %failed);
     }
 }
 
-impl std::fmt::Debug for StreamTaskInfo {
+impl std::fmt::Debug for StreamDataCollector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamTaskInfo")
             .field("task", &self.task.info.name)
@@ -887,7 +932,7 @@ impl std::fmt::Debug for StreamTaskInfo {
     }
 }
 
-impl StreamTaskInfo {
+impl StreamDataCollector {
     /// Create a new temporary file set at the `temp_dir`.
     pub async fn new(
         task: StreamTask,
@@ -986,15 +1031,11 @@ impl StreamTaskInfo {
         let mut w = self.flushing_files.write().await;
         let mut wm = self.flushing_meta_files.write().await;
         // Let's flush all files first...
-        futures::future::join_all(
-            w.iter_mut()
-                .chain(wm.iter_mut())
-                .map(|(_, f, _)| f.inner.done()),
-        )
-        .await
-        .into_iter()
-        .map(|r| r.map_err(Error::from))
-        .fold(Ok(()), Result::and)?;
+        futures::future::join_all(w.iter_mut().chain(wm.iter_mut()).map(|(_, f, _)| f.sync()))
+            .await
+            .into_iter()
+            .map(|r| r.map_err(Error::from))
+            .fold(Ok(()), Result::and)?;
 
         let mut metadata = MetadataInfo::with_capacity(w.len() + wm.len());
         metadata.set_store_id(store_id);
@@ -1054,9 +1095,9 @@ impl StreamTaskInfo {
             let mut v = v.into_inner();
             let file_meta = v.generate_metadata(&k)?;
             if file_meta.is_meta {
-                fw_meta.push((k, v, file_meta));
+                fw_meta.push((k, SealedFile::Stream { data_file: v }, file_meta));
             } else {
-                fw.push((k, v, file_meta));
+                fw.push((k, SealedFile::Stream { data_file: v }, file_meta));
             }
         }
         Ok(self)
@@ -1064,32 +1105,66 @@ impl StreamTaskInfo {
 
     #[instrument(skip_all)]
     pub async fn clear_flushing_files(&self) {
-        for (_, data_file, _) in self.flushing_files.write().await.drain(..) {
-            debug!("removing data file"; "size" => %data_file.file_size, "name" => %data_file.inner.path().display());
-            self.total_size
-                .fetch_sub(data_file.file_size, Ordering::SeqCst);
-            if !self.temp_file_pool.remove(data_file.inner.path()) {
-                warn!("Trying to remove file not exists."; "file" => %data_file.inner.path().display());
-            }
-        }
-        for (_, data_file, _) in self.flushing_meta_files.write().await.drain(..) {
-            debug!("removing meta data file"; "size" => %data_file.file_size, "name" => %data_file.inner.path().display());
-            self.total_size
-                .fetch_sub(data_file.file_size, Ordering::SeqCst);
-            if !self.temp_file_pool.remove(data_file.inner.path()) {
-                warn!("Trying to remove file not exists."; "file" => %data_file.inner.path().display());
-            }
+        let files = std::mem::take(&mut *self.flushing_files.write().await);
+        let mfiles = std::mem::take(&mut *self.flushing_meta_files.write().await);
+        for sealed_file in files.into_iter().chain(mfiles).map(|v| v.1) {
+            self.remove_sealed(&sealed_file);
         }
     }
 
+    fn fetch_sst_ts(&self, path: &Path) -> Result<MvccProperties> {
+        use engine_traits::SstReader;
+        let f = engine_rocks::RocksSstReader::open(path.to_str().unwrap(), None)?;
+        let props = f.load_mvcc_properties()?;
+        Ok(props)
+    }
+
+    #[instrument(skip_all, fields(path))]
+    async fn flush_sst_file(&self, path: &Path, sst: SstMeta) -> Result<DataFileGroup> {
+        let props = self
+            .fetch_sst_ts(path)
+            .context(format_args!("load properties from {}", path.display()))?;
+        let mut data_file_group = DataFileGroup::new();
+        let mut data_file_info = DataFileInfo::new();
+        let target_path = format!("{}.sst", hex::encode(&sst.uuid));
+        data_file_info.set_start_key(sst.get_range().get_start().to_owned());
+        data_file_info.set_end_key(sst.get_range().get_end().to_owned());
+        data_file_info.set_path(target_path.clone());
+        data_file_info.set_number_of_entries(sst.get_total_kvs() as _);
+        data_file_info.set_length(sst.get_length());
+        data_file_info.set_cf(sst.get_cf_name().to_owned());
+        data_file_info.set_min_ts(props.min_ts.into_inner());
+        data_file_info.set_max_ts(props.max_ts.into_inner());
+        let file = std::fs::File::open(path)?;
+        let (reader, c) = Sha256Reader::new(file)
+            .map_err(|err| annotate!(err, "failed to create sha256 hasher"))?;
+        self.storage
+            .write(
+                &target_path,
+                AllowStdIo::new(reader).into(),
+                data_file_info.length,
+            )
+            .await?;
+        let hash = c
+            .lock()
+            .unwrap()
+            .finish()
+            .map_err(|err| annotate!(err, "failed to finish sha256 hasher"))?;
+        data_file_info.set_sha256(hash.to_vec());
+        data_file_group.set_data_files_info(vec![data_file_info].into());
+        Ok(data_file_group)
+    }
+
     #[instrument(skip_all)]
-    async fn merge_and_flush_log_files_to(
-        storage: Arc<dyn ExternalStorage>,
-        files: &mut [(TempFileKey, DataFile, DataFileInfo)],
-        metadata: &mut MetadataInfo,
+    async fn flush_kv_stream_files(
+        &self,
+        files: impl Iterator<Item = (&DataFile, &DataFileInfo)>,
         is_meta: bool,
-        shared_pool: Arc<TempFilePool>,
+        metadata: &mut MetadataInfo,
     ) -> Result<()> {
+        let shared_pool = &self.temp_file_pool;
+        let storage = &self.storage;
+
         let mut data_files_open = Vec::new();
         let mut data_file_infos = Vec::new();
         let mut merged_file_info = DataFileGroup::new();
@@ -1097,7 +1172,7 @@ impl StreamTaskInfo {
         let mut max_ts: Option<u64> = None;
         let mut min_ts: Option<u64> = None;
         let mut min_resolved_ts: Option<u64> = None;
-        for (_, data_file, file_info) in files {
+        for (data_file, file_info) in files {
             let mut file_info_clone = file_info.to_owned();
             // Update offset of file_info(DataFileInfo)
             //  and push it into merged_file_info(DataFileGroup).
@@ -1169,10 +1244,9 @@ impl StreamTaskInfo {
 
     #[instrument(skip_all)]
     pub async fn flush_log(&self, metadata: &mut MetadataInfo) -> Result<()> {
-        let storage = self.storage.clone();
-        self.merge_log(metadata, storage.clone(), &self.flushing_files, false)
+        self.merge_log(&self.flushing_files, false, metadata)
             .await?;
-        self.merge_log(metadata, storage.clone(), &self.flushing_meta_files, true)
+        self.merge_log(&self.flushing_meta_files, true, metadata)
             .await?;
         Ok(())
     }
@@ -1180,41 +1254,52 @@ impl StreamTaskInfo {
     #[instrument(skip_all)]
     async fn merge_log(
         &self,
-        metadata: &mut MetadataInfo,
-        storage: Arc<dyn ExternalStorage>,
-        files_lock: &RwLock<Vec<(TempFileKey, DataFile, DataFileInfo)>>,
+        files_lock: &RwLock<Vec<(TempFileKey, SealedFile, DataFileInfo)>>,
         is_meta: bool,
+        metadata: &mut MetadataInfo,
     ) -> Result<()> {
-        let mut files = files_lock.write().await;
-        let mut batch_size = 0;
-        // file[batch_begin_index, i) is a batch
-        let mut batch_begin_index = 0;
-        // TODO: upload the merged file concurrently,
-        // then collect merged_file_infos and push them into `metadata`.
-        for i in 0..files.len() {
-            if batch_size >= self.merged_file_size_limit {
-                Self::merge_and_flush_log_files_to(
-                    storage.clone(),
-                    &mut files[batch_begin_index..i],
-                    metadata,
-                    is_meta,
-                    self.temp_file_pool.clone(),
-                )
-                .await?;
+        let files = files_lock.write().await;
+        // NOTE: Perhaps sort the slice and put all SST files at the end of it for
+        // better performance.
+        let mut rem_files = &files[..];
+        while !rem_files.is_empty() {
+            let batched = {
+                let mut batch_size = 0;
+                let mut offset = 0;
+                for file in rem_files.iter() {
+                    match file.1 {
+                        SealedFile::Stream { .. } => {
+                            offset += 1;
+                            batch_size += file.2.length;
+                            if batch_size >= self.merged_file_size_limit {
+                                break;
+                            }
+                        }
+                        SealedFile::Sst { .. } => {
+                            // For now, we don't support download segment from SST files.
+                            // So we must create an exclusive file group for SSTs.
+                            if offset == 0 {
+                                offset = 1;
+                            }
+                            // In the case of offset == 0, this will generate an exclusive file
+                            // group.
+                            // In the case of offset != 0, this will commit the current batch.
+                            break;
+                        }
+                    }
+                }
+                let batch;
+                (batch, rem_files) = rem_files.split_at(offset);
+                batch
+            };
 
-                batch_begin_index = i;
-                batch_size = 0;
-            }
-
-            batch_size += files[i].2.length;
-        }
-        if batch_begin_index < files.len() {
-            Self::merge_and_flush_log_files_to(
-                storage.clone(),
-                &mut files[batch_begin_index..],
-                metadata,
+            self.flush_kv_stream_files(
+                batched.iter().map(|(_, f, d)| match f {
+                    SealedFile::Stream { data_file } => (data_file, d),
+                    SealedFile::Sst { .. } => unreachable!(),
+                }),
                 is_meta,
-                self.temp_file_pool.clone(),
+                metadata,
             )
             .await?;
         }
@@ -1361,6 +1446,21 @@ impl StreamTaskInfo {
             }
         }
         Ok(false)
+    }
+
+    fn remove_sealed(&self, file: &SealedFile) -> bool {
+        match file {
+            SealedFile::Stream { data_file: df } => self.temp_file_pool.remove(df.inner.path()),
+            SealedFile::Sst { path, .. } => std::fs::remove_file(path).is_ok(),
+        }
+    }
+
+    fn drop_sealed(&self, file: &SealedFile) {
+        debug!("removing sealed file"; "file" => %file);
+        self.total_size.fetch_sub(file.len() as _, Ordering::SeqCst);
+        if !self.remove_sealed(file) {
+            warn!("A log backup file not removed. Perhaps the file doesn't exist."; "file" => %file);
+        }
     }
 }
 
@@ -1948,7 +2048,7 @@ mod tests {
             is_paused: false,
         };
         let merged_file_size_limit = 0x10000;
-        let task = StreamTaskInfo::new(
+        let task = StreamDataCollector::new(
             stream_task,
             vec![(vec![], vec![])],
             merged_file_size_limit,
@@ -2334,7 +2434,7 @@ mod tests {
             info: task_info,
             is_paused: false,
         };
-        let task = StreamTaskInfo::new(
+        let task = StreamDataCollector::new(
             stream_task,
             vec![(vec![], vec![])],
             0x100000,
@@ -2425,31 +2525,36 @@ mod tests {
     async fn test_est_len_in_flush() -> Result<()> {
         let noop_s = NoopStorage::default();
         let ms = MockCheckContentStorage { s: noop_s };
+        let (task, _) = task("test".to_owned()).await.unwrap();
 
         let file_name = format!("{}", uuid::Uuid::new_v4());
         let file_path = Path::new(&file_name);
         let tempfile = TempDir::new().unwrap();
         let cfg = make_tempfiles_cfg(tempfile.path());
-        let pool = Arc::new(TempFilePool::new(cfg).unwrap());
+        let mut task_handler = StreamDataCollector::new(
+            StreamTask {
+                info: task,
+                is_paused: false,
+            },
+            vec![],
+            0,
+            cfg,
+        )
+        .await
+        .unwrap();
+        task_handler.storage = Arc::new(ms);
+        let pool = task_handler.temp_file_pool.clone();
         let mut f = pool.open_for_write(file_path).unwrap();
         f.write_all(b"test-data").await?;
         f.done().await?;
         let mut data_file = DataFile::new(&file_path, &pool).await.unwrap();
         let info = DataFileInfo::new();
-
         let mut meta = MetadataInfo::with_capacity(1);
-        let kv_event = build_kv_event(1, 1);
-        let tmp_key = TempFileKey::of(&kv_event.events[0], 1);
         data_file.inner.done().await?;
-        let mut files = vec![(tmp_key, data_file, info)];
-        let result = StreamTaskInfo::merge_and_flush_log_files_to(
-            Arc::new(ms),
-            &mut files[0..],
-            &mut meta,
-            false,
-            pool.clone(),
-        )
-        .await;
+        let files = vec![(&data_file, &info)];
+        let result = task_handler
+            .flush_kv_stream_files(files.into_iter(), false, &mut meta)
+            .await;
         result.unwrap();
         Ok(())
     }
