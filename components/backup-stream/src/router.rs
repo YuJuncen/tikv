@@ -5,6 +5,7 @@ use std::{
     collections::HashMap,
     fmt::Display,
     path::{Path, PathBuf},
+    process::Output,
     result,
     sync::{
         atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
@@ -29,7 +30,7 @@ use openssl::hash::{Hasher, MessageDigest};
 use protobuf::Message;
 use raftstore::coprocessor::CmdBatch;
 use slog_global::debug;
-use tidb_query_datatype::codec::table::decode_table_id;
+use tidb_query_datatype::codec::{batch, table::decode_table_id};
 use tikv::config::BackupStreamConfig;
 use tikv_util::{
     box_err,
@@ -158,6 +159,12 @@ impl<'a> ApplyEventDesc<'a> {
 pub struct IngestedSst {
     pub meta: SstMeta,
     pub path: PathBuf,
+}
+
+pub struct SealedLog {
+    key: TempFileKey,
+    handle: DataFile,
+    info: DataFileInfo,
 }
 
 #[derive(Debug)]
@@ -401,24 +408,49 @@ impl ApplyEvent {
     }
 }
 
-enum SealedFile {
-    Stream {
-        data_file: DataFile,
-        info: DataFileInfo,
-    },
-    Sst(IngestedSst),
+enum SealedFile<'a> {
+    Stream(&'a SealedLog),
+    Sst(&'a IngestedSst),
 }
 
-impl std::fmt::Debug for SealedFile {
+#[derive(Default)]
+struct SealedFiles {
+    ddl_meta: Vec<SealedLog>,
+    normal: Vec<SealedLog>,
+    ssts: Vec<IngestedSst>,
+}
+
+impl SealedFiles {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.ddl_meta.is_empty() && self.normal.is_empty() && self.ssts.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = SealedFile<'_>> {
+        self.ddl_meta
+            .iter()
+            .map(SealedFile::Stream)
+            .chain(self.normal.iter().map(SealedFile::Stream))
+            .chain(self.ssts.iter().map(SealedFile::Sst))
+    }
+
+    fn logs_mut(&mut self) -> impl Iterator<Item = &mut SealedLog> {
+        self.ddl_meta.iter_mut().chain(self.normal.iter_mut())
+    }
+}
+
+impl<'a> std::fmt::Debug for SealedFile<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Display::fmt(&self, f)
     }
 }
 
-impl Display for SealedFile {
+impl<'a> Display for SealedFile<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SealedFile::Stream { data_file, .. } => write!(
+            SealedFile::Stream(SealedLog {
+                handle: data_file, ..
+            }) => write!(
                 f,
                 "Stream(at_pool={}, len={})",
                 data_file.inner.path().display(),
@@ -431,18 +463,13 @@ impl Display for SealedFile {
     }
 }
 
-impl SealedFile {
+impl<'a> SealedFile<'a> {
     fn len(&self) -> u64 {
         match self {
-            SealedFile::Stream { data_file, .. } => data_file.file_size as _,
+            SealedFile::Stream(SealedLog {
+                handle: data_file, ..
+            }) => data_file.file_size as _,
             SealedFile::Sst(IngestedSst { meta, .. }) => meta.length,
-        }
-    }
-
-    async fn sync(&mut self) -> Result<()> {
-        match self {
-            SealedFile::Stream { data_file: df, .. } => df.inner.done().await,
-            SealedFile::Sst { .. } => Ok(()),
         }
     }
 }
@@ -818,7 +845,7 @@ impl RouterInner {
 }
 
 /// The handle of a temporary file.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash, Default)]
 struct TempFileKey {
     table_id: i64,
     region_id: u64,
@@ -958,10 +985,8 @@ pub struct StreamDataCollector {
     /// The temporary file index. Both meta (m prefixed keys) and data (t
     /// prefixed keys).
     files: SlotMap<TempFileKey, DataFile>,
-    /// flushing_files contains files pending flush.
-    flushing_files: RwLock<Vec<(TempFileKey, SealedFile)>>,
-    /// flushing_meta_files contains meta files pending flush.
-    flushing_meta_files: RwLock<Vec<(TempFileKey, SealedFile)>>,
+    /// The files won't be modified anymore and about to be flushed.
+    sealed_files: RwLock<SealedFiles>,
     /// last_flush_ts represents last time this task flushed to storage.
     last_flush_time: AtomicPtr<Instant>,
     /// The min resolved TS of all regions involved.
@@ -987,9 +1012,7 @@ pub struct StreamDataCollector {
 
 impl Drop for StreamDataCollector {
     fn drop(&mut self) {
-        let ffiles = std::mem::take(self.flushing_files.get_mut());
-        let mffiles = std::mem::take(self.flushing_meta_files.get_mut());
-        let all_flush_files = ffiles.into_iter().chain(mffiles);
+        let flushing_files = std::mem::take(self.sealed_files.get_mut());
         let files = std::mem::take(self.files.get_mut());
         let count_group = |(succ, fail), succeed| {
             if succeed {
@@ -999,8 +1022,9 @@ impl Drop for StreamDataCollector {
             }
         };
 
-        let (success, failed) = all_flush_files
-            .map(|(_, f)| self.remove_sealed(&f))
+        let (success, failed) = flushing_files
+            .iter()
+            .map(|f| self.remove_sealed(&f))
             .fold((0, 0), count_group);
         info!("stream task info dropped[1/2], removing flushing_temp files"; "success" => %success, "failure" => %failed);
 
@@ -1045,8 +1069,7 @@ impl StreamDataCollector {
             ranges,
             min_resolved_ts: TimeStamp::max(),
             files: SlotMap::default(),
-            flushing_files: RwLock::default(),
-            flushing_meta_files: RwLock::default(),
+            sealed_files: RwLock::default(),
             last_flush_time: AtomicPtr::new(Box::into_raw(Box::new(Instant::now()))),
             total_size: AtomicUsize::new(0),
             flushing: AtomicBool::new(false),
@@ -1088,10 +1111,10 @@ impl StreamDataCollector {
             frame!(f.lock()).await.on_events(events).await?,
             Ordering::SeqCst,
         );
-        let mut fs = self.flushing_files.write().await;
+        let mut fs = self.sealed_files.write().await;
         for sst in ssts {
             let size = sst.meta.length;
-            fs.push((key, SealedFile::Sst(sst)));
+            fs.ssts.push(sst);
             self.total_size.fetch_add(size as _, Ordering::SeqCst);
         }
         fail::fail_point!("after_write_to_file");
@@ -1127,11 +1150,10 @@ impl StreamDataCollector {
 
     /// Flush all template files and generate corresponding metadata.
     #[instrument(skip_all)]
-    pub async fn sync_files(&self) -> Result<()> {
-        let mut w = self.flushing_files.write().await;
-        let mut wm = self.flushing_meta_files.write().await;
+    pub async fn sync_current_logs(&self) -> Result<()> {
+        let mut fs = self.sealed_files.write().await;
         // Let's flush all files first...
-        futures::future::join_all(w.iter_mut().chain(wm.iter_mut()).map(|(_, f)| f.sync()))
+        futures::future::join_all(fs.logs_mut().map(|f| f.handle.inner.done()))
             .await
             .into_iter()
             .map(|r| r.map_err(Error::from))
@@ -1172,15 +1194,14 @@ impl StreamDataCollector {
 
     /// move need-flushing files to flushing_files.
     #[instrument(skip_all)]
-    pub async fn move_to_flushing_files(&self) -> Result<()> {
+    pub async fn seal_current_logs(&self) -> Result<()> {
         // Don't flush more files given we have already failed.
         if self.is_retrying() {
             return Ok(());
         }
 
         let mut w = frame!(self.files.write()).await;
-        let mut fw = frame!(self.flushing_files.write()).await;
-        let mut fw_meta = frame!(self.flushing_meta_files.write()).await;
+        let mut sf = frame!(self.sealed_files.write()).await;
         for (k, v) in w.drain() {
             // we should generate file metadata(calculate sha256) when moving file.
             // because sha256 calculation is a unsafe move operation.
@@ -1188,22 +1209,16 @@ impl StreamDataCollector {
             // TODO refactor move_to_flushing_files and generate_metadata
             let mut v = v.into_inner();
             let file_meta = v.generate_metadata(&k)?;
-            if file_meta.is_meta {
-                fw_meta.push((
-                    k,
-                    SealedFile::Stream {
-                        data_file: v,
-                        info: file_meta,
-                    },
-                ));
+            let is_meta = file_meta.is_meta;
+            let sealed = SealedLog {
+                handle: v,
+                info: file_meta,
+                key: k,
+            };
+            if is_meta {
+                sf.ddl_meta.push(sealed);
             } else {
-                fw.push((
-                    k,
-                    SealedFile::Stream {
-                        data_file: v,
-                        info: file_meta,
-                    },
-                ));
+                sf.normal.push(sealed);
             }
         }
         Ok(())
@@ -1211,9 +1226,8 @@ impl StreamDataCollector {
 
     #[instrument(skip_all)]
     pub async fn clear_flushing_files(&self) {
-        let files = std::mem::take(&mut *self.flushing_files.write().await);
-        let mfiles = std::mem::take(&mut *self.flushing_meta_files.write().await);
-        for sealed_file in files.into_iter().chain(mfiles).map(|v| v.1) {
+        let files = std::mem::take(&mut *self.sealed_files.write().await);
+        for sealed_file in files.iter() {
             self.drop_sealed(&sealed_file);
         }
     }
@@ -1231,7 +1245,16 @@ impl StreamDataCollector {
         }
     }
 
-    #[instrument(skip_all, fields(path))]
+    #[instrument(skip_all, fields(len=ssts.len()))]
+    async fn flush_sst_files(&self, ssts: &[IngestedSst], md: &mut MetadataInfo) -> Result<()> {
+        for sst in ssts {
+            let sst = self.flush_sst_file(sst).await?;
+            md.push(sst);
+        }
+        Ok(())
+    }
+
+    #[instrument(skip_all, fields(path=%sst.path.display()))]
     async fn flush_sst_file(&self, sst: &IngestedSst) -> Result<DataFileGroup> {
         let path = &sst.path;
         let meta = &sst.meta;
@@ -1271,7 +1294,7 @@ impl StreamDataCollector {
     #[instrument(skip_all)]
     async fn flush_kv_stream_files(
         &self,
-        files: impl Iterator<Item = (&DataFile, &DataFileInfo)>,
+        files: impl Iterator<Item = &SealedLog>,
         is_meta: bool,
         metadata: &mut MetadataInfo,
     ) -> Result<()> {
@@ -1285,18 +1308,19 @@ impl StreamDataCollector {
         let mut max_ts: Option<u64> = None;
         let mut min_ts: Option<u64> = None;
         let mut min_resolved_ts: Option<u64> = None;
-        for (data_file, file_info) in files {
-            let mut file_info_clone = file_info.to_owned();
+        for SealedLog { info, handle, .. } in files {
+            let mut file_info_clone = info.to_owned();
             // Update offset of file_info(DataFileInfo)
             //  and push it into merged_file_info(DataFileGroup).
             file_info_clone.set_range_offset(stat_length);
             data_files_open.push({
-                let file = shared_pool
-                    .open_raw_for_read(data_file.inner.path())
-                    .context(format_args!(
-                        "failed to open read file {:?}",
-                        data_file.inner.path()
-                    ))?;
+                let file =
+                    shared_pool
+                        .open_raw_for_read(handle.inner.path())
+                        .context(format_args!(
+                            "failed to open read file {:?}",
+                            handle.inner.path()
+                        ))?;
                 let compress_length = file.len().await?;
                 stat_length += compress_length;
                 file_info_clone.set_range_length(compress_length);
@@ -1304,10 +1328,10 @@ impl StreamDataCollector {
             });
             data_file_infos.push(file_info_clone);
 
-            let rts = file_info.resolved_ts;
+            let rts = info.resolved_ts;
             min_resolved_ts = min_resolved_ts.map_or(Some(rts), |r| Some(r.min(rts)));
-            min_ts = min_ts.map_or(Some(file_info.min_ts), |ts| Some(ts.min(file_info.min_ts)));
-            max_ts = max_ts.map_or(Some(file_info.max_ts), |ts| Some(ts.max(file_info.max_ts)));
+            min_ts = min_ts.map_or(Some(info.min_ts), |ts| Some(ts.min(info.min_ts)));
+            max_ts = max_ts.map_or(Some(info.max_ts), |ts| Some(ts.max(info.max_ts)));
         }
         let min_ts = min_ts.unwrap_or_default();
         let max_ts = max_ts.unwrap_or_default();
@@ -1358,21 +1382,29 @@ impl StreamDataCollector {
 
     #[instrument(skip_all)]
     pub async fn flush_log(&self, metadata: &mut MetadataInfo) -> Result<()> {
-        self.merge_and_flush_log(&self.flushing_files, false, metadata)
-            .await?;
-        self.merge_and_flush_log(&self.flushing_meta_files, true, metadata)
-            .await?;
+        let sf = frame!(self.sealed_files.read()).await;
+        let mut normals = metadata.fork();
+        let mut ssts = metadata.fork();
+        let mut metas = metadata.fork();
+        futures::future::try_join3(
+            self.merge_and_flush_log(&sf.normal, false, &mut normals),
+            self.merge_and_flush_log(&sf.ddl_meta, true, &mut metas),
+            self.flush_sst_files(&sf.ssts, &mut ssts),
+        )
+        .await?;
+        metadata.join(normals);
+        metadata.join(ssts);
+        metadata.join(metas);
         Ok(())
     }
 
     #[instrument(skip_all)]
     async fn merge_and_flush_log(
         &self,
-        files_lock: &RwLock<Vec<(TempFileKey, SealedFile)>>,
+        files: &[SealedLog],
         is_meta: bool,
         metadata: &mut MetadataInfo,
     ) -> Result<()> {
-        let files = files_lock.write().await;
         // NOTE: Perhaps sort the slice and put all SST files at the end of it for
         // better performance.
         let mut rem_files = &files[..];
@@ -1381,47 +1413,17 @@ impl StreamDataCollector {
                 let mut batch_size = 0;
                 let mut offset = 0;
                 for file in rem_files.iter() {
-                    match &file.1 {
-                        SealedFile::Stream { info, .. } => {
-                            offset += 1;
-                            batch_size += info.length;
-                            if batch_size >= self.merged_file_size_limit {
-                                break;
-                            }
-                        }
-                        SealedFile::Sst { .. } => {
-                            // For now, we don't support download segment from SST files.
-                            // So we must create an exclusive file group for SSTs.
-                            if offset == 0 {
-                                offset = 1;
-                            }
-                            // In the case of offset == 0, this will generate an exclusive file
-                            // group.
-                            // In the case of offset != 0, this will commit the current batch.
-                            break;
-                        }
+                    offset += 1;
+                    batch_size += file.info.length;
+                    if batch_size >= self.merged_file_size_limit {
+                        break;
                     }
                 }
                 let batch;
                 (batch, rem_files) = rem_files.split_at(offset);
                 batch
             };
-            match batched {
-                [(_, SealedFile::Sst(sst))] => {
-                    self.flush_sst_file(sst).await?;
-                }
-                _ => {
-                    self.flush_kv_stream_files(
-                        batched.iter().map(|(_, f)| match f {
-                            SealedFile::Stream { data_file, info } => (data_file, info),
-                            SealedFile::Sst { .. } => unreachable!(),
-                        }),
-                        is_meta,
-                        metadata,
-                    )
-                    .await?;
-                }
-            }
+            self.flush_kv_stream_files(batched.iter(), is_meta, metadata);
         }
 
         Ok(())
@@ -1471,8 +1473,8 @@ impl StreamDataCollector {
             let mut sw = StopWatch::by_now();
 
             // generate meta data and prepare to flush to storage
-            self.move_to_flushing_files().await?;
-            self.sync_files().await?;
+            self.seal_current_logs().await?;
+            self.sync_current_logs().await?;
             let mut metadata_info = MetadataInfo::default();
             metadata_info.set_store_id(store_id);
 
@@ -1573,7 +1575,9 @@ impl StreamDataCollector {
 
     fn remove_sealed(&self, file: &SealedFile) -> bool {
         match file {
-            SealedFile::Stream { data_file: df, .. } => self.temp_file_pool.remove(df.inner.path()),
+            SealedFile::Stream(SealedLog { handle, .. }) => {
+                self.temp_file_pool.remove(handle.inner.path())
+            }
             SealedFile::Sst(IngestedSst { path, .. }) => std::fs::remove_file(path).is_ok(),
         }
     }
@@ -1651,6 +1655,31 @@ impl MetadataInfo {
             self.min_resolved_ts.unwrap_or_default(),
             uuid::Uuid::new_v4()
         )
+    }
+
+    fn fork(&self) -> Self {
+        Self {
+            file_groups: vec![],
+            min_resolved_ts: None,
+            min_ts: None,
+            max_ts: None,
+            store_id: self.store_id,
+        }
+    }
+
+    fn join(&mut self, other: Self) {
+        fn merge_one<T>(a: Option<T>, b: Option<T>, choose: impl FnOnce(T, T) -> T) -> Option<T> {
+            match (a, b) {
+                (None, None) => None,
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (Some(a), Some(b)) => Some(choose(a, b)),
+            }
+        }
+        self.min_ts = merge_one(self.min_ts, other.min_ts, Ord::min);
+        self.max_ts = merge_one(self.max_ts, other.max_ts, Ord::max);
+        self.min_resolved_ts = merge_one(self.min_resolved_ts, other.min_resolved_ts, Ord::min);
+        self.file_groups.extend(other.file_groups);
     }
 }
 
@@ -2064,8 +2093,8 @@ mod tests {
 
         let end_ts = TimeStamp::physical_now();
         let files = router.tasks.lock().await.get("dummy").unwrap().clone();
-        files.move_to_flushing_files().await.unwrap();
-        files.sync_files().await.unwrap();
+        files.seal_current_logs().await.unwrap();
+        files.sync_current_logs().await.unwrap();
         let mut meta = MetadataInfo::default();
         meta.set_store_id(1);
 
@@ -2243,7 +2272,7 @@ mod tests {
         task.do_flush(1, TimeStamp::new(1)).await.unwrap();
         assert_eq!(task.flush_failure_count(), 0);
         assert_eq!(task.files.read().await.is_empty(), true);
-        assert_eq!(task.flushing_files.read().await.is_empty(), true);
+        assert_eq!(task.sealed_files.read().await.is_empty(), true);
 
         // assert backup log files
         let mut meta_count = 0;
@@ -2437,7 +2466,7 @@ mod tests {
         router
             .collector_of("cleanup_test")
             .await?
-            .move_to_flushing_files()
+            .seal_current_logs()
             .await?;
         write_simple_data(&router).await;
         let mut w = walkdir::WalkDir::new(&tmp).into_iter();
@@ -2724,11 +2753,15 @@ mod tests {
         f.done().await?;
         let mut data_file = DataFile::new(&file_path, &pool).await.unwrap();
         let info = DataFileInfo::new();
-        let mut meta = MetadataInfo::with_capacity(1);
+        let mut meta = MetadataInfo::default();
         data_file.inner.done().await?;
-        let files = vec![(&data_file, &info)];
+        let files = vec![SealedLog {
+            handle: data_file,
+            info,
+            key: TempFileKey::default(),
+        }];
         let result = task_handler
-            .flush_kv_stream_files(files.into_iter(), false, &mut meta)
+            .flush_kv_stream_files(files.iter(), false, &mut meta)
             .await;
         result.unwrap();
         Ok(())
