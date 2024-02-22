@@ -23,7 +23,7 @@ use kvproto::{
         StreamBackupTaskInfo,
     },
     import_sstpb::SstMeta,
-    raft_cmdpb::CmdType,
+    raft_cmdpb::{CmdType, IngestSstRequest},
 };
 use openssl::hash::{Hasher, MessageDigest};
 use protobuf::Message;
@@ -141,12 +141,89 @@ pub struct ApplyEvent {
     pub cmd_type: CmdType,
 }
 
+struct ApplyEventDesc<'a> {
+    key: &'a [u8],
+    cf: &'a str,
+    cmd_type: CmdType,
+}
+
+impl<'a> ApplyEventDesc<'a> {
+    fn is_meta(&self) -> bool {
+        // Can we make things not looking so hacky?
+        self.key.starts_with(b"m")
+    }
+}
+
+#[derive(Debug)]
+pub struct IngestedSst {
+    pub meta: SstMeta,
+    pub path: PathBuf,
+}
+
 #[derive(Debug)]
 pub struct ApplyEvents {
     events: Vec<ApplyEvent>,
+    ssts: Vec<IngestedSst>,
     region_id: u64,
     // TODO: this field is useless, maybe remove it.
     region_resolved_ts: u64,
+}
+
+fn handle_normal(
+    req: kvproto::raft_cmdpb::Request,
+    resolver: &mut TwoPhaseResolver,
+    region_id: u64,
+) -> Result<Option<ApplyEvent>> {
+    let cmd_type = req.cmd_type;
+    let (key, value, cf) = match utils::request_to_triple(req) {
+        Either::Left(t) => t,
+        Either::Right(req) => {
+            debug!("ignoring unexpected request"; "type" => ?req.get_cmd_type());
+            return Ok(None);
+        }
+    };
+    if cf == CF_LOCK {
+        match cmd_type {
+            CmdType::Put => {
+                match Lock::parse(&value).map_err(|err| {
+                    annotate!(
+                        err,
+                        "failed to parse lock (value = {})",
+                        utils::redact(&value)
+                    )
+                }) {
+                    Ok(lock) => {
+                        if utils::should_track_lock(&lock) {
+                            resolver
+                                .track_lock(lock.ts, key)
+                                .map_err(|_| Error::OutOfQuota { region_id })?;
+                        }
+                    }
+                    Err(err) => err.report(format!("region id = {}", region_id)),
+                }
+            }
+            CmdType::Delete => resolver.untrack_lock(&key),
+            _ => {}
+        }
+        return Ok(None);
+    }
+    let item = ApplyEvent {
+        key,
+        value,
+        cf,
+        cmd_type,
+    };
+    if !item.should_record() {
+        return Ok(None);
+    }
+    Ok(Some(item))
+}
+
+fn handle_ingest_sst(req: &IngestSstRequest) -> IngestedSst {
+    IngestedSst {
+        meta: req.get_sst().clone(),
+        path: Path::new("/tmp/placeholder.sst").to_owned(),
+    }
 }
 
 impl ApplyEvents {
@@ -157,7 +234,8 @@ impl ApplyEvents {
     /// we also need to update resolved_ts when flushing?
     pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut TwoPhaseResolver) -> Result<Self> {
         let region_id = cmd.region_id;
-        let mut result = vec![];
+        let mut events = vec![];
+        let mut ssts = vec![];
         for req in cmd
             .cmds
             .into_iter()
@@ -178,54 +256,20 @@ impl ApplyEvents {
             .flat_map(|mut cmd| cmd.request.take_requests().into_iter())
         {
             let cmd_type = req.get_cmd_type();
-
-            let (key, value, cf) = match utils::request_to_triple(req) {
-                Either::Left(t) => t,
-                Either::Right(req) => {
-                    debug!("ignoring unexpected request"; "type" => ?req.get_cmd_type());
-                    SKIP_KV_COUNTER.inc();
-                    continue;
-                }
-            };
-            if cf == CF_LOCK {
-                match cmd_type {
-                    CmdType::Put => {
-                        match Lock::parse(&value).map_err(|err| {
-                            annotate!(
-                                err,
-                                "failed to parse lock (value = {})",
-                                utils::redact(&value)
-                            )
-                        }) {
-                            Ok(lock) => {
-                                if utils::should_track_lock(&lock) {
-                                    resolver
-                                        .track_lock(lock.ts, key)
-                                        .map_err(|_| Error::OutOfQuota { region_id })?;
-                                }
-                            }
-                            Err(err) => err.report(format!("region id = {}", region_id)),
-                        }
+            match cmd_type {
+                CmdType::Put | CmdType::Delete => match handle_normal(req, resolver, region_id)? {
+                    Some(item) => events.push(item),
+                    None => {
+                        SKIP_KV_COUNTER.inc();
                     }
-                    CmdType::Delete => resolver.untrack_lock(&key),
-                    _ => {}
-                }
-                continue;
+                },
+                CmdType::IngestSst => ssts.push(handle_ingest_sst(req.get_ingest_sst())),
+                _ => SKIP_KV_COUNTER.inc(),
             }
-            let item = ApplyEvent {
-                key,
-                value,
-                cf,
-                cmd_type,
-            };
-            if !item.should_record() {
-                SKIP_KV_COUNTER.inc();
-                continue;
-            }
-            result.push(item);
         }
         Ok(Self {
-            events: result,
+            events,
+            ssts,
             region_id,
             region_resolved_ts: resolver.resolved_ts().into_inner(),
         })
@@ -237,6 +281,7 @@ impl ApplyEvents {
 
     pub fn with_capacity(cap: usize, region_id: u64) -> Self {
         Self {
+            ssts: vec![],
             events: Vec::with_capacity(cap),
             region_id,
             region_resolved_ts: 0,
@@ -257,42 +302,80 @@ impl ApplyEvents {
 
     fn group_by<T: std::hash::Hash + Clone + Eq, R: Borrow<T>>(
         self,
-        mut partition_fn: impl FnMut(&ApplyEvent) -> Option<R>,
+        mut partition_fn: impl FnMut(ApplyEventDesc) -> Option<R>,
     ) -> HashMap<T, Self> {
         let mut result: HashMap<T, Self> = HashMap::new();
-        let event_len = self.len();
-        for event in self.events {
-            if let Some(item) = partition_fn(&event) {
-                if let Some(events) = result.get_mut(<R as Borrow<T>>::borrow(&item)) {
-                    events.events.push(event);
-                } else {
-                    result.insert(
-                        <R as Borrow<T>>::borrow(&item).clone(),
-                        ApplyEvents {
-                            events: {
-                                // assuming the keys in the same region would probably be in one
-                                // group.
-                                let mut v = Vec::with_capacity(event_len);
-                                v.push(event);
-                                v
-                            },
-                            region_resolved_ts: self.region_resolved_ts,
-                            region_id: self.region_id,
-                        },
-                    );
+        let template = self.fork();
+        fn upsert<T: std::hash::Hash + Clone + Eq, R: Borrow<T>, V>(
+            m: &mut HashMap<T, V>,
+            key: &R,
+            update: impl FnOnce(&mut V),
+            default: impl FnOnce() -> V,
+        ) {
+            let key = key.borrow();
+            match m.get_mut(key) {
+                Some(v) => update(v),
+                None => {
+                    m.insert(key.clone(), {
+                        let mut v = default();
+                        update(&mut v);
+                        v
+                    });
                 }
+            }
+        }
+
+        for event in self.events {
+            let desc = ApplyEventDesc {
+                key: &event.key,
+                cmd_type: event.cmd_type,
+                cf: event.cf,
+            };
+
+            if let Some(item) = partition_fn(desc) {
+                upsert(
+                    &mut result,
+                    &item,
+                    |evts| evts.events.push(event),
+                    || template.fork(),
+                );
+            }
+        }
+
+        for sst in self.ssts {
+            let desc = ApplyEventDesc {
+                key: sst.meta.get_range().get_start(),
+                cf: sst.meta.get_cf_name(),
+                cmd_type: CmdType::IngestSst,
+            };
+            if let Some(item) = partition_fn(desc) {
+                upsert(
+                    &mut result,
+                    &item,
+                    |evts| evts.ssts.push(sst),
+                    || template.fork(),
+                );
             }
         }
         result
     }
 
     fn partition_by_range(self, ranges: &SegmentMap<Vec<u8>, String>) -> HashMap<String, Self> {
-        self.group_by(|event| ranges.get_value_by_point(&event.key))
+        self.group_by(|event| ranges.get_value_by_point(event.key))
     }
 
     fn partition_by_table_key(self) -> HashMap<TempFileKey, Self> {
         let region_id = self.region_id;
         self.group_by(move |event| Some(TempFileKey::of(event, region_id)))
+    }
+
+    fn fork(&self) -> Self {
+        Self {
+            events: vec![],
+            ssts: vec![],
+            region_id: self.region_id,
+            region_resolved_ts: self.region_resolved_ts,
+        }
     }
 }
 
@@ -319,20 +402,29 @@ impl ApplyEvent {
 }
 
 enum SealedFile {
-    Stream { data_file: DataFile },
-    Sst { path: PathBuf, meta: SstMeta },
+    Stream {
+        data_file: DataFile,
+        info: DataFileInfo,
+    },
+    Sst(IngestedSst),
+}
+
+impl std::fmt::Debug for SealedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(&self, f)
+    }
 }
 
 impl Display for SealedFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SealedFile::Stream { data_file } => write!(
+            SealedFile::Stream { data_file, .. } => write!(
                 f,
                 "Stream(at_pool={}, len={})",
                 data_file.inner.path().display(),
                 self.len()
             ),
-            SealedFile::Sst { path, meta } => {
+            SealedFile::Sst(IngestedSst { path, meta }) => {
                 write!(f, "Sst(at_fs={}, len={})", path.display(), meta.length)
             }
         }
@@ -342,14 +434,14 @@ impl Display for SealedFile {
 impl SealedFile {
     fn len(&self) -> u64 {
         match self {
-            SealedFile::Stream { data_file } => data_file.file_size as _,
-            SealedFile::Sst { path, meta } => meta.length,
+            SealedFile::Stream { data_file, .. } => data_file.file_size as _,
+            SealedFile::Sst(IngestedSst { meta, .. }) => meta.length,
         }
     }
 
     async fn sync(&mut self) -> Result<()> {
         match self {
-            SealedFile::Stream { data_file: df } => df.inner.done().await,
+            SealedFile::Stream { data_file: df, .. } => df.inner.done().await,
             SealedFile::Sst { .. } => Ok(()),
         }
     }
@@ -590,7 +682,7 @@ impl RouterInner {
     }
 
     #[instrument(skip(self))]
-    pub async fn get_task_info(&self, task_name: &str) -> Result<Arc<StreamDataCollector>> {
+    pub async fn collector_of(&self, task_name: &str) -> Result<Arc<StreamDataCollector>> {
         let task_info = match frame!(self.tasks.lock()).await.get(task_name) {
             Some(t) => t.clone(),
             None => {
@@ -605,8 +697,8 @@ impl RouterInner {
 
     #[instrument(skip_all, fields(task))]
     async fn on_event(&self, task: String, events: ApplyEvents) -> Result<()> {
-        let task_info = self.get_task_info(&task).await?;
-        task_info.on_events(events).await?;
+        let coll = self.collector_of(&task).await?;
+        coll.on_events(events).await?;
         let file_size_limit = self.temp_file_size_limit.load(Ordering::SeqCst);
 
         // When this event make the size of temporary files exceeds the size limit, make
@@ -615,16 +707,16 @@ impl RouterInner {
         debug!(
             "backup stream statics size";
             "task" => ?task,
-            "next_size" => task_info.total_size(),
+            "next_size" => coll.total_size(),
             "size_limit" => file_size_limit,
         );
-        let cur_size = task_info.total_size();
-        if cur_size > file_size_limit && !task_info.is_flushing() {
+        let cur_size = coll.total_size();
+        if cur_size > file_size_limit && !coll.is_flushing() {
             info!("try flushing task"; "task" => %task, "size" => %cur_size);
-            if task_info.set_flushing_status_cas(false, true).is_ok() {
+            if coll.set_flushing_status_cas(false, true).is_ok() {
                 if let Err(e) = self.scheduler.schedule(Task::Flush(task)) {
                     error!("backup stream schedule task failed"; "error" => ?e);
-                    task_info.set_flushing_status(false);
+                    coll.set_flushing_status(false);
                 }
             }
         }
@@ -687,7 +779,7 @@ impl RouterInner {
         global_checkpoint: u64,
         store_id: u64,
     ) -> Result<bool> {
-        self.get_task_info(task_name)
+        self.collector_of(task_name)
             .await?
             .update_global_checkpoint(global_checkpoint, store_id)
             .await
@@ -743,7 +835,7 @@ pub enum FormatType {
 impl TempFileKey {
     /// Create the key for an event. The key can be used to find which temporary
     /// file the event should be stored.
-    fn of(kv: &ApplyEvent, region_id: u64) -> Self {
+    fn of(kv: ApplyEventDesc<'_>, region_id: u64) -> Self {
         let table_id = if kv.is_meta() {
             // Force table id of meta key be zero.
             0
@@ -761,14 +853,14 @@ impl TempFileKey {
             is_meta: kv.is_meta(),
             table_id,
             region_id,
-            cf: kv.cf,
+            cf: utils::cf_name(kv.cf),
             cmd_type: kv.cmd_type,
         }
     }
 
     fn get_file_type(&self) -> FileType {
         match self.cmd_type {
-            CmdType::Put => FileType::Put,
+            CmdType::Put | CmdType::IngestSst => FileType::Put,
             CmdType::Delete => FileType::Delete,
             _ => {
                 warn!("error cmdtype"; "cmdtype" => ?self.cmd_type);
@@ -867,9 +959,9 @@ pub struct StreamDataCollector {
     /// prefixed keys).
     files: SlotMap<TempFileKey, DataFile>,
     /// flushing_files contains files pending flush.
-    flushing_files: RwLock<Vec<(TempFileKey, SealedFile, DataFileInfo)>>,
+    flushing_files: RwLock<Vec<(TempFileKey, SealedFile)>>,
     /// flushing_meta_files contains meta files pending flush.
-    flushing_meta_files: RwLock<Vec<(TempFileKey, SealedFile, DataFileInfo)>>,
+    flushing_meta_files: RwLock<Vec<(TempFileKey, SealedFile)>>,
     /// last_flush_ts represents last time this task flushed to storage.
     last_flush_time: AtomicPtr<Instant>,
     /// The min resolved TS of all regions involved.
@@ -908,7 +1000,7 @@ impl Drop for StreamDataCollector {
         };
 
         let (success, failed) = all_flush_files
-            .map(|(_, f, _)| self.remove_sealed(&f))
+            .map(|(_, f)| self.remove_sealed(&f))
             .fold((0, 0), count_group);
         info!("stream task info dropped[1/2], removing flushing_temp files"; "success" => %success, "failure" => %failed);
 
@@ -966,8 +1058,9 @@ impl StreamDataCollector {
     }
 
     #[instrument(skip(self, events), fields(event_len = events.len()))]
-    async fn on_events_of_key(&self, key: TempFileKey, events: ApplyEvents) -> Result<()> {
+    async fn on_events_of_key(&self, key: TempFileKey, mut events: ApplyEvents) -> Result<()> {
         fail::fail_point!("before_generate_temp_file");
+        debug!("Log backup consuming event."; "key" => ?key, "normal_len" => %events.events.len(), "sst_len" => %events.ssts.len());
         if let Some(f) = frame!(self.files.read()).await.get(&key) {
             self.total_size.fetch_add(
                 frame!(f.lock()).await.on_events(events).await?,
@@ -990,10 +1083,17 @@ impl StreamDataCollector {
         }
 
         let f = w.get(&key).unwrap();
+        let ssts = std::mem::take(&mut events.ssts);
         self.total_size.fetch_add(
             frame!(f.lock()).await.on_events(events).await?,
             Ordering::SeqCst,
         );
+        let mut fs = self.flushing_files.write().await;
+        for sst in ssts {
+            let size = sst.meta.length;
+            fs.push((key, SealedFile::Sst(sst)));
+            self.total_size.fetch_add(size as _, Ordering::SeqCst);
+        }
         fail::fail_point!("after_write_to_file");
         Ok(())
     }
@@ -1027,20 +1127,17 @@ impl StreamDataCollector {
 
     /// Flush all template files and generate corresponding metadata.
     #[instrument(skip_all)]
-    pub async fn generate_metadata(&self, store_id: u64) -> Result<MetadataInfo> {
+    pub async fn sync_files(&self) -> Result<()> {
         let mut w = self.flushing_files.write().await;
         let mut wm = self.flushing_meta_files.write().await;
         // Let's flush all files first...
-        futures::future::join_all(w.iter_mut().chain(wm.iter_mut()).map(|(_, f, _)| f.sync()))
+        futures::future::join_all(w.iter_mut().chain(wm.iter_mut()).map(|(_, f)| f.sync()))
             .await
             .into_iter()
             .map(|r| r.map_err(Error::from))
             .fold(Ok(()), Result::and)?;
 
-        let mut metadata = MetadataInfo::with_capacity(w.len() + wm.len());
-        metadata.set_store_id(store_id);
-        // delay push files until log files are flushed
-        Ok(metadata)
+        Ok(())
     }
 
     pub fn set_flushing_status_cas(&self, expect: bool, new: bool) -> result::Result<bool, bool> {
@@ -1075,13 +1172,10 @@ impl StreamDataCollector {
 
     /// move need-flushing files to flushing_files.
     #[instrument(skip_all)]
-    pub async fn move_to_flushing_files(&self) -> Result<&Self> {
-        // if flushing_files is not empty, which represents this flush is a retry
-        // operation.
-        if !self.flushing_files.read().await.is_empty()
-            || !self.flushing_meta_files.read().await.is_empty()
-        {
-            return Ok(self);
+    pub async fn move_to_flushing_files(&self) -> Result<()> {
+        // Don't flush more files given we have already failed.
+        if self.is_retrying() {
+            return Ok(());
         }
 
         let mut w = frame!(self.files.write()).await;
@@ -1095,12 +1189,24 @@ impl StreamDataCollector {
             let mut v = v.into_inner();
             let file_meta = v.generate_metadata(&k)?;
             if file_meta.is_meta {
-                fw_meta.push((k, SealedFile::Stream { data_file: v }, file_meta));
+                fw_meta.push((
+                    k,
+                    SealedFile::Stream {
+                        data_file: v,
+                        info: file_meta,
+                    },
+                ));
             } else {
-                fw.push((k, SealedFile::Stream { data_file: v }, file_meta));
+                fw.push((
+                    k,
+                    SealedFile::Stream {
+                        data_file: v,
+                        info: file_meta,
+                    },
+                ));
             }
         }
-        Ok(self)
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -1108,33 +1214,40 @@ impl StreamDataCollector {
         let files = std::mem::take(&mut *self.flushing_files.write().await);
         let mfiles = std::mem::take(&mut *self.flushing_meta_files.write().await);
         for sealed_file in files.into_iter().chain(mfiles).map(|v| v.1) {
-            self.remove_sealed(&sealed_file);
+            self.drop_sealed(&sealed_file);
         }
     }
 
-    fn fetch_sst_ts(&self, path: &Path) -> Result<MvccProperties> {
+    fn fetch_min_max_ts(&self, path: &Path) -> (u64, u64) {
         use engine_traits::SstReader;
-        let f = engine_rocks::RocksSstReader::open(path.to_str().unwrap(), None)?;
-        let props = f.load_mvcc_properties()?;
-        Ok(props)
+        let props = engine_rocks::RocksSstReader::open(path.to_str().unwrap(), None)
+            .and_then(|f| f.load_mvcc_properties());
+        match props {
+            Ok(props) => (props.min_ts.into_inner(), props.max_ts.into_inner()),
+            Err(err) => {
+                warn!("Failed to load mvcc properties. The SST might be leaked."; "err" => ?err, "path" => %path.display());
+                (0, u64::MAX)
+            }
+        }
     }
 
     #[instrument(skip_all, fields(path))]
-    async fn flush_sst_file(&self, path: &Path, sst: SstMeta) -> Result<DataFileGroup> {
-        let props = self
-            .fetch_sst_ts(path)
-            .context(format_args!("load properties from {}", path.display()))?;
+    async fn flush_sst_file(&self, sst: &IngestedSst) -> Result<DataFileGroup> {
+        let path = &sst.path;
+        let meta = &sst.meta;
+        info!("Log backup flushing sst."; "path" => %path.display(), "meta" => ?meta);
+        let (min_ts, max_ts) = self.fetch_min_max_ts(path);
         let mut data_file_group = DataFileGroup::new();
         let mut data_file_info = DataFileInfo::new();
-        let target_path = format!("{}.sst", hex::encode(&sst.uuid));
-        data_file_info.set_start_key(sst.get_range().get_start().to_owned());
-        data_file_info.set_end_key(sst.get_range().get_end().to_owned());
+        let target_path = format!("{}.sst", hex::encode(&meta.uuid));
+        data_file_info.set_start_key(meta.get_range().get_start().to_owned());
+        data_file_info.set_end_key(meta.get_range().get_end().to_owned());
         data_file_info.set_path(target_path.clone());
-        data_file_info.set_number_of_entries(sst.get_total_kvs() as _);
-        data_file_info.set_length(sst.get_length());
-        data_file_info.set_cf(sst.get_cf_name().to_owned());
-        data_file_info.set_min_ts(props.min_ts.into_inner());
-        data_file_info.set_max_ts(props.max_ts.into_inner());
+        data_file_info.set_number_of_entries(meta.get_total_kvs() as _);
+        data_file_info.set_length(meta.get_length());
+        data_file_info.set_cf(meta.get_cf_name().to_owned());
+        data_file_info.set_min_ts(min_ts);
+        data_file_info.set_max_ts(max_ts);
         let file = std::fs::File::open(path)?;
         let (reader, c) = Sha256Reader::new(file)
             .map_err(|err| annotate!(err, "failed to create sha256 hasher"))?;
@@ -1217,6 +1330,7 @@ impl StreamDataCollector {
 
         let reader = UnpinReader(Box::new(limiter.limit(files_reader.compat())));
         let filepath = &merged_file_info.path;
+        debug!("Log backup about to flush the normal files."; "path" => ?filepath, "est_len" => ?stat_length, "len" => merged_file_info.get_data_files_info().len());
 
         let ret = storage.write(filepath, reader, stat_length).await;
 
@@ -1244,17 +1358,17 @@ impl StreamDataCollector {
 
     #[instrument(skip_all)]
     pub async fn flush_log(&self, metadata: &mut MetadataInfo) -> Result<()> {
-        self.merge_log(&self.flushing_files, false, metadata)
+        self.merge_and_flush_log(&self.flushing_files, false, metadata)
             .await?;
-        self.merge_log(&self.flushing_meta_files, true, metadata)
+        self.merge_and_flush_log(&self.flushing_meta_files, true, metadata)
             .await?;
         Ok(())
     }
 
     #[instrument(skip_all)]
-    async fn merge_log(
+    async fn merge_and_flush_log(
         &self,
-        files_lock: &RwLock<Vec<(TempFileKey, SealedFile, DataFileInfo)>>,
+        files_lock: &RwLock<Vec<(TempFileKey, SealedFile)>>,
         is_meta: bool,
         metadata: &mut MetadataInfo,
     ) -> Result<()> {
@@ -1267,10 +1381,10 @@ impl StreamDataCollector {
                 let mut batch_size = 0;
                 let mut offset = 0;
                 for file in rem_files.iter() {
-                    match file.1 {
-                        SealedFile::Stream { .. } => {
+                    match &file.1 {
+                        SealedFile::Stream { info, .. } => {
                             offset += 1;
-                            batch_size += file.2.length;
+                            batch_size += info.length;
                             if batch_size >= self.merged_file_size_limit {
                                 break;
                             }
@@ -1292,16 +1406,22 @@ impl StreamDataCollector {
                 (batch, rem_files) = rem_files.split_at(offset);
                 batch
             };
-
-            self.flush_kv_stream_files(
-                batched.iter().map(|(_, f, d)| match f {
-                    SealedFile::Stream { data_file } => (data_file, d),
-                    SealedFile::Sst { .. } => unreachable!(),
-                }),
-                is_meta,
-                metadata,
-            )
-            .await?;
+            match batched {
+                [(_, SealedFile::Sst(sst))] => {
+                    self.flush_sst_file(sst).await?;
+                }
+                _ => {
+                    self.flush_kv_stream_files(
+                        batched.iter().map(|(_, f)| match f {
+                            SealedFile::Stream { data_file, info } => (data_file, info),
+                            SealedFile::Sst { .. } => unreachable!(),
+                        }),
+                        is_meta,
+                        metadata,
+                    )
+                    .await?;
+                }
+            }
         }
 
         Ok(())
@@ -1351,11 +1471,10 @@ impl StreamDataCollector {
             let mut sw = StopWatch::by_now();
 
             // generate meta data and prepare to flush to storage
-            let mut metadata_info = self
-                .move_to_flushing_files()
-                .await?
-                .generate_metadata(store_id)
-                .await?;
+            self.move_to_flushing_files().await?;
+            self.sync_files().await?;
+            let mut metadata_info = MetadataInfo::default();
+            metadata_info.set_store_id(store_id);
 
             fail::fail_point!("after_moving_to_flushing_files");
             crate::metrics::FLUSH_DURATION
@@ -1410,6 +1529,10 @@ impl StreamDataCollector {
         result
     }
 
+    fn is_retrying(&self) -> bool {
+        self.flush_fail_count.load(Ordering::SeqCst) > 0
+    }
+
     pub async fn flush_global_checkpoint(&self, store_id: u64) -> Result<()> {
         let filename = format!("v1/global_checkpoint/{}.ts", store_id);
         let buff = self
@@ -1450,8 +1573,8 @@ impl StreamDataCollector {
 
     fn remove_sealed(&self, file: &SealedFile) -> bool {
         match file {
-            SealedFile::Stream { data_file: df } => self.temp_file_pool.remove(df.inner.path()),
-            SealedFile::Sst { path, .. } => std::fs::remove_file(path).is_ok(),
+            SealedFile::Stream { data_file: df, .. } => self.temp_file_pool.remove(df.inner.path()),
+            SealedFile::Sst(IngestedSst { path, .. }) => std::fs::remove_file(path).is_ok(),
         }
     }
 
@@ -1480,7 +1603,7 @@ struct DataFile {
     file_size: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct MetadataInfo {
     // the field files is deprecated in v6.3.0
     // pub files: Vec<DataFileInfo>,
@@ -1492,16 +1615,6 @@ pub struct MetadataInfo {
 }
 
 impl MetadataInfo {
-    fn with_capacity(cap: usize) -> Self {
-        Self {
-            file_groups: Vec::with_capacity(cap),
-            min_resolved_ts: None,
-            min_ts: None,
-            max_ts: None,
-            store_id: 0,
-        }
-    }
-
     fn set_store_id(&mut self, store_id: u64) {
         self.store_id = store_id;
     }
@@ -1690,22 +1803,35 @@ struct TaskRange {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, io, time::Duration};
+    use std::{ffi::OsStr, io, mem::ManuallyDrop, time::Duration};
 
+    use engine_rocks::{RocksEngine, RocksSstReader, RocksSstWriter, RocksSstWriterBuilder};
+    use engine_traits::{
+        IterOptions, Iterator, RefIterable, SstReader, SstWriter, SstWriterBuilder,
+    };
     use external_storage::{ExternalData, NoopStorage};
     use futures::AsyncReadExt;
-    use kvproto::brpb::{Local, Noop, StorageBackend, StreamBackupTaskInfo};
+    use kvproto::{
+        brpb::{Local, Noop, StorageBackend, StreamBackupTaskInfo},
+        import_sstpb::Range,
+    };
     use online_config::{ConfigManager, OnlineConfig};
+    use rand::{Rng, RngCore};
     use tempfile::TempDir;
     use tikv_util::{
         codec::number::NumberEncoder,
         config::ReadableDuration,
+        defer,
         worker::{dummy_scheduler, ReceiverWrapper},
     };
     use txn_types::{Write, WriteType};
+    use uuid::Uuid;
 
     use super::*;
-    use crate::{config::BackupStreamConfigManager, utils};
+    use crate::{
+        config::BackupStreamConfigManager,
+        utils::{self, wrap_key},
+    };
 
     #[derive(Debug)]
     struct KvEventsBuilder {
@@ -1743,6 +1869,7 @@ mod tests {
         fn new(region_id: u64, region_resolved_ts: u64) -> Self {
             Self {
                 events: ApplyEvents {
+                    ssts: vec![],
                     events: vec![],
                     region_id,
                     region_resolved_ts,
@@ -1798,6 +1925,7 @@ mod tests {
             std::mem::replace(
                 &mut self.events,
                 ApplyEvents {
+                    ssts: vec![],
                     events: vec![],
                     region_id,
                     region_resolved_ts,
@@ -1936,14 +2064,18 @@ mod tests {
 
         let end_ts = TimeStamp::physical_now();
         let files = router.tasks.lock().await.get("dummy").unwrap().clone();
-        let mut meta = files
-            .move_to_flushing_files()
-            .await
-            .unwrap()
-            .generate_metadata(1)
-            .await
-            .unwrap();
+        files.move_to_flushing_files().await.unwrap();
+        files.sync_files().await.unwrap();
+        let mut meta = MetadataInfo::default();
+        meta.set_store_id(1);
 
+        // in some case when flush failed to write files to storage.
+        // we may run `generate_metadata` again with same files.
+        let mut another_meta = MetadataInfo::default();
+        meta.set_store_id(1);
+
+        files.flush_log(&mut meta).await.unwrap();
+        files.flush_log(&mut another_meta).await.unwrap();
         assert!(
             meta.file_groups
                 .iter()
@@ -1957,19 +2089,6 @@ mod tests {
             start_ts,
             end_ts
         );
-
-        // in some case when flush failed to write files to storage.
-        // we may run `generate_metadata` again with same files.
-        let mut another_meta = files
-            .move_to_flushing_files()
-            .await
-            .unwrap()
-            .generate_metadata(1)
-            .await
-            .unwrap();
-
-        files.flush_log(&mut meta).await.unwrap();
-        files.flush_log(&mut another_meta).await.unwrap();
         // meta updated
         let files_num = meta
             .file_groups
@@ -2035,6 +2154,62 @@ mod tests {
             "world".repeat(1024).as_bytes(),
         );
         events_builder.finish()
+    }
+
+    fn create_simple_sst(table_id: i64, base: &Path) -> IngestedSst {
+        let path = base.join("test.sst");
+        let mut sst = RocksSstWriterBuilder::new()
+            .build(path.to_str().unwrap())
+            .unwrap();
+        let max = 50i32;
+        for i in 0..max {
+            let key = Key::from_encoded(wrap_key(make_table_key(table_id, &i.to_le_bytes()[..])))
+                .append_ts(TimeStamp::new(42));
+            let mut value = vec![0u8; 64];
+            rand::thread_rng().fill(&mut value[..]);
+
+            sst.put(&key.as_encoded(), &value).unwrap();
+        }
+
+        sst.finish().unwrap();
+
+        let mut meta = SstMeta::new();
+        let reader = RocksSstReader::open(path.to_str().unwrap(), None).unwrap();
+        meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
+        meta.set_cf_name("default".to_owned());
+        let (ents, size) = reader.kv_count_and_size();
+        meta.set_total_kvs(ents);
+        meta.set_total_bytes(size);
+        meta.set_range({
+            let mut r = Range::new();
+            let min_key = wrap_key(make_table_key(table_id, &0i32.to_le_bytes()[..]));
+            let max_key = wrap_key(make_table_key(table_id, &max.to_le_bytes()[..]));
+            r.set_start(min_key);
+            r.set_end(max_key);
+            r
+        });
+        info!("Created simple SST."; "path" => %path.display(), "meta" => ?meta);
+        IngestedSst { path, meta }
+    }
+
+    #[track_caller]
+    fn check_simple_sst(path: &Path, table_id: i64) {
+        let rd = RocksSstReader::open(path.to_str().unwrap(), None).unwrap();
+        let mut iter = rd.iter(IterOptions::default()).unwrap();
+        let max = 50i32;
+        assert!(iter.seek(b"").unwrap());
+        for i in 0..max {
+            assert!(iter.valid().unwrap());
+            assert_eq!(
+                iter.key(),
+                Key::from_encoded(wrap_key(make_table_key(table_id, &i.to_le_bytes()[..])))
+                    .append_ts(TimeStamp::new(42))
+                    .as_encoded()
+                    .as_slice(),
+            );
+            iter.next().unwrap();
+        }
+        assert!(!iter.valid().unwrap());
     }
 
     #[tokio::test]
@@ -2192,7 +2367,7 @@ mod tests {
                 .is_none()
         );
         check_on_events_result(&router.on_events(build_kv_event(10, 10)).await);
-        let t = router.get_task_info("error_prone").await.unwrap();
+        let t = router.collector_of("error_prone").await.unwrap();
         let _ = router.do_flush("error_prone", 42, TimeStamp::max()).await;
         assert_eq!(t.total_size() > 0, true);
 
@@ -2230,7 +2405,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let task = router.get_task_info("nothing").await.unwrap();
+        let task = router.collector_of("nothing").await.unwrap();
         task.set_flushing_status_cas(false, true).unwrap();
         let ts = TimeStamp::compose(TimeStamp::physical_now(), 42);
         let rts = router.do_flush("nothing", 1, ts).await.unwrap();
@@ -2254,13 +2429,13 @@ mod tests {
         must_register_table(&router, task, 1).await;
         write_simple_data(&router).await;
         let tempfiles = router
-            .get_task_info("cleanup_test")
+            .collector_of("cleanup_test")
             .await
             .unwrap()
             .temp_file_pool
             .clone();
         router
-            .get_task_info("cleanup_test")
+            .collector_of("cleanup_test")
             .await?
             .move_to_flushing_files()
             .await?;
@@ -2652,7 +2827,7 @@ mod tests {
         let (fp_tx, fp_rx) = std::sync::mpsc::sync_channel(0);
         let fp_rx = std::sync::Mutex::new(fp_rx);
 
-        let t = router.get_task_info("race").await.unwrap();
+        let t = router.collector_of("race").await.unwrap();
         let _ = router.on_events(events_before_flush).await;
 
         // make generate temp files ***happen after*** moving files to flushing_files
@@ -2699,5 +2874,48 @@ mod tests {
         assert!(res.is_some());
         assert_eq!(t.files.read().await.len(), 0,);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_flush_sst() {
+        let (tx, _rx) = dummy_scheduler();
+        let tmp = TempDir::new().unwrap();
+        let router = Arc::new(RouterInner::new(
+            tx,
+            Config {
+                prefix: tmp.path().to_owned(),
+                temp_file_size_limit: 1,
+                temp_file_memory_quota: 2,
+                max_flush_interval: Duration::from_secs(300),
+            },
+        ));
+        let (task, ext_storage) = task("with_sst".to_owned()).await.unwrap();
+        must_register_table(router.as_ref(), task, 1).await;
+
+        let sst = create_simple_sst(1, tmp.path());
+        write_simple_data(&router).await;
+        let mut builder = KvEventsBuilder::new(1, 42);
+        let mut events = builder.finish();
+        events.ssts.push(sst);
+        for (_, res) in router.on_events(events).await {
+            res.unwrap();
+        }
+
+        let task = router.collector_of("with_sst").await.unwrap();
+        task.do_flush(42, TimeStamp::zero()).await.unwrap();
+        let files = walkdir::WalkDir::new(ext_storage.as_path())
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut success = false;
+        for file in &files {
+            let file = file.as_ref().unwrap();
+            if file.file_name().to_str().unwrap().ends_with(".sst") {
+                check_simple_sst(file.path(), 1);
+                success = true;
+            }
+        }
+        if !success {
+            panic!("No SST files found: {:?}", files);
+        }
     }
 }

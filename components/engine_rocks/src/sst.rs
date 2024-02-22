@@ -12,7 +12,7 @@ use file_system::get_io_rate_limiter;
 use rocksdb::{
     rocksdb::supported_compression, ColumnFamilyOptions, DBCompressionType, DBIterator, Env,
     EnvOptions, ExternalSstFileInfo as RawExternalSstFileInfo, SequentialFile, SstFileReader,
-    SstFileWriter, DB,
+    SstFileWriter, TableProperties, DB,
 };
 
 use crate::{engine::RocksEngine, get_env, options::RocksReadOptions, r2e, RocksMvccProperties};
