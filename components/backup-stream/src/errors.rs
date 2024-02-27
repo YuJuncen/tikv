@@ -161,7 +161,7 @@ impl Error {
     pub fn report(&self, context: impl Display) {
         warn!("backup stream meet error"; "context" => %context, "err" => %self, 
             "verbose_err" => ?self,
-            "position" => ?Location::caller());
+            "position" => %Location::caller());
         metrics::STREAM_ERROR
             .with_label_values(&[self.kind()])
             .inc()

@@ -519,7 +519,7 @@ where
                 .with_label_values(&["to_stream_event"])
                 .observe(sw.lap().as_secs_f64());
             let kv_count = kvs.len();
-            let total_size = kvs.size();
+            let total_size = kvs.kv_size();
             metrics::HEAP_MEMORY
                 .add(total_size as _);
             utils::handle_on_event_result(&sched, router.on_events(kvs).await);

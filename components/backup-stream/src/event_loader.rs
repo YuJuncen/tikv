@@ -416,7 +416,7 @@ where
             stats.add_statistics(&res.statistics);
             let region_id = region.get_id();
             let sink = self.sink.clone();
-            let event_size = events.size();
+            let event_size = events.kv_size();
             let sched = self.scheduler.clone();
             self.limit.consume(disk_read as _).await;
             debug!("sending events to router"; "size" => %event_size, "region" => %region_id);

@@ -1,6 +1,7 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{collections::HashMap, fs, path::Path, sync::Arc};
+use core::num;
+use std::{collections::HashMap, fs, path::Path, process::Output, sync::Arc};
 
 use engine_rocks::{
     raw::{DBEntryType, Env, TablePropertiesCollector, TablePropertiesCollectorFactory},
@@ -8,8 +9,9 @@ use engine_rocks::{
     RocksCfOptions, RocksDbOptions, RocksEngine, RocksSstReader, RocksSstWriterBuilder,
 };
 pub use engine_rocks::{RocksEngine as TestEngine, RocksSstWriter};
-use engine_traits::{KvEngine, SstWriter, SstWriterBuilder};
-use kvproto::import_sstpb::*;
+use engine_traits::{IterOptions, Iterator, KvEngine, RefIterable, SstWriter, SstWriterBuilder};
+use futures::{future::FutureExt, sink::SinkExt};
+use kvproto::{import_sstpb::*, kvrpcpb::Context, metapb::Region};
 use uuid::Uuid;
 
 pub const PROP_TEST_MARKER_CF_NAME: &[u8] = b"tikv.test_marker_cf_name";
@@ -141,6 +143,73 @@ pub fn read_sst_file<P: AsRef<Path>>(path: P, range: (&[u8], &[u8])) -> (SstMeta
     meta.set_cf_name("default".to_owned());
 
     (meta, data)
+}
+
+pub async fn call_write(
+    cli: &ImportSstClient,
+    region: &Region,
+    iter: impl std::iter::Iterator<Item = (Vec<u8>, Vec<u8>)>,
+) -> SstMeta {
+    let mut ctx = Context::new();
+    ctx.set_region_id(region.get_id());
+    ctx.set_region_epoch(region.get_region_epoch().clone());
+    ctx.set_peer(region.get_peers()[0].clone());
+    let mut wb = WriteBatch::new();
+    let mut first_key = None;
+    let mut last_key = None;
+    let mut len = 0;
+    let mut num_of_entries = 0;
+    for (k, v) in iter {
+        num_of_entries += 1;
+        len += k.len() + v.len();
+        if first_key.is_none() {
+            first_key = Some(k.clone());
+        }
+        last_key = Some(k.clone());
+        let mut pair = Pair::new();
+        pair.set_key(k);
+        pair.set_value(v);
+        wb.mut_pairs().push(pair);
+    }
+
+    let mut meta = SstMeta::new();
+    meta.set_uuid(Uuid::new_v4().as_bytes().to_vec());
+    meta.set_region_id(region.get_id());
+    meta.set_region_epoch(region.get_region_epoch().clone());
+    meta.set_total_kvs(num_of_entries);
+    meta.set_total_bytes(len as _);
+    meta.set_cf_name("default".to_owned());
+    meta.set_range({
+        let mut r = Range::new();
+        r.set_start(first_key.unwrap_or_default());
+        r.set_end(last_key.unwrap_or_default());
+        r
+    });
+    let (mut send, recv) = cli.write().unwrap();
+    let mut req = WriteRequest::new();
+    req.set_context(ctx);
+    req.set_meta(meta);
+    send.send((req.clone(), Default::default())).await.unwrap();
+    req.clear_meta();
+    req.set_batch(wb);
+    send.send((req, Default::default())).await.unwrap();
+    send.close().await.unwrap();
+    let resp = recv.await.unwrap();
+    assert_eq!(resp.get_metas().len(), 1);
+    assert!(!resp.has_error(), "{:?}", resp.get_error());
+    resp.get_metas()[0].clone()
+}
+
+pub fn call_ingest(cli: &ImportSstClient, region: &Region, meta: SstMeta) {
+    let mut ctx = Context::new();
+    ctx.set_region_id(region.get_id());
+    ctx.set_region_epoch(region.get_region_epoch().clone());
+    ctx.set_peer(region.get_peers()[0].clone());
+    let mut req = IngestRequest::new();
+    req.set_context(ctx);
+    req.set_sst(meta);
+    let resp = cli.ingest(&req).unwrap();
+    assert!(!resp.has_error(), "{:?}", resp.get_error());
 }
 
 #[derive(Default)]

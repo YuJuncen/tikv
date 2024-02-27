@@ -498,6 +498,7 @@ dependencies = [
  "grpcio",
  "hex 0.4.2",
  "indexmap 1.6.2",
+ "keys",
  "kvproto",
  "lazy_static",
  "log_wrappers",
@@ -521,6 +522,7 @@ dependencies = [
  "test_pd",
  "test_pd_client",
  "test_raftstore",
+ "test_sst_importer",
  "test_util",
  "thiserror",
  "tidb_query_datatype",
@@ -2839,7 +2841,7 @@ dependencies = [
 [[package]]
 name = "kvproto"
 version = "0.0.2"
-source = "git+https://github.com/YuJuncen/kvproto?branch=ingest-logbackup-comp#e6198f3afa05789e5464edfa0ee6814210775346"
+source = "git+https://github.com/pingcap/kvproto.git?branch=start-ts#df7de980806772de855a6abd7ee64a770389ad4e"
 dependencies = [
  "futures 0.3.15",
  "grpcio",
@@ -6074,6 +6076,7 @@ dependencies = [
  "crc32fast",
  "engine_rocks",
  "engine_traits",
+ "futures 0.3.15",
  "keys",
  "kvproto",
  "uuid 0.8.2",

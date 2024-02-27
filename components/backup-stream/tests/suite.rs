@@ -22,13 +22,16 @@ use backup_stream::{
     RegionSet, Service, Task,
 };
 use engine_rocks::RocksEngine;
-use futures::{executor::block_on, AsyncWriteExt, Future, Stream, StreamExt};
-use grpcio::{ChannelBuilder, Server, ServerBuilder};
+use error_code::sst_importer;
+use futures::{executor::block_on, sink::SinkExt, AsyncWriteExt, Future, Stream, StreamExt};
+use grpcio::{ChannelBuilder, Server, ServerBuilder, WriteFlags};
 use kvproto::{
     brpb::{CompressionType, Local, Metadata, StorageBackend},
+    import_sstpb::{ImportSstClient, IngestRequest, SstMeta, WriteBatch, WriteRequest},
     kvrpcpb::*,
     logbackuppb::{SubscribeFlushEventRequest, SubscribeFlushEventResponse},
     logbackuppb_grpc::{create_log_backup, LogBackupClient},
+    raft_cmdpb::IngestSstRequest,
     tikvpb::*,
 };
 use pd_client::PdClient;
@@ -406,6 +409,10 @@ impl Suite {
         self.cluster.must_split(&region, key);
     }
 
+    pub fn must_register_default_task(&self) {
+        self.must_register_task(1, &self.case_name)
+    }
+
     pub fn must_register_task(&self, for_table: i64, name: &str) {
         let cli = self.get_meta_cli();
         block_on(cli.insert_task_with_range(
@@ -525,6 +532,10 @@ impl Suite {
         // TODO: use the callback to make the test more stable.
         self.run(|| Task::ForceFlush(task.to_owned()));
         self.sync();
+    }
+
+    pub fn default_task_name(&self) -> &str {
+        &self.case_name
     }
 
     pub fn run(&self, mut t: impl FnMut() -> Task) {
@@ -703,7 +714,7 @@ impl Suite {
         lock_req.start_version = ts.into_inner();
         lock_req.lock_ttl = ts.into_inner() + 1;
         let resp = self
-            .get_tikv_client(region_id)
+            .connect_region(region_id)
             .kv_pessimistic_lock(&lock_req)
             .unwrap();
 
@@ -725,7 +736,7 @@ impl Suite {
         prewrite_req.start_version = ts.into_inner();
         prewrite_req.lock_ttl = prewrite_req.start_version + 1;
         let prewrite_resp = self
-            .get_tikv_client(region_id)
+            .connect_region(region_id)
             .kv_prewrite(&prewrite_req)
             .unwrap();
         assert!(
@@ -765,7 +776,7 @@ impl Suite {
         prewrite_req.start_version = ts.into_inner();
         prewrite_req.lock_ttl = prewrite_req.start_version + 1;
         let prewrite_resp = self
-            .get_tikv_client(region_id)
+            .connect_region(region_id)
             .kv_prewrite(&prewrite_req)
             .unwrap();
         assert!(
@@ -795,7 +806,7 @@ impl Suite {
         commit_req.set_keys(keys.into_iter().collect());
         commit_req.commit_version = commit_ts.into_inner();
         let commit_resp = self
-            .get_tikv_client(region_id)
+            .connect_region(region_id)
             .kv_commit(&commit_req)
             .unwrap();
         assert!(
@@ -816,7 +827,7 @@ impl Suite {
         context
     }
 
-    pub fn get_tikv_client(&mut self, region_id: u64) -> &TikvClient {
+    pub fn connect_region(&mut self, region_id: u64) -> &TikvClient {
         let leader = self.cluster.leader_of_region(region_id).unwrap();
         let store_id = leader.get_store_id();
         let addr = self.cluster.sim.rl().get_addr(store_id);
@@ -827,6 +838,12 @@ impl Suite {
                 let channel = ChannelBuilder::new(env).connect(&addr);
                 TikvClient::new(channel)
             })
+    }
+
+    fn connect_store(&self, store_id: u64) -> TikvClient {
+        let addr = self.cluster.sim.rl().get_addr(store_id);
+        let channel = ChannelBuilder::new(Arc::clone(&self.env)).connect(&addr);
+        TikvClient::new(channel)
     }
 
     pub fn sync(&self) {
@@ -889,6 +906,41 @@ impl Suite {
             }
         }
         panic!("must_shuffle_leader: region has no peer")
+    }
+}
+
+impl Suite {
+    fn get_import_client(&self, id: u64) -> ImportSstClient {
+        let ch = self.connect_store(id);
+        ImportSstClient::new(ch.client.channel().clone())
+    }
+
+    pub async fn ingest_simple_sst(&self, table_id: i64, number: u64) {
+        assert_eq!(
+            self.log_backup_cli.len(),
+            1,
+            "Only support write to a sole server now."
+        );
+        // Hacky get the ID of the only tikv.
+        let sid = *self.endpoints.keys().next().unwrap();
+        let cli = self.get_import_client(sid);
+        let region = self.cluster.pd_client.get_region(b"").unwrap();
+        let mut i = 0;
+        let meta = test_sst_importer::call_write(
+            &cli,
+            &region,
+            std::iter::from_fn(|| {
+                if i > number {
+                    return None;
+                }
+                let key = make_record_key(table_id, i);
+                let res = Some((Key::from_raw(&key).into_encoded(), b"test_record".to_vec()));
+                i += 1;
+                res
+            }),
+        )
+        .await;
+        test_sst_importer::call_ingest(&cli, &region, meta);
     }
 }
 

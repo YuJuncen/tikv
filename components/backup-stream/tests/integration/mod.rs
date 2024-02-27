@@ -450,4 +450,18 @@ mod all {
             true
         });
     }
+
+    #[test]
+    fn with_ingest() {
+        test_util::init_log_for_test();
+        let suite = SuiteBuilder::new_named("with_ingest").nodes(1).build();
+        suite.must_register_default_task();
+        run_async_test(suite.ingest_simple_sst(1, 256));
+        suite.force_flush_files(suite.default_task_name());
+        suite.sync();
+        suite.wait_for_flush();
+        for entries in walkdir::WalkDir::new(suite.flushed_files.path()) {
+            println!("{entries:?}");
+        }
+    }
 }

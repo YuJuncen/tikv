@@ -156,20 +156,19 @@ impl<'a> ApplyEventDesc<'a> {
 }
 
 #[derive(Debug)]
-pub struct IngestedSst {
-    pub meta: SstMeta,
-    pub path: PathBuf,
+struct IngestedSst {
+    meta: SstMeta,
+    path: PathBuf,
 }
 
-pub struct SealedLog {
-    key: TempFileKey,
+struct SealedLog {
     handle: DataFile,
     info: DataFileInfo,
 }
 
 #[derive(Debug)]
 pub struct ApplyEvents {
-    events: Vec<ApplyEvent>,
+    kv_events: Vec<ApplyEvent>,
     ssts: Vec<IngestedSst>,
     region_id: u64,
     // TODO: this field is useless, maybe remove it.
@@ -227,8 +226,10 @@ fn handle_normal(
 }
 
 fn handle_ingest_sst(req: &IngestSstRequest) -> IngestedSst {
+    let meta = req.get_sst().clone();
+
     IngestedSst {
-        meta: req.get_sst().clone(),
+        meta,
         path: Path::new("/tmp/placeholder.sst").to_owned(),
     }
 }
@@ -275,7 +276,7 @@ impl ApplyEvents {
             }
         }
         Ok(Self {
-            events,
+            kv_events: events,
             ssts,
             region_id,
             region_resolved_ts: resolver.resolved_ts().into_inner(),
@@ -283,24 +284,26 @@ impl ApplyEvents {
     }
 
     pub fn push(&mut self, event: ApplyEvent) {
-        self.events.push(event);
+        self.kv_events.push(event);
     }
 
     pub fn with_capacity(cap: usize, region_id: u64) -> Self {
         Self {
             ssts: vec![],
-            events: Vec::with_capacity(cap),
+            kv_events: Vec::with_capacity(cap),
             region_id,
             region_resolved_ts: 0,
         }
     }
 
-    pub fn size(&self) -> usize {
-        self.events.iter().map(ApplyEvent::size).sum()
+    /// Return the total size of all kv pairs.
+    /// Size of SST files are ignored.
+    pub fn kv_size(&self) -> usize {
+        self.kv_events.iter().map(ApplyEvent::size).sum()
     }
 
     pub fn len(&self) -> usize {
-        self.events.len()
+        self.kv_events.len() + self.ssts.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -309,7 +312,7 @@ impl ApplyEvents {
 
     fn group_by<T: std::hash::Hash + Clone + Eq, R: Borrow<T>>(
         self,
-        mut partition_fn: impl FnMut(ApplyEventDesc) -> Option<R>,
+        mut partition_fn: impl FnMut(ApplyEventDesc<'_>) -> Option<R>,
     ) -> HashMap<T, Self> {
         let mut result: HashMap<T, Self> = HashMap::new();
         let template = self.fork();
@@ -332,7 +335,7 @@ impl ApplyEvents {
             }
         }
 
-        for event in self.events {
+        for event in self.kv_events {
             let desc = ApplyEventDesc {
                 key: &event.key,
                 cmd_type: event.cmd_type,
@@ -343,7 +346,7 @@ impl ApplyEvents {
                 upsert(
                     &mut result,
                     &item,
-                    |evts| evts.events.push(event),
+                    |evts| evts.kv_events.push(event),
                     || template.fork(),
                 );
             }
@@ -378,7 +381,7 @@ impl ApplyEvents {
 
     fn fork(&self) -> Self {
         Self {
-            events: vec![],
+            kv_events: vec![],
             ssts: vec![],
             region_id: self.region_id,
             region_resolved_ts: self.region_resolved_ts,
@@ -1083,7 +1086,7 @@ impl StreamDataCollector {
     #[instrument(skip(self, events), fields(event_len = events.len()))]
     async fn on_events_of_key(&self, key: TempFileKey, mut events: ApplyEvents) -> Result<()> {
         fail::fail_point!("before_generate_temp_file");
-        debug!("Log backup consuming event."; "key" => ?key, "normal_len" => %events.events.len(), "sst_len" => %events.ssts.len());
+        debug!("Log backup consuming event."; "key" => ?key, "normal_len" => %events.kv_events.len(), "sst_len" => %events.ssts.len());
         if let Some(f) = frame!(self.files.read()).await.get(&key) {
             self.total_size.fetch_add(
                 frame!(f.lock()).await.on_events(events).await?,
@@ -1213,7 +1216,6 @@ impl StreamDataCollector {
             let sealed = SealedLog {
                 handle: v,
                 info: file_meta,
-                key: k,
             };
             if is_meta {
                 sf.ddl_meta.push(sealed);
@@ -1248,7 +1250,11 @@ impl StreamDataCollector {
     #[instrument(skip_all, fields(len=ssts.len()))]
     async fn flush_sst_files(&self, ssts: &[IngestedSst], md: &mut MetadataInfo) -> Result<()> {
         for sst in ssts {
-            let sst = self.flush_sst_file(sst).await?;
+            let sst = self.flush_sst_file(sst).await.context(format_args!(
+                "flushing {}(uuid={})",
+                sst.path.display(),
+                hex::encode(&sst.meta.uuid)
+            ))?;
             md.push(sst);
         }
         Ok(())
@@ -1423,7 +1429,8 @@ impl StreamDataCollector {
                 (batch, rem_files) = rem_files.split_at(offset);
                 batch
             };
-            self.flush_kv_stream_files(batched.iter(), is_meta, metadata);
+            self.flush_kv_stream_files(batched.iter(), is_meta, metadata)
+                .await?;
         }
 
         Ok(())
@@ -1573,7 +1580,7 @@ impl StreamDataCollector {
         Ok(false)
     }
 
-    fn remove_sealed(&self, file: &SealedFile) -> bool {
+    fn remove_sealed(&self, file: &SealedFile<'_>) -> bool {
         match file {
             SealedFile::Stream(SealedLog { handle, .. }) => {
                 self.temp_file_pool.remove(handle.inner.path())
@@ -1582,7 +1589,7 @@ impl StreamDataCollector {
         }
     }
 
-    fn drop_sealed(&self, file: &SealedFile) {
+    fn drop_sealed(&self, file: &SealedFile<'_>) {
         debug!("removing sealed file"; "file" => %file);
         self.total_size.fetch_sub(file.len() as _, Ordering::SeqCst);
         if !self.remove_sealed(file) {
@@ -1723,7 +1730,7 @@ impl DataFile {
         let now = Instant::now_coarse();
         let mut total_size = 0;
 
-        for mut event in events.events {
+        for mut event in events.kv_events {
             let encoded = EventEncoder::encode_event(&event.key, &event.value);
             let mut size = 0;
             for slice in encoded {
@@ -1899,7 +1906,7 @@ mod tests {
             Self {
                 events: ApplyEvents {
                     ssts: vec![],
-                    events: vec![],
+                    kv_events: vec![],
                     region_id,
                     region_resolved_ts,
                 },
@@ -1955,7 +1962,7 @@ mod tests {
                 &mut self.events,
                 ApplyEvents {
                     ssts: vec![],
-                    events: vec![],
+                    kv_events: vec![],
                     region_id,
                     region_resolved_ts,
                 },
