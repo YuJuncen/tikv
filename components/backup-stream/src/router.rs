@@ -50,6 +50,7 @@ use tokio_util::compat::TokioAsyncReadCompatExt;
 use tracing::instrument;
 use tracing_active_tree::frame;
 use txn_types::{Key, Lock, TimeStamp, WriteRef};
+use uuid::Uuid;
 
 use super::errors::Result;
 use crate::{
@@ -225,13 +226,19 @@ fn handle_normal(
     Ok(Some(item))
 }
 
-fn handle_ingest_sst(req: &IngestSstRequest) -> IngestedSst {
+fn handle_ingest_sst(req: &IngestSstRequest, ssts: &HashMap<Uuid, PathBuf>) -> Result<IngestedSst> {
     let meta = req.get_sst().clone();
+    let path = ssts
+        .get(
+            &Uuid::from_slice(&meta.uuid)
+                .map_err(|err| annotate!(err, "invaild uuid in sst {:?}", meta))?,
+        )
+        .ok_or_else(|| Error::Other(box_err!("sst not found: {:?}", meta)))?;
 
-    IngestedSst {
+    Ok(IngestedSst {
         meta,
-        path: Path::new("/tmp/placeholder.sst").to_owned(),
-    }
+        path: path.clone(),
+    })
 }
 
 impl ApplyEvents {
@@ -240,7 +247,11 @@ impl ApplyEvents {
     /// those keys.
     /// Note: the resolved ts cannot be advanced if there is no command, maybe
     /// we also need to update resolved_ts when flushing?
-    pub fn from_cmd_batch(cmd: CmdBatch, resolver: &mut TwoPhaseResolver) -> Result<Self> {
+    pub fn compose(
+        cmd: CmdBatch,
+        resolver: &mut TwoPhaseResolver,
+        sst_paths: &HashMap<Uuid, PathBuf>,
+    ) -> Result<Self> {
         let region_id = cmd.region_id;
         let mut events = vec![];
         let mut ssts = vec![];
@@ -271,7 +282,9 @@ impl ApplyEvents {
                         SKIP_KV_COUNTER.inc();
                     }
                 },
-                CmdType::IngestSst => ssts.push(handle_ingest_sst(req.get_ingest_sst())),
+                CmdType::IngestSst => {
+                    ssts.push(handle_ingest_sst(req.get_ingest_sst(), sst_paths)?)
+                }
                 _ => SKIP_KV_COUNTER.inc(),
             }
         }

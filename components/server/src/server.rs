@@ -866,6 +866,37 @@ where
             )),
         );
 
+        let import_path = self.core.store_path.join("import");
+        let mut importer = SstImporter::new(
+            &self.core.config.import,
+            import_path,
+            self.core.encryption_key_manager.clone(),
+            self.core.config.storage.api_version(),
+            false,
+        )
+        .unwrap();
+        for (cf_name, compression_type) in &[
+            (
+                CF_DEFAULT,
+                self.core
+                    .config
+                    .rocksdb
+                    .defaultcf
+                    .bottommost_level_compression,
+            ),
+            (
+                CF_WRITE,
+                self.core
+                    .config
+                    .rocksdb
+                    .writecf
+                    .bottommost_level_compression,
+            ),
+        ] {
+            importer.set_compression_type(cf_name, from_rocks_compression_type(*compression_type));
+        }
+        let importer = Arc::new(importer);
+
         let rejector = Arc::new(PrepareDiskSnapObserver::default());
         rejector.register_to(self.coprocessor_host.as_mut().unwrap());
         self.snap_br_rejector = Some(rejector);
@@ -877,7 +908,10 @@ where
             let backup_stream_scheduler = backup_stream_worker.scheduler();
 
             // Register backup-stream observer.
-            let backup_stream_ob = BackupStreamObserver::new(backup_stream_scheduler.clone());
+            let backup_stream_ob = BackupStreamObserver::new(
+                backup_stream_scheduler.clone(),
+                Arc::clone(&importer) as Arc<_>,
+            );
             backup_stream_ob.register_to(self.coprocessor_host.as_mut().unwrap());
             // Register config manager.
             cfg_controller.register(
@@ -924,37 +958,6 @@ where
         } else {
             None
         };
-
-        let import_path = self.core.store_path.join("import");
-        let mut importer = SstImporter::new(
-            &self.core.config.import,
-            import_path,
-            self.core.encryption_key_manager.clone(),
-            self.core.config.storage.api_version(),
-            false,
-        )
-        .unwrap();
-        for (cf_name, compression_type) in &[
-            (
-                CF_DEFAULT,
-                self.core
-                    .config
-                    .rocksdb
-                    .defaultcf
-                    .bottommost_level_compression,
-            ),
-            (
-                CF_WRITE,
-                self.core
-                    .config
-                    .rocksdb
-                    .writecf
-                    .bottommost_level_compression,
-            ),
-        ] {
-            importer.set_compression_type(cf_name, from_rocks_compression_type(*compression_type));
-        }
-        let importer = Arc::new(importer);
 
         let split_check_runner = SplitCheckRunner::new(
             engines.engines.kv.clone(),

@@ -4,10 +4,11 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
+use ::sst_importer::sst_path::{ImportDir, PanicSstPath};
 use async_compression::futures::write::ZstdDecoder;
 use backup_stream::{
     errors::Result,
@@ -49,10 +50,12 @@ use tikv_util::{
     },
     debug, info,
     worker::LazyWorker,
-    HandyRwLock,
+    Either, HandyRwLock,
 };
 use txn_types::{Key, TimeStamp, WriteRef};
 use walkdir::WalkDir;
+
+type TestSstPath = Either<PanicSstPath, ImportDir<engine_test::kv::KvTestEngine>>;
 
 #[derive(Debug)]
 pub struct FileSegments {
@@ -287,7 +290,8 @@ impl Suite {
         let worker = LazyWorker::new(format!("br-{}", id));
         let mut s = cluster.sim.wl();
 
-        let ob = BackupStreamObserver::new(worker.scheduler());
+        let sst_query = Mutex::new(TestSstPath::Left(PanicSstPath));
+        let ob = BackupStreamObserver::new(worker.scheduler(), Arc::new(sst_query));
         let ob2 = ob.clone();
         s.coprocessor_hooks
             .entry(id)
@@ -366,6 +370,14 @@ impl Suite {
         let cm = sim.get_concurrency_manager(id);
         let regions = sim.region_info_accessors.get(&id).unwrap().clone();
         let ob = self.obs.get(&id).unwrap().clone();
+        let mock_dir = ImportDir::<engine_test::kv::KvTestEngine>::new(
+            cluster.paths[cluster.sst_workers_map[&id]]
+                .path()
+                .join("import-sst"),
+        )
+        .unwrap();
+        let lock = Arc::downcast::<Mutex<TestSstPath>>(ob.sst_query.clone()).unwrap();
+        *lock.lock().unwrap() = TestSstPath::Right(mock_dir);
         cfg.enable = true;
         cfg.temp_path = format!("/{}/{}", self.temp_files.path().display(), id);
         let resolver = LeadershipResolver::new(

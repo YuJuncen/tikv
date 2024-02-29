@@ -695,46 +695,6 @@ where
             self.core.to_stop.push(rts_worker);
         }
 
-        // Start backup stream
-        self.backup_stream_scheduler = if self.core.config.log_backup.enable {
-            // Create backup stream.
-            let mut backup_stream_worker = Box::new(LazyWorker::new("backup-stream"));
-            let backup_stream_scheduler = backup_stream_worker.scheduler();
-
-            // Register backup-stream observer.
-            let backup_stream_ob = BackupStreamObserver::new(backup_stream_scheduler.clone());
-            backup_stream_ob.register_to(self.coprocessor_host.as_mut().unwrap());
-            // Register config manager.
-            cfg_controller.register(
-                tikv::config::Module::BackupStream,
-                Box::new(BackupStreamConfigManager::new(
-                    backup_stream_worker.scheduler(),
-                    self.core.config.log_backup.clone(),
-                )),
-            );
-
-            let backup_stream_endpoint = backup_stream::Endpoint::new(
-                self.node.as_ref().unwrap().id(),
-                PdStore::new(Checked::new(Sourced::new(
-                    Arc::clone(&self.pd_client),
-                    pd_client::meta_storage::Source::LogBackup,
-                ))),
-                self.core.config.log_backup.clone(),
-                backup_stream_scheduler.clone(),
-                backup_stream_ob,
-                self.region_info_accessor.as_ref().unwrap().clone(),
-                self.router.clone().unwrap(),
-                self.pd_client.clone(),
-                self.concurrency_manager.clone(),
-                BackupStreamResolver::V2(self.router.clone().unwrap(), PhantomData),
-            );
-            backup_stream_worker.start(backup_stream_endpoint);
-            self.core.to_stop.push(backup_stream_worker);
-            Some(backup_stream_scheduler)
-        } else {
-            None
-        };
-
         let server_config = Arc::new(VersionTrack::new(self.core.config.server.clone()));
 
         self.core.config.raft_store.optimize_for(true);
@@ -819,6 +779,49 @@ where
             importer.set_compression_type(cf_name, from_rocks_compression_type(*compression_type));
         }
         let importer = Arc::new(importer);
+
+        // Start backup stream
+        self.backup_stream_scheduler = if self.core.config.log_backup.enable {
+            // Create backup stream.
+            let mut backup_stream_worker = Box::new(LazyWorker::new("backup-stream"));
+            let backup_stream_scheduler = backup_stream_worker.scheduler();
+
+            // Register backup-stream observer.
+            let backup_stream_ob = BackupStreamObserver::new(
+                backup_stream_scheduler.clone(),
+                Arc::clone(&importer) as Arc<_>,
+            );
+            backup_stream_ob.register_to(self.coprocessor_host.as_mut().unwrap());
+            // Register config manager.
+            cfg_controller.register(
+                tikv::config::Module::BackupStream,
+                Box::new(BackupStreamConfigManager::new(
+                    backup_stream_worker.scheduler(),
+                    self.core.config.log_backup.clone(),
+                )),
+            );
+
+            let backup_stream_endpoint = backup_stream::Endpoint::new(
+                self.node.as_ref().unwrap().id(),
+                PdStore::new(Checked::new(Sourced::new(
+                    Arc::clone(&self.pd_client),
+                    pd_client::meta_storage::Source::LogBackup,
+                ))),
+                self.core.config.log_backup.clone(),
+                backup_stream_scheduler.clone(),
+                backup_stream_ob,
+                self.region_info_accessor.as_ref().unwrap().clone(),
+                self.router.clone().unwrap(),
+                self.pd_client.clone(),
+                self.concurrency_manager.clone(),
+                BackupStreamResolver::V2(self.router.clone().unwrap(), PhantomData),
+            );
+            backup_stream_worker.start(backup_stream_endpoint);
+            self.core.to_stop.push(backup_stream_worker);
+            Some(backup_stream_scheduler)
+        } else {
+            None
+        };
 
         // V2 starts split-check worker within raftstore.
 

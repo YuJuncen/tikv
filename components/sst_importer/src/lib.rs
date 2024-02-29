@@ -23,6 +23,7 @@ mod caching;
 pub mod import_mode2;
 pub mod metrics;
 pub mod sst_importer;
+pub mod sst_path;
 
 pub use self::{
     config::{Config, ConfigManager},

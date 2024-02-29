@@ -1,16 +1,23 @@
-// Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
+// CopyrigTask::BatchEvent { field1: batches }ors. Licensed under Apache-2.0.
 
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, RwLock},
+};
 
 use engine_traits::KvEngine;
 use kvproto::metapb::Region;
 use raft::StateRole;
 use raftstore::coprocessor::*;
-use tikv_util::{worker::Scheduler, HandyRwLock};
+use sst_importer::sst_path::{PanicSstPath, SstPath};
+use tikv_util::{warn, worker::Scheduler, HandyRwLock};
+use uuid::Uuid;
 
 use crate::{
     debug,
     endpoint::{ObserveOp, Task},
+    errors::ReportableResult,
     try_send,
     utils::SegmentSet,
 };
@@ -24,6 +31,8 @@ pub struct BackupStreamObserver {
     scheduler: Scheduler<Task>,
     // Note: maybe wrap those fields to methods?
     pub ranges: Arc<RwLock<SegmentSet<Vec<u8>>>>,
+    // Note: this is published for test.
+    pub sst_query: Arc<dyn SstPath + Send + Sync + 'static>,
 }
 
 impl BackupStreamObserver {
@@ -31,11 +40,19 @@ impl BackupStreamObserver {
     ///
     /// Events are strong ordered, so `scheduler` must be implemented as
     /// a FIFO queue.
-    pub fn new(scheduler: Scheduler<Task>) -> BackupStreamObserver {
-        BackupStreamObserver {
+    pub fn new(
+        scheduler: Scheduler<Task>,
+        sst_query: Arc<dyn SstPath + Send + Sync + 'static>,
+    ) -> Self {
+        Self {
             scheduler,
             ranges: Default::default(),
+            sst_query,
         }
+    }
+
+    pub fn without_sst(scheduler: Scheduler<Task>) -> Self {
+        Self::new(scheduler, Arc::new(PanicSstPath))
     }
 
     pub fn register_to(&self, coprocessor_host: &mut CoprocessorHost<impl KvEngine>) {
@@ -87,6 +104,35 @@ impl BackupStreamObserver {
     pub fn is_hibernating(&self) -> bool {
         self.ranges.rl().is_empty()
     }
+
+    fn collect_sst_paths(&self, batches: &[CmdBatch]) -> HashMap<Uuid, PathBuf> {
+        let mut res = HashMap::new();
+        for batch in batches {
+            for cmd in &batch.cmds {
+                for req in cmd.request.get_requests() {
+                    if req.has_ingest_sst() {
+                        let sst = req.get_ingest_sst().get_sst();
+                        let entry = self.sst_query.sst_path(sst).and_then(|path| {
+                            let uuid = Uuid::from_slice(sst.get_uuid()).ok()?;
+                            let linked_path =
+                                path.parent().unwrap().join(format!("{uuid}.backup.sst"));
+                            std::fs::hard_link(path, &linked_path).report_if_err("");
+                            Some((uuid, linked_path))
+                        });
+                        match entry {
+                            Some((k, v)) => {
+                                res.insert(k, v);
+                            }
+                            None => {
+                                warn!("log backup failed to query sst real path from importer."; "meta" => ?sst);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        res
+    }
 }
 
 impl Coprocessor for BackupStreamObserver {}
@@ -120,7 +166,13 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
         if cmd_batches.is_empty() {
             return;
         }
-        try_send!(self.scheduler, Task::BatchEvent(cmd_batches));
+        let sst_paths = self.collect_sst_paths(&cmd_batches);
+        self.scheduler
+            .schedule_force(Task::BatchEvent {
+                cmds: cmd_batches,
+                sst_paths,
+            })
+            .report_if_err("failed to send backup command, are we shutting down?");
     }
 
     fn on_applied_current_term(&self, role: StateRole, region: &Region) {
@@ -130,19 +182,6 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
                 Task::ModifyObserve(ObserveOp::Start {
                     region: region.clone(),
                     handle: ObserveHandle::new(),
-                })
-            );
-        }
-    }
-}
-
-impl RoleObserver for BackupStreamObserver {
-    fn on_role_change(&self, ctx: &mut ObserverContext<'_>, r: &RoleChange) {
-        if r.state != StateRole::Leader && !self.is_hibernating() {
-            try_send!(
-                self.scheduler,
-                Task::ModifyObserve(ObserveOp::Stop {
-                    region: ctx.region().clone(),
                 })
             );
         }
@@ -189,7 +228,7 @@ impl RegionChangeObserver for BackupStreamObserver {
 #[cfg(test)]
 
 mod tests {
-    use std::{assert_matches::assert_matches, time::Duration};
+    use std::{assert_matches::assert_matches, collections::HashMap, time::Duration};
 
     use engine_panic::PanicEngine;
     use kvproto::metapb::Region;
@@ -219,7 +258,7 @@ mod tests {
         let (sched, mut rx) = dummy_scheduler();
 
         // Prepare: assuming a task wants the range of [0001, 0010].
-        let o = BackupStreamObserver::new(sched);
+        let o = BackupStreamObserver::without_sst(sched);
         let subs = SubscriptionTracer::default();
         assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
 
@@ -244,7 +283,7 @@ mod tests {
         let (sched, mut rx) = dummy_scheduler();
 
         // Prepare: assuming a task wants the range of [0001, 0010].
-        let o = BackupStreamObserver::new(sched);
+        let o = BackupStreamObserver::without_sst(sched);
         let subs = SubscriptionTracer::default();
         assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
 
@@ -267,7 +306,7 @@ mod tests {
         let mut cmd_batches = vec![cb];
         o.on_flush_applied_cmd_batch(ObserveLevel::All, &mut cmd_batches, &mock_engine);
         let task = rx.recv_timeout(Duration::from_secs(0)).unwrap().unwrap();
-        assert_matches!(task, Task::BatchEvent(batches) if
+        assert_matches!(task, Task::BatchEvent{ cmds: batches, .. } if
             batches.len() == 1 && batches[0].region_id == 42 && batches[0].cdc_id == handle.id
         );
 
@@ -316,7 +355,7 @@ mod tests {
         let (sched, mut rx) = dummy_scheduler();
 
         // Prepare: assuming a task wants the range of [0001, 0010].
-        let o = BackupStreamObserver::new(sched);
+        let o = BackupStreamObserver::without_sst(sched);
         let r = fake_region(43, b"0010", b"0042");
         let mut ctx = ObserverContext::new(&r);
         o.on_region_changed(&mut ctx, RegionChangeEvent::Create, StateRole::Leader);

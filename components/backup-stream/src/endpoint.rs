@@ -2,9 +2,11 @@
 
 use std::{
     any::Any,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
+    future::Future,
     marker::PhantomData,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -24,6 +26,7 @@ use raftstore::{
     router::CdcHandle,
 };
 use resolved_ts::{resolve_by_raft, LeadershipResolver};
+use sst_importer::sst_path::SstPath;
 use tikv::config::BackupStreamConfig;
 use tikv_util::{
     box_err,
@@ -45,6 +48,7 @@ use tokio_stream::StreamExt;
 use tracing::instrument;
 use tracing_active_tree::root;
 use txn_types::TimeStamp;
+use uuid::Uuid;
 
 use super::metrics::HANDLE_EVENT_DURATION_HISTOGRAM;
 use crate::{
@@ -444,7 +448,11 @@ where
 
     /// Convert a batch of events to the cmd batch, and update the resolver
     /// status.
-    fn record_batch(subs: SubscriptionTracer, batch: CmdBatch) -> Result<ApplyEvents> {
+    fn record_batch(
+        subs: SubscriptionTracer,
+        batch: CmdBatch,
+        ssts: &HashMap<Uuid, PathBuf>,
+    ) -> Result<ApplyEvents> {
         let region_id = batch.region_id;
         let mut resolver = match subs.get_subscription_of(region_id) {
             Some(rts) => rts,
@@ -472,11 +480,15 @@ where
             return Err(Error::ObserveCanceled(region_id, RegionEpoch::new()));
         }
 
-        let kvs = ApplyEvents::from_cmd_batch(batch, resolver.value_mut().resolver())?;
+        let kvs = ApplyEvents::compose(batch, resolver.value_mut().resolver(), ssts)?;
         Ok(kvs)
     }
 
-    fn backup_batch(&self, batch: CmdBatch, work: Work) {
+    async fn backup_batch<'a>(
+        &self,
+        batch: CmdBatch,
+        ssts: &'a HashMap<Uuid, PathBuf>,
+    ) -> impl Future<Output = ()> + 'a {
         let mut sw = StopWatch::by_now();
 
         let router = self.range_router.clone();
@@ -490,26 +502,33 @@ where
             .last()
             .map(|c| (c.index, c.term))
             .unwrap_or((0, 0));
-        self.pool.spawn(root!("backup_batch"; async move {
+        tracing_active_tree::frame!("backup"; async move {
             let region_id = batch.region_id;
-            let kvs = Self::record_batch(subs, batch);
+            let kvs = Self::record_batch(subs, batch, ssts);
             let kvs = match kvs {
                 Err(Error::OutOfQuota { region_id }) => {
-                    region_op.send(ObserveOp::HighMemUsageWarning { region_id }).await
-                        .map_err(|err| Error::Other(box_err!("failed to send, are we shutting down? {}", err)))
+                    region_op
+                        .send(ObserveOp::HighMemUsageWarning { region_id })
+                        .await
+                        .map_err(|err| {
+                            Error::Other(box_err!("failed to send, are we shutting down? {}", err))
+                        })
                         .report_if_err("");
-                    return
+                    return;
                 }
                 Err(Error::ObserveCanceled(..)) => {
                     return;
                 }
                 Err(err) => {
-                    err.report(format_args!("unexpected error during handing region event for {}.", region_id));
+                    err.report(format_args!(
+                        "unexpected error during handing region event for {}.",
+                        region_id
+                    ));
                     return;
                 }
                 Ok(batch) => {
                     if batch.is_empty() {
-                        return
+                        return;
                     }
                     batch
                 }
@@ -520,11 +539,9 @@ where
                 .observe(sw.lap().as_secs_f64());
             let kv_count = kvs.len();
             let total_size = kvs.kv_size();
-            metrics::HEAP_MEMORY
-                .add(total_size as _);
+            metrics::HEAP_MEMORY.add(total_size as _);
             utils::handle_on_event_result(&sched, router.on_events(kvs).await);
-            metrics::HEAP_MEMORY
-                .sub(total_size as _);
+            metrics::HEAP_MEMORY.sub(total_size as _);
             let time_cost = sw.lap().as_secs_f64();
             if time_cost > SLOW_EVENT_THRESHOLD {
                 warn!("write to temp file too slow."; "time_cost" => ?time_cost, "region_id" => %region_id, "len" => %kv_count);
@@ -532,8 +549,7 @@ where
             HANDLE_EVENT_DURATION_HISTOGRAM
                 .with_label_values(&["save_to_temp_file"])
                 .observe(time_cost);
-            drop(work)
-        }; from_idx, to_idx, region, current_term = term));
+        }; region, from_idx, to_idx, term)
     }
 
     pub fn handle_watch_task(&self, op: TaskOp) {
@@ -1000,7 +1016,10 @@ where
         }
         match task {
             Task::WatchTask(op) => self.handle_watch_task(op),
-            Task::BatchEvent(events) => self.do_backup(events),
+            Task::BatchEvent {
+                cmds: events,
+                sst_paths,
+            } => self.do_backup(events, sst_paths),
             Task::Flush(task) => self.on_flush(task),
             Task::ModifyObserve(op) => self.on_modify_observe(op),
             Task::ForceFlush(task) => self.on_force_flush(task),
@@ -1117,12 +1136,13 @@ where
         }
     }
 
-    pub fn do_backup(&self, events: Vec<CmdBatch>) {
-        let wg = CallbackWaitGroup::new();
-        for batch in events {
-            self.backup_batch(batch, wg.clone().work());
-        }
-        self.pool.block_on(wg.wait())
+    pub fn do_backup(&self, events: Vec<CmdBatch>, ssts: HashMap<Uuid, PathBuf>) {
+        let fut = futures::future::join_all(
+            events
+                .into_iter()
+                .map(|batch| self.backup_batch(batch, &ssts)),
+        );
+        self.pool.block_on(fut);
     }
 }
 
@@ -1215,7 +1235,10 @@ impl fmt::Debug for RegionCheckpointOperation {
 
 pub enum Task {
     WatchTask(TaskOp),
-    BatchEvent(Vec<CmdBatch>),
+    BatchEvent {
+        cmds: Vec<CmdBatch>,
+        sst_paths: HashMap<Uuid, PathBuf>,
+    },
     ChangeConfig(BackupStreamConfig),
     /// Change the observe status of some region.
     ModifyObserve(ObserveOp),
@@ -1344,7 +1367,7 @@ impl fmt::Debug for Task {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WatchTask(arg0) => f.debug_tuple("WatchTask").field(arg0).finish(),
-            Self::BatchEvent(arg0) => f
+            Self::BatchEvent { cmds: arg0, .. } => f
                 .debug_tuple("BatchEvent")
                 .field(&format!("[{} events...]", arg0.len()))
                 .finish(),
@@ -1388,7 +1411,7 @@ impl Task {
                 TaskOp::PauseTask(_) => "watch_task.pause",
                 TaskOp::ResumeTask(_) => "watch_task.resume",
             },
-            Task::BatchEvent(_) => "batch_event",
+            Task::BatchEvent { .. } => "batch_event",
             Task::ChangeConfig(_) => "change_config",
             Task::Flush(_) => "flush",
             Task::ModifyObserve(o) => match o {

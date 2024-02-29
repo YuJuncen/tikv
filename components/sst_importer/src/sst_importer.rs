@@ -153,7 +153,7 @@ impl CacheKvFile {
 
 /// SstImporter manages SST files that are waiting for ingesting.
 pub struct SstImporter<E: KvEngine> {
-    dir: ImportDir<E>,
+    pub(crate) dir: ImportDir<E>,
     key_manager: Option<Arc<DataKeyManager>>,
     switcher: Either<ImportModeSwitcher, ImportModeSwitcherV2>,
     // TODO: lift api_version as a type parameter.

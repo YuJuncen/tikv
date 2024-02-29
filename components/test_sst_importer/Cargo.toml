@@ -10,10 +10,10 @@ license = "Apache-2.0"
 test = false
 
 [dependencies]
-futures = "0.3"
 crc32fast = "1.2"
 engine_rocks = { workspace = true }
 engine_traits = { workspace = true }
+futures = "0.3"
 keys = { workspace = true }
 kvproto = { workspace = true }
 uuid = { version = "0.8.1", features = ["serde", "v4"] }
