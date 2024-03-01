@@ -20,7 +20,7 @@ use file_system::Sha256Reader;
 use futures::io::{AllowStdIo, Cursor};
 use kvproto::{
     brpb::{
-        CompressionType, DataFileGroup, DataFileInfo, FileType, MetaVersion, Metadata,
+        CompressionType, DataFileGroup, DataFileInfo, FileFormat, FileType, MetaVersion, Metadata,
         StreamBackupTaskInfo,
     },
     import_sstpb::SstMeta,
@@ -227,16 +227,19 @@ fn handle_normal(
 }
 
 fn handle_ingest_sst(req: &IngestSstRequest, ssts: &HashMap<Uuid, PathBuf>) -> Result<IngestedSst> {
-    let meta = req.get_sst().clone();
+    let mut meta = req.get_sst().clone();
     let path = ssts
         .get(
             &Uuid::from_slice(&meta.uuid)
                 .map_err(|err| annotate!(err, "invaild uuid in sst {:?}", meta))?,
         )
         .ok_or_else(|| Error::Other(box_err!("sst not found: {:?}", meta)))?;
+    let range = meta.mut_range();
+    range.set_start(Key::from_raw(range.get_start()).into_encoded());
+    range.set_end(Key::from_raw(range.get_end()).into_encoded());
 
     Ok(IngestedSst {
-        meta,
+        meta: dbg!(meta),
         path: path.clone(),
     })
 }
@@ -1290,6 +1293,7 @@ impl StreamDataCollector {
         data_file_info.set_cf(meta.get_cf_name().to_owned());
         data_file_info.set_min_ts(min_ts);
         data_file_info.set_max_ts(max_ts);
+        data_file_info.set_file_format(FileFormat::Sst);
         let file = std::fs::File::open(path)?;
         let (reader, c) = Sha256Reader::new(file)
             .map_err(|err| annotate!(err, "failed to create sha256 hasher"))?;
@@ -1307,6 +1311,9 @@ impl StreamDataCollector {
             .map_err(|err| annotate!(err, "failed to finish sha256 hasher"))?;
         data_file_info.set_sha256(hash.to_vec());
         data_file_group.set_data_files_info(vec![data_file_info].into());
+        data_file_group.set_path(target_path.clone());
+        data_file_group.set_min_ts(min_ts);
+        data_file_group.set_max_ts(max_ts);
         Ok(data_file_group)
     }
 
@@ -1823,6 +1830,7 @@ impl DataFile {
         meta.set_cf(file_key.cf.to_owned());
         meta.set_region_id(file_key.region_id as i64);
         meta.set_type(file_key.get_file_type());
+        meta.set_file_format(FileFormat::KvStream);
 
         meta.set_compression_type(self.compression_type);
 
@@ -2778,7 +2786,6 @@ mod tests {
         let files = vec![SealedLog {
             handle: data_file,
             info,
-            key: TempFileKey::default(),
         }];
         let result = task_handler
             .flush_kv_stream_files(files.iter(), false, &mut meta)

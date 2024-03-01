@@ -484,7 +484,7 @@ where
         Ok(kvs)
     }
 
-    async fn backup_batch<'a>(
+    fn backup_batch<'a>(
         &self,
         batch: CmdBatch,
         ssts: &'a HashMap<Uuid, PathBuf>,
@@ -578,6 +578,7 @@ where
         let start = Instant::now_coarse();
         let success = self
             .observer
+            .shared
             .ranges
             .wl()
             .add((start_key.clone(), end_key.clone()));
@@ -799,7 +800,7 @@ where
 
         // for now, we support one concurrent task only.
         // so simply clear all info would be fine.
-        self.observer.ranges.wl().clear();
+        self.observer.shared.ranges.wl().clear();
         self.subs.clear();
         self.pool.block_on(router.unregister_task(task))
     }

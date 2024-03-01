@@ -2,7 +2,11 @@
 
 use std::{
     any::Any,
+    ffi::OsStr,
+    io::Write,
+    panic::UnwindSafe,
     path::PathBuf,
+    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -22,8 +26,32 @@ impl<E: engine_traits::KvEngine> SstPath for SstImporter<E> {
     }
 }
 
+fn system(cmd: &str, args: impl IntoIterator<Item = impl AsRef<OsStr>> + UnwindSafe) {
+    let exec = || {
+        let child = Command::new(cmd).args(args).spawn().unwrap();
+        println!("====={child:?}=====");
+        let exit = child.wait_with_output().unwrap();
+        std::io::copy(
+            &mut std::io::Cursor::new(exit.stdout),
+            &mut std::io::stdout(),
+        )
+        .unwrap();
+        std::io::copy(
+            &mut std::io::Cursor::new(exit.stderr),
+            &mut std::io::stdout(),
+        )
+        .unwrap();
+        std::io::stdout().flush().unwrap();
+    };
+    println!("====={:?}=====", std::panic::catch_unwind(exec));
+}
+
 impl<E: engine_traits::KvEngine> SstPath for ImportDir<E> {
     fn sst_path(&self, meta: &SstMeta) -> Option<PathBuf> {
+        system(
+            "ls",
+            ["-R".to_owned(), self.get_root_dir().display().to_string()],
+        );
         self.join_for_read(meta).map(|x| x.save).ok()
     }
 }

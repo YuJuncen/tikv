@@ -456,12 +456,16 @@ mod all {
         test_util::init_log_for_test();
         let suite = SuiteBuilder::new_named("with_ingest").nodes(1).build();
         suite.must_register_default_task();
-        run_async_test(suite.ingest_simple_sst(1, 256));
+        let keys = run_async_test(suite.ingest_simple_sst(1, 256));
         suite.force_flush_files(suite.default_task_name());
         suite.sync();
         suite.wait_for_flush();
         for entries in walkdir::WalkDir::new(suite.flushed_files.path()) {
             println!("{entries:?}");
         }
+        suite.check_for_write_records(
+            suite.flushed_files.path(),
+            keys.iter().map(|x| x.as_slice()),
+        );
     }
 }

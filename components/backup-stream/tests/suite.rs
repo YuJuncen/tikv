@@ -22,12 +22,12 @@ use backup_stream::{
     utils, BackupStreamResolver, Endpoint, GetCheckpointResult, RegionCheckpointOperation,
     RegionSet, Service, Task,
 };
-use engine_rocks::RocksEngine;
+use engine_rocks::{RocksEngine, RocksSstReader};
 use error_code::sst_importer;
 use futures::{executor::block_on, sink::SinkExt, AsyncWriteExt, Future, Stream, StreamExt};
 use grpcio::{ChannelBuilder, Server, ServerBuilder, WriteFlags};
 use kvproto::{
-    brpb::{CompressionType, Local, Metadata, StorageBackend},
+    brpb::{CompressionType, FileFormat, Local, Metadata, StorageBackend},
     import_sstpb::{ImportSstClient, IngestRequest, SstMeta, WriteBatch, WriteRequest},
     kvrpcpb::*,
     logbackuppb::{SubscribeFlushEventRequest, SubscribeFlushEventResponse},
@@ -67,6 +67,7 @@ pub struct FileSegments {
 pub struct LogFiles {
     default_cf: Vec<FileSegments>,
     write_cf: Vec<FileSegments>,
+    ssts: Vec<FileSegments>,
 }
 
 pub type TestEndpoint = Endpoint<
@@ -373,10 +374,11 @@ impl Suite {
         let mock_dir = ImportDir::<engine_test::kv::KvTestEngine>::new(
             cluster.paths[cluster.sst_workers_map[&id]]
                 .path()
+                .join("db")
                 .join("import-sst"),
         )
         .unwrap();
-        let lock = Arc::downcast::<Mutex<TestSstPath>>(ob.sst_query.clone()).unwrap();
+        let lock = Arc::downcast::<Mutex<TestSstPath>>(ob.shared.sst_query.clone()).unwrap();
         *lock.lock().unwrap() = TestSstPath::Right(mock_dir);
         cfg.enable = true;
         cfg.temp_path = format!("/{}/{}", self.temp_files.path().display(), id);
@@ -567,8 +569,12 @@ impl Suite {
                 for fg in meta.get_file_groups() {
                     let mut default_segs = vec![];
                     let mut write_segs = vec![];
+                    let mut ssts = vec![];
                     for file in fg.get_data_files_info() {
-                        let v = if file.cf == "default" || file.cf.is_empty() {
+                        dbg!(&file);
+                        let v = if file.file_format == FileFormat::Sst {
+                            Some(&mut ssts)
+                        } else if file.cf == "default" || file.cf.is_empty() {
                             Some(&mut default_segs)
                         } else if file.cf == "write" {
                             Some(&mut write_segs)
@@ -589,6 +595,12 @@ impl Suite {
                             segments: default_segs,
                         })
                     }
+                    if !ssts.is_empty() {
+                        res.ssts.push(FileSegments {
+                            path: p.clone(),
+                            segments: ssts,
+                        })
+                    }
                     if !write_segs.is_empty() {
                         res.write_cf.push(FileSegments {
                             path: p,
@@ -601,7 +613,6 @@ impl Suite {
         Ok(res)
     }
 
-    #[track_caller]
     pub fn check_for_write_records<'a>(
         &self,
         path: &Path,
@@ -674,6 +685,31 @@ impl Suite {
                     let value = iter.value();
                     assert_eq!(value, &[0xdd; 4096]);
                 }
+            }
+        }
+
+        for entry in files.ssts {
+            use engine_traits::{IterOptions, Iterator, RefIterable, SstReader};
+            assert_eq!(entry.segments.len(), 1);
+            let sst_read = RocksSstReader::open(&entry.path.to_string_lossy(), None).unwrap();
+            let mut iter = sst_read.iter(IterOptions::default()).unwrap();
+            iter.seek_to_first().unwrap();
+            while iter.valid().unwrap() {
+                // Remove the 'z' prefix.
+                let key = Key::from_encoded_slice(&iter.key()[1..])
+                    .truncate_ts()
+                    .unwrap()
+                    .into_raw()
+                    .unwrap();
+                if !remain_keys.remove(key.as_slice()) {
+                    extra_key += 1;
+                    extra_len += iter.key().len() + iter.value().len();
+                }
+
+                let value = iter.value();
+                let wf = WriteRef::parse(value).unwrap();
+                assert_eq!(wf.short_value, Some(b"test_record" as &[u8]));
+                iter.next().unwrap();
             }
         }
 
@@ -927,7 +963,7 @@ impl Suite {
         ImportSstClient::new(ch.client.channel().clone())
     }
 
-    pub async fn ingest_simple_sst(&self, table_id: i64, number: u64) {
+    pub async fn ingest_simple_sst(&self, table_id: i64, number: u64) -> HashSet<Vec<u8>> {
         assert_eq!(
             self.log_backup_cli.len(),
             1,
@@ -938,6 +974,7 @@ impl Suite {
         let cli = self.get_import_client(sid);
         let region = self.cluster.pd_client.get_region(b"").unwrap();
         let mut i = 0;
+        let mut keys = HashSet::default();
         let meta = test_sst_importer::call_write(
             &cli,
             &region,
@@ -946,13 +983,15 @@ impl Suite {
                     return None;
                 }
                 let key = make_record_key(table_id, i);
-                let res = Some((Key::from_raw(&key).into_encoded(), b"test_record".to_vec()));
+                keys.insert(key.clone());
+                let res = Some((key, b"test_record".to_vec()));
                 i += 1;
                 res
             }),
         )
         .await;
         test_sst_importer::call_ingest(&cli, &region, meta);
+        keys
     }
 }
 

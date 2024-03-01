@@ -2,8 +2,8 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, RwLock},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use engine_traits::KvEngine;
@@ -29,6 +29,12 @@ use crate::{
 #[derive(Clone)]
 pub struct BackupStreamObserver {
     scheduler: Scheduler<Task>,
+    pub shared: Arc<ObserverShared>,
+}
+
+pub struct ObserverShared {
+    linked_ssts: Mutex<HashMap<Uuid, PathBuf>>,
+    basic_path: PathBuf,
     // Note: maybe wrap those fields to methods?
     pub ranges: Arc<RwLock<SegmentSet<Vec<u8>>>>,
     // Note: this is published for test.
@@ -46,8 +52,12 @@ impl BackupStreamObserver {
     ) -> Self {
         Self {
             scheduler,
-            ranges: Default::default(),
-            sst_query,
+            shared: Arc::new(ObserverShared {
+                linked_ssts: Default::default(),
+                basic_path: Path::new("/tmp").to_owned(),
+                ranges: Default::default(),
+                sst_query,
+            }),
         }
     }
 
@@ -61,6 +71,7 @@ impl BackupStreamObserver {
         // use 0 as the priority of the cmd observer. should have a higher priority than
         // the `resolved-ts`'s cmd observer
         registry.register_cmd_observer(0, BoxCmdObserver::new(self.clone()));
+        registry.register_query_observer(100, BoxQueryObserver::new(self.clone()));
         registry.register_role_observer(100, BoxRoleObserver::new(self.clone()));
         registry.register_region_change_observer(100, BoxRegionChangeObserver::new(self.clone()));
     }
@@ -93,7 +104,8 @@ impl BackupStreamObserver {
         if end_key.is_empty() {
             end_key = &[0xffu8; 32];
         }
-        self.ranges
+        self.shared
+            .ranges
             .rl()
             .is_overlapping((region.get_start_key(), end_key))
     }
@@ -102,40 +114,62 @@ impl BackupStreamObserver {
     /// when there isn't any task, we can ignore the events, so we don't need to
     /// handle useless events. (Also won't yield verbose logs.)
     pub fn is_hibernating(&self) -> bool {
-        self.ranges.rl().is_empty()
-    }
-
-    fn collect_sst_paths(&self, batches: &[CmdBatch]) -> HashMap<Uuid, PathBuf> {
-        let mut res = HashMap::new();
-        for batch in batches {
-            for cmd in &batch.cmds {
-                for req in cmd.request.get_requests() {
-                    if req.has_ingest_sst() {
-                        let sst = req.get_ingest_sst().get_sst();
-                        let entry = self.sst_query.sst_path(sst).and_then(|path| {
-                            let uuid = Uuid::from_slice(sst.get_uuid()).ok()?;
-                            let linked_path =
-                                path.parent().unwrap().join(format!("{uuid}.backup.sst"));
-                            std::fs::hard_link(path, &linked_path).report_if_err("");
-                            Some((uuid, linked_path))
-                        });
-                        match entry {
-                            Some((k, v)) => {
-                                res.insert(k, v);
-                            }
-                            None => {
-                                warn!("log backup failed to query sst real path from importer."; "meta" => ?sst);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        res
+        self.shared.ranges.rl().is_empty()
     }
 }
 
 impl Coprocessor for BackupStreamObserver {}
+
+impl QueryObserver for BackupStreamObserver {
+    fn post_exec_query(
+        &self,
+        _: &mut ObserverContext<'_>,
+        _: &Cmd,
+        _: &kvproto::raft_serverpb::RaftApplyState,
+        _: &RegionState,
+        ssts: &mut ApplyCtxInfo<'_>,
+    ) -> bool {
+        for sst in ssts.pending_handle_ssts.iter().flat_map(|sst| sst) {
+            let handle = || {
+                let path = self
+                    .shared
+                    .sst_query
+                    .sst_path(&sst.meta)
+                    .ok_or_else(|| format!("cannot find path for sst {:?}", sst.meta))?;
+                let sst_name = path
+                    .file_name()
+                    .ok_or_else(|| format!("not a file path {}", path.display()))?;
+                let temp_path = self.shared.basic_path.join(sst_name);
+                std::fs::hard_link(&path, &temp_path).map_err(|err| err.to_string())?;
+                let uuid = Uuid::from_slice(&sst.meta.uuid).map_err(|err| err.to_string())?;
+                self.shared
+                    .linked_ssts
+                    .lock()
+                    .unwrap()
+                    .insert(uuid, temp_path);
+
+                std::result::Result::<(), String>::Ok(())
+            };
+            if let Err(err) = handle() {
+                warn!("log backup observer failed to link sst file."; "err" => %err);
+            }
+        }
+        false
+    }
+}
+
+impl RoleObserver for BackupStreamObserver {
+    fn on_role_change(&self, ctx: &mut ObserverContext<'_>, r: &RoleChange) {
+        if r.state != StateRole::Leader && !self.is_hibernating() {
+            try_send!(
+                self.scheduler,
+                Task::ModifyObserve(ObserveOp::Stop {
+                    region: ctx.region().clone(),
+                })
+            );
+        }
+    }
+}
 
 impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
     // `BackupStreamObserver::on_flush_applied_cmd_batch` should only invoke if
@@ -166,11 +200,10 @@ impl<E: KvEngine> CmdObserver<E> for BackupStreamObserver {
         if cmd_batches.is_empty() {
             return;
         }
-        let sst_paths = self.collect_sst_paths(&cmd_batches);
         self.scheduler
             .schedule_force(Task::BatchEvent {
                 cmds: cmd_batches,
-                sst_paths,
+                sst_paths: std::mem::take(&mut self.shared.linked_ssts.lock().unwrap()),
             })
             .report_if_err("failed to send backup command, are we shutting down?");
     }
