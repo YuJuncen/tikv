@@ -1,14 +1,18 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
+#![feature(lazy_cell)]
 
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
-use ::sst_importer::sst_path::{ImportDir, PanicSstPath};
+use ::sst_importer::{
+    sst_path::{ImportDir, PanicSstPath},
+    SstImporter,
+};
 use async_compression::futures::write::ZstdDecoder;
 use backup_stream::{
     errors::Result,
@@ -23,6 +27,7 @@ use backup_stream::{
     RegionSet, Service, Task,
 };
 use engine_rocks::{RocksEngine, RocksSstReader};
+use engine_test::kv::KvTestEngine as EK;
 use error_code::sst_importer;
 use futures::{executor::block_on, sink::SinkExt, AsyncWriteExt, Future, Stream, StreamExt};
 use grpcio::{ChannelBuilder, Server, ServerBuilder, WriteFlags};
@@ -42,7 +47,7 @@ use tempfile::TempDir;
 use test_pd_client::TestPdClient;
 use test_raftstore::{new_server_cluster, Cluster, ServerCluster};
 use test_util::retry;
-use tikv::config::BackupStreamConfig;
+use tikv::config::{BackupStreamConfig, TikvConfig};
 use tikv_util::{
     codec::{
         number::NumberEncoder,
@@ -55,7 +60,7 @@ use tikv_util::{
 use txn_types::{Key, TimeStamp, WriteRef};
 use walkdir::WalkDir;
 
-type TestSstPath = Either<PanicSstPath, ImportDir<engine_test::kv::KvTestEngine>>;
+type TestSstPath = LazyLock<Arc<SstImporter<EK>>>;
 
 #[derive(Debug)]
 pub struct FileSegments {
@@ -132,6 +137,7 @@ pub struct SuiteBuilder {
     nodes: usize,
     metastore_error: Box<dyn Fn(&str) -> Result<()> + Send + Sync>,
     cfg: Box<dyn FnOnce(&mut BackupStreamConfig)>,
+    cluster_cfg: Box<dyn FnOnce(&mut tikv::config::TikvConfig)>,
 }
 
 impl SuiteBuilder {
@@ -143,6 +149,7 @@ impl SuiteBuilder {
             cfg: Box::new(|cfg| {
                 cfg.enable = true;
             }),
+            cluster_cfg: Box::new(|_| {}),
         }
     }
 
@@ -170,17 +177,30 @@ impl SuiteBuilder {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn cluster_cfg(mut self, f: impl FnOnce(&mut TikvConfig) + 'static) -> Self {
+        let old_f = self.cluster_cfg;
+        self.cluster_cfg = Box::new(move |cfg| {
+            old_f(cfg);
+            f(cfg);
+        });
+        self
+    }
+
     pub fn build(self) -> Suite {
         let Self {
             name: case,
             nodes: n,
             metastore_error,
             cfg: cfg_f,
+            cluster_cfg: ccfg_f,
         } = self;
 
         info!("start test"; "case" => %case, "nodes" => %n);
-        let cluster = new_server_cluster(42, n);
+        let mut cluster = new_server_cluster(42, n);
+        ccfg_f(&mut cluster.cfg);
         let mut suite = Suite {
+            sst_path_promises: Default::default(),
             endpoints: Default::default(),
             meta_store: ErrorStore {
                 inner: Default::default(),
@@ -210,6 +230,7 @@ impl SuiteBuilder {
             let cli = suite.start_log_backup_client_on(id);
             suite.log_backup_cli.insert(id, cli);
         }
+
         // We must wait until the endpoints get ready to watching the metastore, or some
         // modifies may be lost. Either make Endpoint::with_client wait until watch did
         // start or make slash_etc support multi-version, then we can get rid of this
@@ -265,6 +286,8 @@ pub struct Suite {
     // The place to make services live as long as suite.
     servers: Vec<Server>,
 
+    sst_path_promises: HashMap<u64, std::sync::mpsc::SyncSender<Arc<SstImporter<EK>>>>,
+
     temp_files: TempDir,
     pub flushed_files: TempDir,
     case_name: String,
@@ -291,7 +314,9 @@ impl Suite {
         let worker = LazyWorker::new(format!("br-{}", id));
         let mut s = cluster.sim.wl();
 
-        let sst_query = Mutex::new(TestSstPath::Left(PanicSstPath));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let sst_query = LazyLock::new(move || rx.recv().unwrap());
+        self.sst_path_promises.insert(id, tx);
         let ob = BackupStreamObserver::new(worker.scheduler(), Arc::new(sst_query));
         let ob2 = ob.clone();
         s.coprocessor_hooks
@@ -371,15 +396,12 @@ impl Suite {
         let cm = sim.get_concurrency_manager(id);
         let regions = sim.region_info_accessors.get(&id).unwrap().clone();
         let ob = self.obs.get(&id).unwrap().clone();
-        let mock_dir = ImportDir::<engine_test::kv::KvTestEngine>::new(
-            cluster.paths[cluster.sst_workers_map[&id]]
-                .path()
-                .join("db")
-                .join("import-sst"),
-        )
-        .unwrap();
-        let lock = Arc::downcast::<Mutex<TestSstPath>>(ob.shared.sst_query.clone()).unwrap();
-        *lock.lock().unwrap() = TestSstPath::Right(mock_dir);
+        self.sst_path_promises
+            .remove(&id)
+            .unwrap()
+            .send(sim.importers[&id].clone())
+            .unwrap();
+
         cfg.enable = true;
         cfg.temp_path = format!("/{}/{}", self.temp_files.path().display(), id);
         let resolver = LeadershipResolver::new(
@@ -405,6 +427,7 @@ impl Suite {
             cluster.pd_client.clone(),
             cm,
             BackupStreamResolver::V1(resolver),
+            sim.data_key_manager.clone(),
         );
         worker.start(endpoint);
     }
@@ -571,7 +594,6 @@ impl Suite {
                     let mut write_segs = vec![];
                     let mut ssts = vec![];
                     for file in fg.get_data_files_info() {
-                        dbg!(&file);
                         let v = if file.file_format == FileFormat::Sst {
                             Some(&mut ssts)
                         } else if file.cf == "default" || file.cf.is_empty() {

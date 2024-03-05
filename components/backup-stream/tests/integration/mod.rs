@@ -1,20 +1,28 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 #![feature(custom_test_frameworks)]
+#![feature(lazy_cell)]
 #![test_runner(test_util::run_tests)]
 
 #[path = "../suite.rs"]
 mod suite;
 
 mod all {
-    use std::time::{Duration, Instant};
+    use std::{
+        env::temp_dir,
+        time::{Duration, Instant},
+    };
 
     use backup_stream::{
         errors::Error, router::TaskSelector, GetCheckpointResult, RegionCheckpointOperation,
         RegionSet, Task,
     };
+    use encryption::{FileConfig, MasterKeyConfig};
     use futures::{Stream, StreamExt};
+    use kvproto::encryptionpb::EncryptionMethod;
     use pd_client::PdClient;
+    use rand::Rng;
+    use tempfile::TempDir;
     use test_raftstore::IsolationFilterFactory;
     use tikv::config::BackupStreamConfig;
     use tikv_util::{box_err, defer, info, HandyRwLock};
@@ -453,16 +461,48 @@ mod all {
 
     #[test]
     fn with_ingest() {
+        let mut suite = SuiteBuilder::new_named("with_ingest").nodes(1).build();
+        suite.must_register_default_task();
+        let keys = run_async_test(suite.ingest_simple_sst(1, 256));
+        let keys2 = run_async_test(suite.write_records(256, 128, 1));
+        suite.force_flush_files(suite.default_task_name());
+        suite.sync();
+        suite.wait_for_flush();
+        suite.check_for_write_records(
+            suite.flushed_files.path(),
+            keys.union(&keys2).map(|x| x.as_slice()),
+        );
+    }
+
+    #[test]
+    fn with_encryption_ingest() {
         test_util::init_log_for_test();
-        let suite = SuiteBuilder::new_named("with_ingest").nodes(1).build();
+        let master_key_space = TempDir::new().unwrap();
+        let mp = master_key_space.path().join("key.bin").to_owned();
+        let mut suite = SuiteBuilder::new_named("with_enc_ingest")
+            .nodes(1)
+            .cluster_cfg(move |cfg| {
+                let enc = &mut cfg.security.encryption;
+                enc.data_encryption_method = EncryptionMethod::Aes256Ctr;
+                // Write a random value as the master key.
+                let mut key = [0u8; 32];
+                rand::thread_rng().fill(&mut key[..]);
+                let mut encoded = [0u8; 65];
+                hex::encode_to_slice(key, &mut encoded[..64]).unwrap();
+                encoded[64] = b'\n';
+                std::fs::write(&mp, encoded).unwrap();
+                enc.master_key = MasterKeyConfig::File {
+                    config: FileConfig {
+                        path: mp.to_str().unwrap().to_owned(),
+                    },
+                };
+            })
+            .build();
         suite.must_register_default_task();
         let keys = run_async_test(suite.ingest_simple_sst(1, 256));
         suite.force_flush_files(suite.default_task_name());
         suite.sync();
         suite.wait_for_flush();
-        for entries in walkdir::WalkDir::new(suite.flushed_files.path()) {
-            println!("{entries:?}");
-        }
         suite.check_for_write_records(
             suite.flushed_files.path(),
             keys.iter().map(|x| x.as_slice()),

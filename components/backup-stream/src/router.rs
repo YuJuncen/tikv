@@ -4,6 +4,7 @@ use std::{
     borrow::Borrow,
     collections::HashMap,
     fmt::Display,
+    io::Read,
     path::{Path, PathBuf},
     process::Output,
     result,
@@ -14,6 +15,7 @@ use std::{
     time::Duration,
 };
 
+use encryption::{DataKeyManager, DecrypterReader};
 use engine_traits::{CfName, MvccProperties, SstExt, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use external_storage::{create_storage, BackendConfig, ExternalStorage, UnpinReader};
 use file_system::Sha256Reader;
@@ -23,6 +25,7 @@ use kvproto::{
         CompressionType, DataFileGroup, DataFileInfo, FileFormat, FileType, MetaVersion, Metadata,
         StreamBackupTaskInfo,
     },
+    encryptionpb::EncryptionMethod,
     import_sstpb::SstMeta,
     raft_cmdpb::{CmdType, IngestSstRequest},
 };
@@ -521,8 +524,8 @@ impl From<tikv::config::BackupStreamConfig> for Config {
 
 impl Router {
     /// Create a new router with the temporary folder.
-    pub fn new(scheduler: Scheduler<Task>, config: Config) -> Self {
-        Self(Arc::new(RouterInner::new(scheduler, config)))
+    pub fn new(inner: RouterInner) -> Self {
+        Self(Arc::new(inner))
     }
 }
 
@@ -561,6 +564,8 @@ pub struct RouterInner {
     temp_file_memory_quota: AtomicU64,
     /// The max duration the local data can be pending.
     max_flush_interval: SyncRwLock<Duration>,
+    /// The data key manager for each tasks.
+    data_key_manager: Option<Arc<DataKeyManager>>,
 }
 
 impl std::fmt::Debug for RouterInner {
@@ -574,8 +579,13 @@ impl std::fmt::Debug for RouterInner {
 }
 
 impl RouterInner {
-    pub fn new(scheduler: Scheduler<Task>, config: Config) -> Self {
+    pub fn new(
+        scheduler: Scheduler<Task>,
+        config: Config,
+        data_key_manager: Option<Arc<DataKeyManager>>,
+    ) -> Self {
         RouterInner {
+            data_key_manager,
             ranges: SyncRwLock::new(SegmentMap::default()),
             tasks: Mutex::new(HashMap::default()),
             prefix: config.prefix,
@@ -584,6 +594,11 @@ impl RouterInner {
             temp_file_memory_quota: AtomicU64::new(config.temp_file_memory_quota),
             max_flush_interval: SyncRwLock::new(config.max_flush_interval),
         }
+    }
+
+    #[cfg(test)]
+    pub fn for_test(scheduler: Scheduler<Task>, config: Config) -> Self {
+        Self::new(scheduler, config, None)
     }
 
     pub fn update_config(&self, config: &BackupStreamConfig) {
@@ -654,8 +669,14 @@ impl RouterInner {
 
         // register task info
         let cfg = self.tempfile_config_for_task(&task);
-        let stream_task =
-            StreamDataCollector::new(task, ranges.clone(), merged_file_size_limit, cfg).await?;
+        let stream_task = StreamDataCollector::new(
+            task,
+            ranges.clone(),
+            merged_file_size_limit,
+            cfg,
+            self.data_key_manager.as_ref().map(Arc::clone),
+        )
+        .await?;
         frame!(self.tasks.lock())
             .await
             .insert(task_name.clone(), Arc::new(stream_task));
@@ -1027,6 +1048,8 @@ pub struct StreamDataCollector {
     merged_file_size_limit: u64,
     /// The pool for holding the temporary files.
     temp_file_pool: Arc<TempFilePool>,
+    /// The encryption manager for decoing the SSTs to be backed up.
+    enc_manager: Option<Arc<DataKeyManager>>,
 }
 
 impl Drop for StreamDataCollector {
@@ -1074,6 +1097,7 @@ impl StreamDataCollector {
         ranges: Vec<(Vec<u8>, Vec<u8>)>,
         merged_file_size_limit: u64,
         temp_pool_cfg: tempfiles::Config,
+        enc_manager: Option<Arc<DataKeyManager>>,
     ) -> Result<Self> {
         let temp_dir = &temp_pool_cfg.swap_files;
         tokio::fs::create_dir_all(temp_dir).await?;
@@ -1096,7 +1120,18 @@ impl StreamDataCollector {
             global_checkpoint_ts: AtomicU64::new(start_ts),
             merged_file_size_limit,
             temp_file_pool: Arc::new(TempFilePool::new(temp_pool_cfg)?),
+            enc_manager,
         })
+    }
+
+    #[cfg(test)]
+    pub async fn for_test(
+        task: StreamTask,
+        ranges: Vec<(Vec<u8>, Vec<u8>)>,
+        merged_file_size_limit: u64,
+        temp_pool_cfg: tempfiles::Config,
+    ) -> Result<Self> {
+        Self::new(task, ranges, merged_file_size_limit, temp_pool_cfg, None).await
     }
 
     #[instrument(skip(self, events), fields(event_len = events.len()))]
@@ -1252,8 +1287,9 @@ impl StreamDataCollector {
 
     fn fetch_min_max_ts(&self, path: &Path) -> (u64, u64) {
         use engine_traits::SstReader;
-        let props = engine_rocks::RocksSstReader::open(path.to_str().unwrap(), None)
-            .and_then(|f| f.load_mvcc_properties());
+        let props =
+            engine_rocks::RocksSstReader::open(path.to_str().unwrap(), self.enc_manager.clone())
+                .and_then(|f| f.load_mvcc_properties());
         match props {
             Ok(props) => (props.min_ts.into_inner(), props.max_ts.into_inner()),
             Err(err) => {
@@ -1294,7 +1330,17 @@ impl StreamDataCollector {
         data_file_info.set_min_ts(min_ts);
         data_file_info.set_max_ts(max_ts);
         data_file_info.set_file_format(FileFormat::Sst);
-        let file = std::fs::File::open(path)?;
+        let file = match &self.enc_manager {
+            Some(enm) => enm.open_file_for_read(&path),
+            None => DecrypterReader::new(
+                file_system::File::open(&path)?,
+                EncryptionMethod::Plaintext,
+                &[],
+                encryption::Iv::Empty,
+            ),
+        };
+        let file =
+            file.map_err(|err| annotate!(err, "failed to decrypt the file {}", path.display()))?;
         let (reader, c) = Sha256Reader::new(file)
             .map_err(|err| annotate!(err, "failed to create sha256 hasher"))?;
         self.storage
@@ -1994,7 +2040,7 @@ mod tests {
     #[test]
     fn test_register() {
         let (tx, _) = dummy_scheduler();
-        let router = RouterInner::new(
+        let router = RouterInner::for_test(
             tx,
             Config {
                 prefix: PathBuf::new(),
@@ -2104,7 +2150,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&tmp).await.unwrap();
         let (tx, rx) = dummy_scheduler();
-        let router = RouterInner::new(
+        let router = RouterInner::for_test(
             tx,
             Config {
                 prefix: tmp.clone(),
@@ -2280,7 +2326,7 @@ mod tests {
             is_paused: false,
         };
         let merged_file_size_limit = 0x10000;
-        let task = StreamDataCollector::new(
+        let task = StreamDataCollector::for_test(
             stream_task,
             vec![(vec![], vec![])],
             merged_file_size_limit,
@@ -2400,7 +2446,7 @@ mod tests {
     async fn test_flush_with_error() -> Result<()> {
         let (tx, _rx) = dummy_scheduler();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
-        let router = Arc::new(RouterInner::new(
+        let router = Arc::new(RouterInner::for_test(
             tx,
             Config {
                 prefix: tmp.clone(),
@@ -2438,7 +2484,7 @@ mod tests {
     async fn test_empty_resolved_ts() {
         let (tx, _rx) = dummy_scheduler();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
-        let router = RouterInner::new(
+        let router = RouterInner::for_test(
             tx,
             Config {
                 prefix: tmp.clone(),
@@ -2473,7 +2519,7 @@ mod tests {
     async fn test_cleanup_when_stop() -> Result<()> {
         let (tx, _rx) = dummy_scheduler();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
-        let router = Arc::new(RouterInner::new(
+        let router = Arc::new(RouterInner::for_test(
             tx,
             Config {
                 prefix: tmp.clone(),
@@ -2529,7 +2575,7 @@ mod tests {
     async fn test_flush_with_pausing_self() -> Result<()> {
         let (tx, rx) = dummy_scheduler();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
-        let router = Arc::new(RouterInner::new(
+        let router = Arc::new(RouterInner::for_test(
             tx,
             Config {
                 prefix: tmp.clone(),
@@ -2666,7 +2712,7 @@ mod tests {
             info: task_info,
             is_paused: false,
         };
-        let task = StreamDataCollector::new(
+        let task = StreamDataCollector::for_test(
             stream_task,
             vec![(vec![], vec![])],
             0x100000,
@@ -2763,7 +2809,7 @@ mod tests {
         let file_path = Path::new(&file_name);
         let tempfile = TempDir::new().unwrap();
         let cfg = make_tempfiles_cfg(tempfile.path());
-        let mut task_handler = StreamDataCollector::new(
+        let mut task_handler = StreamDataCollector::for_test(
             StreamTask {
                 info: task,
                 is_paused: false,
@@ -2798,7 +2844,7 @@ mod tests {
     fn test_update_config() {
         let (sched, rx) = dummy_scheduler();
         let cfg = BackupStreamConfig::default();
-        let router = Arc::new(RouterInner::new(
+        let router = Arc::new(RouterInner::for_test(
             sched.clone(),
             Config {
                 prefix: PathBuf::new(),
@@ -2853,7 +2899,7 @@ mod tests {
     async fn test_flush_on_events_race() -> Result<()> {
         let (tx, _rx) = dummy_scheduler();
         let tmp = std::env::temp_dir().join(format!("{}", uuid::Uuid::new_v4()));
-        let router = Arc::new(RouterInner::new(
+        let router = Arc::new(RouterInner::for_test(
             tx,
             Config {
                 prefix: tmp.clone(),
@@ -2940,7 +2986,7 @@ mod tests {
     async fn test_flush_sst() {
         let (tx, _rx) = dummy_scheduler();
         let tmp = TempDir::new().unwrap();
-        let router = Arc::new(RouterInner::new(
+        let router = Arc::new(RouterInner::for_test(
             tx,
             Config {
                 prefix: tmp.path().to_owned(),

@@ -80,6 +80,7 @@ tracing-active-tree = { workspace = true }
 txn_types = { workspace = true }
 uuid = "0.8"
 yatp = { workspace = true }
+encryption = {workspace = true}
 
 [dev-dependencies]
 async-trait = "0.1"

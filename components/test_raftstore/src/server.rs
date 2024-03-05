@@ -153,6 +153,8 @@ pub struct ServerCluster<EK: KvEngine> {
     pub health_controllers: HashMap<u64, HealthController>,
     pub security_mgr: Arc<SecurityManager>,
     pub txn_extra_schedulers: HashMap<u64, Arc<dyn TxnExtraScheduler>>,
+    // This will be filled after `run_node` called.
+    pub data_key_manager: Option<Arc<DataKeyManager>>,
     snap_paths: HashMap<u64, TempDir>,
     snap_mgrs: HashMap<u64, SnapManager>,
     pd_client: Arc<TestPdClient>,
@@ -204,6 +206,7 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
             env,
             txn_extra_schedulers: HashMap::default(),
             causal_ts_providers: HashMap::default(),
+            data_key_manager: None,
         }
     }
 
@@ -275,7 +278,6 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
             let p = self.snap_paths[&node_id].path().to_str().unwrap();
             (p.to_owned(), None)
         };
-
         let bg_worker = WorkerBuilder::new("background").thread_count(2).create();
 
         if cfg.server.addr == "127.0.0.1:0" {
@@ -460,7 +462,7 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
         let snap_mgr = SnapManagerBuilder::default()
             .max_write_bytes_per_sec(cfg.server.snap_io_max_bytes_per_sec.0 as i64)
             .max_total_size(cfg.server.snap_max_total_size.0)
-            .encryption_key_manager(key_manager)
+            .encryption_key_manager(key_manager.clone())
             .max_per_file_size(cfg.raft_store.max_snapshot_file_raw_size.0)
             .enable_multi_snapshot_files(true)
             .enable_receive_tablet_snapshot(cfg.raft_store.enable_v2_compatible_learner)
@@ -661,6 +663,8 @@ impl<EK: KvEngineWithRocks> ServerCluster<EK> {
 
         let client = RaftClient::new(node_id, self.conn_builder.clone());
         self.raft_clients.insert(node_id, client);
+
+        self.data_key_manager = key_manager;
         Ok(node_id)
     }
 }

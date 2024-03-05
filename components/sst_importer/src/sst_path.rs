@@ -2,14 +2,16 @@
 
 use std::{
     any::Any,
+    cell::LazyCell,
     ffi::OsStr,
     io::Write,
     panic::UnwindSafe,
     path::PathBuf,
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
+use encryption::DataKeyManager;
 use kvproto::import_sstpb::SstMeta;
 use tikv_util::Either;
 
@@ -18,11 +20,16 @@ use crate::SstImporter;
 
 pub trait SstPath: Any {
     fn sst_path(&self, meta: &SstMeta) -> Option<PathBuf>;
+    fn encryption(&self) -> Option<&DataKeyManager>;
 }
 
 impl<E: engine_traits::KvEngine> SstPath for SstImporter<E> {
     fn sst_path(&self, meta: &SstMeta) -> Option<PathBuf> {
         self.dir.join_for_read(meta).map(|x| x.save).ok()
+    }
+    fn encryption(&self) -> Option<&DataKeyManager> {
+        dbg!(self.key_manager.is_some());
+        self.key_manager.as_deref()
     }
 }
 
@@ -46,25 +53,13 @@ fn system(cmd: &str, args: impl IntoIterator<Item = impl AsRef<OsStr>> + UnwindS
     println!("====={:?}=====", std::panic::catch_unwind(exec));
 }
 
-impl<E: engine_traits::KvEngine> SstPath for ImportDir<E> {
-    fn sst_path(&self, meta: &SstMeta) -> Option<PathBuf> {
-        system(
-            "ls",
-            ["-R".to_owned(), self.get_root_dir().display().to_string()],
-        );
-        self.join_for_read(meta).map(|x| x.save).ok()
-    }
-}
-
 impl<T: SstPath> SstPath for Arc<T> {
     fn sst_path(&self, meta: &SstMeta) -> Option<PathBuf> {
         T::sst_path(&self, meta)
     }
-}
 
-impl<T: SstPath> SstPath for Mutex<T> {
-    fn sst_path(&self, meta: &SstMeta) -> Option<PathBuf> {
-        self.lock().unwrap().sst_path(meta)
+    fn encryption(&self) -> Option<&DataKeyManager> {
+        T::encryption(&self)
     }
 }
 
@@ -75,6 +70,22 @@ impl<T: SstPath, L: SstPath> SstPath for Either<T, L> {
             Either::Right(r) => r.sst_path(meta),
         }
     }
+    fn encryption(&self) -> Option<&DataKeyManager> {
+        match self {
+            Either::Left(l) => l.encryption(),
+            Either::Right(r) => r.encryption(),
+        }
+    }
+}
+
+impl<T: SstPath, F: FnOnce() -> T + 'static> SstPath for LazyLock<T, F> {
+    fn sst_path(&self, meta: &SstMeta) -> Option<PathBuf> {
+        T::sst_path(&*self, meta)
+    }
+
+    fn encryption(&self) -> Option<&DataKeyManager> {
+        T::encryption(&*self)
+    }
 }
 
 pub struct PanicSstPath;
@@ -82,5 +93,8 @@ pub struct PanicSstPath;
 impl SstPath for PanicSstPath {
     fn sst_path(&self, _meta: &SstMeta) -> Option<PathBuf> {
         panic!("call sst_path in PanicSstPath")
+    }
+    fn encryption(&self) -> Option<&DataKeyManager> {
+        panic!("call encryption in PanicSstPath")
     }
 }

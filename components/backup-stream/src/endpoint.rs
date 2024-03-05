@@ -12,6 +12,7 @@ use std::{
 };
 
 use concurrency_manager::ConcurrencyManager;
+use encryption::DataKeyManager;
 use engine_traits::KvEngine;
 use error_code::ErrorCodeExt;
 use futures::{stream::AbortHandle, FutureExt, TryFutureExt};
@@ -63,7 +64,7 @@ use crate::{
     metadata::{store::MetaStore, MetadataClient, MetadataEvent, StreamTask},
     metrics::{self, TaskStatus},
     observer::BackupStreamObserver,
-    router::{self, ApplyEvents, Router, TaskSelector},
+    router::{self, ApplyEvents, Router, RouterInner, TaskSelector},
     subscription_manager::{RegionSubscriptionManager, ResolvedRegions},
     subscription_track::{Ref, RefMut, ResolveResult, SubscriptionTracer},
     try_send,
@@ -125,13 +126,18 @@ where
         pd_client: Arc<PDC>,
         concurrency_manager: ConcurrencyManager,
         resolver: BackupStreamResolver<RT, E>,
+        data_key_manager: Option<Arc<DataKeyManager>>,
     ) -> Self {
         crate::metrics::STREAM_ENABLED.inc();
         let pool = create_tokio_runtime((config.num_threads / 2).max(1), "backup-stream")
             .expect("failed to create tokio runtime for backup stream worker.");
 
         let meta_client = MetadataClient::new(store, store_id);
-        let range_router = Router::new(scheduler.clone(), router::Config::from(config.clone()));
+        let range_router = Router::new(RouterInner::new(
+            scheduler.clone(),
+            router::Config::from(config.clone()),
+            data_key_manager,
+        ));
 
         // spawn a worker to watch task changes from etcd periodically.
         let meta_client_clone = meta_client.clone();

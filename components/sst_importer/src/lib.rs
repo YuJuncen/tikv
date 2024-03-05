@@ -2,6 +2,7 @@
 
 //! Importing RocksDB SST files into TiKV
 #![feature(min_specialization)]
+#![feature(lazy_cell)]
 
 #[macro_use]
 extern crate lazy_static;

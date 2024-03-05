@@ -61,7 +61,8 @@ impl BackupStreamObserver {
         }
     }
 
-    pub fn without_sst(scheduler: Scheduler<Task>) -> Self {
+    #[cfg(test)]
+    pub fn for_test(scheduler: Scheduler<Task>) -> Self {
         Self::new(scheduler, Arc::new(PanicSstPath))
     }
 
@@ -140,7 +141,11 @@ impl QueryObserver for BackupStreamObserver {
                     .file_name()
                     .ok_or_else(|| format!("not a file path {}", path.display()))?;
                 let temp_path = self.shared.basic_path.join(sst_name);
-                std::fs::hard_link(&path, &temp_path).map_err(|err| err.to_string())?;
+                file_system::hard_link(&path, &temp_path).map_err(|err| err.to_string())?;
+                if let Some(enc) = self.shared.sst_query.encryption() {
+                    enc.link_file(&path.to_string_lossy(), &temp_path.to_string_lossy())
+                        .map_err(|err| err.to_string())?;
+                }
                 let uuid = Uuid::from_slice(&sst.meta.uuid).map_err(|err| err.to_string())?;
                 self.shared
                     .linked_ssts
@@ -291,7 +296,7 @@ mod tests {
         let (sched, mut rx) = dummy_scheduler();
 
         // Prepare: assuming a task wants the range of [0001, 0010].
-        let o = BackupStreamObserver::without_sst(sched);
+        let o = BackupStreamObserver::for_test(sched);
         let subs = SubscriptionTracer::default();
         assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
 
@@ -316,7 +321,7 @@ mod tests {
         let (sched, mut rx) = dummy_scheduler();
 
         // Prepare: assuming a task wants the range of [0001, 0010].
-        let o = BackupStreamObserver::without_sst(sched);
+        let o = BackupStreamObserver::for_test(sched);
         let subs = SubscriptionTracer::default();
         assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
 
@@ -388,7 +393,7 @@ mod tests {
         let (sched, mut rx) = dummy_scheduler();
 
         // Prepare: assuming a task wants the range of [0001, 0010].
-        let o = BackupStreamObserver::without_sst(sched);
+        let o = BackupStreamObserver::for_test(sched);
         let r = fake_region(43, b"0010", b"0042");
         let mut ctx = ObserverContext::new(&r);
         o.on_region_changed(&mut ctx, RegionChangeEvent::Create, StateRole::Leader);

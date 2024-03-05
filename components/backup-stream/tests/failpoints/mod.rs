@@ -1,6 +1,7 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
 
 #![feature(custom_test_frameworks)]
+#![feature(lazy_cell)]
 #![test_runner(test_util::run_failpoint_tests)]
 
 #[path = "../suite.rs"]
