@@ -1,7 +1,14 @@
 // Copyright 2017 TiKV Project Authors. Licensed under Apache-2.0.
 
 // #[PerformanceCriticalPath]: TiKV gRPC APIs implementation
-use std::{mem, sync::Arc, time::Duration};
+use std::{
+    mem,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use api_version::KvFormat;
 use fail::fail_point;
@@ -15,6 +22,7 @@ use grpcio::{
     ClientStreamingSink, DuplexSink, Error as GrpcError, RequestStream, Result as GrpcResult,
     RpcContext, RpcStatus, RpcStatusCode, ServerStreamingSink, UnarySink, WriteFlags,
 };
+use health_controller::HealthController;
 use kvproto::{coprocessor::*, kvrpcpb::*, mpp::*, raft_serverpb::*, tikvpb::*};
 use protobuf::RepeatedField;
 use raft::eraftpb::MessageType;
@@ -64,6 +72,7 @@ const GRPC_MSG_NOTIFY_SIZE: usize = 8;
 
 /// Service handles the RPC messages for the `Tikv` service.
 pub struct Service<E: Engine, L: LockManager, F: KvFormat> {
+    cluster_id: u64,
     store_id: u64,
     /// Used to handle requests related to GC.
     // TODO: make it Some after GC is supported for v2.
@@ -89,6 +98,10 @@ pub struct Service<E: Engine, L: LockManager, F: KvFormat> {
     reject_messages_on_memory_ratio: f64,
 
     resource_manager: Option<Arc<ResourceGroupManager>>,
+
+    health_controller: HealthController,
+    health_feedback_interval: Option<Duration>,
+    health_feedback_seq: Arc<AtomicU64>,
 }
 
 impl<E: Engine, L: LockManager, F: KvFormat> Drop for Service<E, L, F> {
@@ -100,6 +113,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Drop for Service<E, L, F> {
 impl<E: Engine + Clone, L: LockManager + Clone, F: KvFormat> Clone for Service<E, L, F> {
     fn clone(&self) -> Self {
         Service {
+            cluster_id: self.cluster_id,
             store_id: self.store_id,
             gc_worker: self.gc_worker.clone(),
             storage: self.storage.clone(),
@@ -112,6 +126,9 @@ impl<E: Engine + Clone, L: LockManager + Clone, F: KvFormat> Clone for Service<E
             proxy: self.proxy.clone(),
             reject_messages_on_memory_ratio: self.reject_messages_on_memory_ratio,
             resource_manager: self.resource_manager.clone(),
+            health_controller: self.health_controller.clone(),
+            health_feedback_seq: self.health_feedback_seq.clone(),
+            health_feedback_interval: self.health_feedback_interval,
         }
     }
 }
@@ -119,6 +136,7 @@ impl<E: Engine + Clone, L: LockManager + Clone, F: KvFormat> Clone for Service<E
 impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
     /// Constructs a new `Service` which provides the `Tikv` service.
     pub fn new(
+        cluster_id: u64,
         store_id: u64,
         storage: Storage<E, L, F>,
         gc_worker: GcWorker<E>,
@@ -131,8 +149,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
         proxy: Proxy,
         reject_messages_on_memory_ratio: f64,
         resource_manager: Option<Arc<ResourceGroupManager>>,
+        health_controller: HealthController,
+        health_feedback_interval: Option<Duration>,
     ) -> Self {
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         Service {
+            cluster_id,
             store_id,
             gc_worker,
             storage,
@@ -145,6 +170,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
             proxy,
             reject_messages_on_memory_ratio,
             resource_manager,
+            health_controller,
+            health_feedback_interval,
+            health_feedback_seq: Arc::new(AtomicU64::new(now_unix)),
         }
     }
 
@@ -187,12 +215,27 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
     }
 }
 
+macro_rules! reject_if_cluster_id_mismatch {
+    ($req:expr, $self:ident, $ctx:expr, $sink:expr) => {
+        let req_cluster_id = $req.get_context().get_cluster_id();
+        if req_cluster_id > 0 && req_cluster_id != $self.cluster_id {
+            // Reject the request if the cluster IDs do not match.
+            warn!("unexpected request with different cluster id is received"; "req" => ?&$req);
+            let e = RpcStatus::with_message(RpcStatusCode::INVALID_ARGUMENT,
+            "the cluster id of the request does not match the TiKV cluster".to_string());
+            $ctx.spawn($sink.fail(e).unwrap_or_else(|_| {}),);
+            return;
+        }
+    };
+}
+
 macro_rules! handle_request {
     ($fn_name: ident, $future_name: ident, $req_ty: ident, $resp_ty: ident) => {
         handle_request!($fn_name, $future_name, $req_ty, $resp_ty, no_time_detail);
     };
     ($fn_name: ident, $future_name: ident, $req_ty: ident, $resp_ty: ident, $time_detail: tt) => {
         fn $fn_name(&mut self, ctx: RpcContext<'_>, req: $req_ty, sink: UnarySink<$resp_ty>) {
+            reject_if_cluster_id_mismatch!(req, self, ctx, sink);
             forward_unary!(self.proxy, $fn_name, ctx, req, sink);
             let begin_instant = Instant::now();
 
@@ -405,6 +448,15 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         RawChecksumResponse
     );
 
+    handle_request!(kv_flush, future_flush, FlushRequest, FlushResponse);
+
+    handle_request!(
+        kv_buffer_batch_get,
+        future_buffer_batch_get,
+        BufferBatchGetRequest,
+        BufferBatchGetResponse
+    );
+
     fn kv_import(&mut self, _: RpcContext<'_>, _: ImportRequest, _: UnarySink<ImportResponse>) {
         unimplemented!();
     }
@@ -423,6 +475,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         req: PrepareFlashbackToVersionRequest,
         sink: UnarySink<PrepareFlashbackToVersionResponse>,
     ) {
+        reject_if_cluster_id_mismatch!(req, self, ctx, sink);
         let begin_instant = Instant::now();
 
         let source = req.get_context().get_request_source().to_owned();
@@ -455,6 +508,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         req: FlashbackToVersionRequest,
         sink: UnarySink<FlashbackToVersionResponse>,
     ) {
+        reject_if_cluster_id_mismatch!(req, self, ctx, sink);
         let begin_instant = Instant::now();
 
         let source = req.get_context().get_request_source().to_owned();
@@ -482,6 +536,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
     }
 
     fn coprocessor(&mut self, ctx: RpcContext<'_>, req: Request, sink: UnarySink<Response>) {
+        reject_if_cluster_id_mismatch!(req, self, ctx, sink);
         forward_unary!(self.proxy, coprocessor, ctx, req, sink);
         let source = req.get_context().get_request_source().to_owned();
         let resource_control_ctx = req.get_context().get_resource_control_context();
@@ -529,6 +584,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         req: RawCoprocessorRequest,
         sink: UnarySink<RawCoprocessorResponse>,
     ) {
+        reject_if_cluster_id_mismatch!(req, self, ctx, sink);
         let source = req.get_context().get_request_source().to_owned();
         let resource_control_ctx = req.get_context().get_resource_control_context();
         let mut resource_group_priority = ResourcePriority::unknown;
@@ -626,6 +682,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         req: Request,
         mut sink: ServerStreamingSink<Response>,
     ) {
+        reject_if_cluster_id_mismatch!(req, self, ctx, sink);
         let begin_instant = Instant::now();
         let resource_control_ctx = req.get_context().get_resource_control_context();
         let mut resource_group_priority = ResourcePriority::unknown;
@@ -926,6 +983,12 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let pool_size = storage.get_normal_pool_size();
         let batch_builder = BatcherBuilder::new(self.enable_req_batch, pool_size);
         let resource_manager = self.resource_manager.clone();
+        let mut health_feedback_attacher = HealthFeedbackAttacher::new(
+            self.store_id,
+            self.health_controller.clone(),
+            self.health_feedback_seq.clone(),
+            self.health_feedback_interval,
+        );
         let request_handler = stream.try_for_each(move |mut req| {
             let request_ids = req.take_request_ids();
             let requests: Vec<_> = req.take_requests().into();
@@ -969,6 +1032,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
             GRPC_RESP_BATCH_COMMANDS_SIZE.observe(r.request_ids.len() as f64);
             // TODO: per thread load is more reasonable for batching.
             r.set_transport_layer_load(grpc_thread_load.total_load() as u64);
+            health_feedback_attacher.attach_if_needed(&mut r);
             GrpcResult::<(BatchCommandsResponse, WriteFlags)>::Ok((
                 r,
                 WriteFlags::default().buffer_hint(false),
@@ -1302,6 +1366,8 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
         DeleteRange, future_delete_range(storage), kv_delete_range;
         PrepareFlashbackToVersion, future_prepare_flashback_to_version(storage.clone()), kv_prepare_flashback_to_version;
         FlashbackToVersion, future_flashback_to_version(storage.clone()), kv_flashback_to_version;
+        BufferBatchGet, future_buffer_batch_get(storage), kv_buffer_batch_get;
+        Flush, future_flush(storage), kv_flush;
         RawBatchGet, future_raw_batch_get(storage), raw_batch_get;
         RawPut, future_raw_put(storage), raw_put;
         RawBatchPut, future_raw_batch_put(storage), raw_batch_put;
@@ -1546,6 +1612,50 @@ fn future_batch_get<E: Engine, L: LockManager, F: KvFormat>(
                     let mut pair = KvPair::default();
                     pair.set_error(key_error);
                     resp.mut_pairs().push(pair);
+                }
+            }
+        }
+        GLOBAL_TRACKERS.remove(tracker);
+        Ok(resp)
+    }
+}
+
+fn future_buffer_batch_get<E: Engine, L: LockManager, F: KvFormat>(
+    storage: &Storage<E, L, F>,
+    mut req: BufferBatchGetRequest,
+) -> impl Future<Output = ServerResult<BufferBatchGetResponse>> {
+    let tracker = GLOBAL_TRACKERS.insert(Tracker::new(RequestInfo::new(
+        req.get_context(),
+        RequestType::KvBufferBatchGet,
+        req.get_version(),
+    )));
+    set_tls_tracker_token(tracker);
+    let start = Instant::now();
+    let keys = req.get_keys().iter().map(|x| Key::from_raw(x)).collect();
+    let v = storage.buffer_batch_get(req.take_context(), keys, req.get_version().into());
+
+    async move {
+        let v = v.await;
+        let duration = start.saturating_elapsed();
+        let mut resp = BufferBatchGetResponse::default();
+        if let Some(err) = extract_region_error(&v) {
+            resp.set_region_error(err);
+        } else {
+            match v {
+                Ok((kv_res, stats)) => {
+                    let pairs = map_kv_pairs(kv_res);
+                    let exec_detail_v2 = resp.mut_exec_details_v2();
+                    let scan_detail_v2 = exec_detail_v2.mut_scan_detail_v2();
+                    stats.stats.write_scan_detail(scan_detail_v2);
+                    GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+                        tracker.write_scan_detail(scan_detail_v2);
+                    });
+                    set_time_detail(exec_detail_v2, duration, &stats.latency_stats);
+                    resp.set_pairs(pairs.into());
+                }
+                Err(e) => {
+                    let key_error = extract_key_error(&e);
+                    resp.set_error(key_error.clone());
                 }
             }
         }
@@ -2265,6 +2375,9 @@ txn_command_future!(future_mvcc_get_by_start_ts, MvccGetByStartTsRequest, MvccGe
         Err(e) => resp.set_error(format!("{}", e)),
     }
 });
+txn_command_future!(future_flush, FlushRequest, FlushResponse, (v, resp) {
+    resp.set_errors(extract_key_errors(v).into());
+});
 
 pub mod batch_commands_response {
     pub type Response = kvproto::tikvpb::BatchCommandsResponseResponse;
@@ -2373,6 +2486,56 @@ fn needs_reject_raft_append(reject_messages_on_memory_ratio: f64) -> bool {
     false
 }
 
+struct HealthFeedbackAttacher {
+    store_id: u64,
+    health_controller: HealthController,
+    last_feedback_time: Option<Instant>,
+    seq: Arc<AtomicU64>,
+    feedback_interval: Option<Duration>,
+}
+
+impl HealthFeedbackAttacher {
+    fn new(
+        store_id: u64,
+        health_controller: HealthController,
+        seq: Arc<AtomicU64>,
+        feedback_interval: Option<Duration>,
+    ) -> Self {
+        Self {
+            store_id,
+            health_controller,
+            last_feedback_time: None,
+            seq,
+            feedback_interval,
+        }
+    }
+
+    fn attach_if_needed(&mut self, resp: &mut BatchCommandsResponse) {
+        let feedback_interval = match self.feedback_interval {
+            Some(i) => i,
+            None => return,
+        };
+
+        let now = Instant::now_coarse();
+
+        if let Some(last_feedback_time) = self.last_feedback_time
+            && now - last_feedback_time < feedback_interval
+        {
+            return;
+        }
+
+        self.attach(resp, now);
+    }
+
+    fn attach(&mut self, resp: &mut BatchCommandsResponse, now: Instant) {
+        self.last_feedback_time = Some(now);
+        let feedback = resp.mut_health_feedback();
+        feedback.set_store_id(self.store_id);
+        feedback.set_feedback_seq_no(self.seq.fetch_add(1, Ordering::Relaxed));
+        feedback.set_slow_score(self.health_controller.get_raftstore_slow_score() as i32);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::thread;
@@ -2427,5 +2590,41 @@ mod tests {
         };
         poll_future_notify(task);
         assert_eq!(block_on(rx1).unwrap(), 200);
+    }
+
+    #[test]
+    fn test_health_feedback_attacher() {
+        let health_controller = HealthController::new();
+        let test_reporter = health_controller::reporters::TestReporter::new(&health_controller);
+        let seq = Arc::new(AtomicU64::new(1));
+
+        let mut a = HealthFeedbackAttacher::new(1, health_controller.clone(), seq.clone(), None);
+        let mut resp = BatchCommandsResponse::default();
+        a.attach_if_needed(&mut resp);
+        assert!(!resp.has_health_feedback());
+
+        let mut a =
+            HealthFeedbackAttacher::new(1, health_controller, seq, Some(Duration::from_secs(1)));
+        resp = BatchCommandsResponse::default();
+        a.attach_if_needed(&mut resp);
+        assert!(resp.has_health_feedback());
+        assert_eq!(resp.get_health_feedback().get_store_id(), 1);
+        assert_eq!(resp.get_health_feedback().get_feedback_seq_no(), 1);
+        assert_eq!(resp.get_health_feedback().get_slow_score(), 1);
+
+        // Skips attaching feedback because last attaching was just done.
+        test_reporter.set_raftstore_slow_score(50.);
+        resp = BatchCommandsResponse::default();
+        a.attach_if_needed(&mut resp);
+        assert!(!resp.has_health_feedback());
+
+        // Simulate elapsing enough time by changing the recorded last update time.
+        *a.last_feedback_time.as_mut().unwrap() -= Duration::from_millis(1001);
+        a.attach_if_needed(&mut resp);
+        assert!(resp.has_health_feedback());
+        assert_eq!(resp.get_health_feedback().get_store_id(), 1);
+        // Seq no increased.
+        assert_eq!(resp.get_health_feedback().get_feedback_seq_no(), 2);
+        assert_eq!(resp.get_health_feedback().get_slow_score(), 50);
     }
 }
