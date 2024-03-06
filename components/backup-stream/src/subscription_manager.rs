@@ -1027,10 +1027,8 @@ mod test {
             let subs = SubscriptionTracer::default();
             let memory_manager = Arc::new(MemoryQuota::new(1024));
             let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-            let router = RouterInner::without_sst_query(
-                scheduler.clone(),
-                BackupStreamConfig::default().into(),
-            );
+            let router =
+                RouterInner::for_test(scheduler.clone(), BackupStreamConfig::default().into());
             let mut task = StreamBackupTaskInfo::new();
             task.set_name(task_name.to_owned());
             task.set_storage({

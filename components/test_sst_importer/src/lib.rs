@@ -1,7 +1,6 @@
 // Copyright 2018 TiKV Project Authors. Licensed under Apache-2.0.
 
-use core::num;
-use std::{collections::HashMap, fs, path::Path, process::Output, sync::Arc};
+use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
 use engine_rocks::{
     raw::{DBEntryType, Env, TablePropertiesCollector, TablePropertiesCollectorFactory},
@@ -9,8 +8,8 @@ use engine_rocks::{
     RocksCfOptions, RocksDbOptions, RocksEngine, RocksSstReader, RocksSstWriterBuilder,
 };
 pub use engine_rocks::{RocksEngine as TestEngine, RocksSstWriter};
-use engine_traits::{IterOptions, Iterator, KvEngine, RefIterable, SstWriter, SstWriterBuilder};
-use futures::{future::FutureExt, sink::SinkExt};
+use engine_traits::{KvEngine, SstWriter, SstWriterBuilder};
+use futures::sink::SinkExt;
 use kvproto::{import_sstpb::*, kvrpcpb::Context, metapb::Region};
 use uuid::Uuid;
 

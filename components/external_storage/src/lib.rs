@@ -41,7 +41,6 @@ mod metrics;
 use metrics::EXT_STORAGE_CREATE_HISTOGRAM;
 mod export;
 pub use export::*;
-use tokio_util::compat::TokioAsyncReadCompatExt;
 
 pub fn record_storage_create(start: Instant, storage: &dyn ExternalStorage) {
     EXT_STORAGE_CREATE_HISTOGRAM

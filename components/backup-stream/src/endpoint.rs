@@ -27,7 +27,7 @@ use raftstore::{
     router::CdcHandle,
 };
 use resolved_ts::{resolve_by_raft, LeadershipResolver};
-use sst_importer::sst_path::SstPath;
+
 use tikv::config::BackupStreamConfig;
 use tikv_util::{
     box_err,
@@ -68,7 +68,7 @@ use crate::{
     subscription_manager::{RegionSubscriptionManager, ResolvedRegions},
     subscription_track::{Ref, RefMut, ResolveResult, SubscriptionTracer},
     try_send,
-    utils::{self, CallbackWaitGroup, StopWatch, Work},
+    utils::{self, StopWatch},
 };
 
 const SLOW_EVENT_THRESHOLD: f64 = 120.0;

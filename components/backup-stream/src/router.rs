@@ -4,9 +4,7 @@ use std::{
     borrow::Borrow,
     collections::HashMap,
     fmt::Display,
-    io::Read,
     path::{Path, PathBuf},
-    process::Output,
     result,
     sync::{
         atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering},
@@ -16,7 +14,7 @@ use std::{
 };
 
 use encryption::{DataKeyManager, DecrypterReader};
-use engine_traits::{CfName, MvccProperties, SstExt, CF_DEFAULT, CF_LOCK, CF_WRITE};
+use engine_traits::{CfName, CF_DEFAULT, CF_LOCK, CF_WRITE};
 use external_storage::{create_storage, BackendConfig, ExternalStorage, UnpinReader};
 use file_system::Sha256Reader;
 use futures::io::{AllowStdIo, Cursor};
@@ -33,7 +31,7 @@ use openssl::hash::{Hasher, MessageDigest};
 use protobuf::Message;
 use raftstore::coprocessor::CmdBatch;
 use slog_global::debug;
-use tidb_query_datatype::codec::{batch, table::decode_table_id};
+use tidb_query_datatype::codec::table::decode_table_id;
 use tikv::config::BackupStreamConfig;
 use tikv_util::{
     box_err,
@@ -242,7 +240,7 @@ fn handle_ingest_sst(req: &IngestSstRequest, ssts: &HashMap<Uuid, PathBuf>) -> R
     range.set_end(Key::from_raw(range.get_end()).into_encoded());
 
     Ok(IngestedSst {
-        meta: dbg!(meta),
+        meta,
         path: path.clone(),
     })
 }
@@ -910,7 +908,7 @@ impl TempFileKey {
             // When we cannot extract the table key, use 0 for the table key(perhaps we
             // insert meta key here.). Can we elide the copy here(or at least,
             // take a slice of key instead of decoding the whole key)?
-            Key::from_encoded_slice(&kv.key)
+            Key::from_encoded_slice(kv.key)
                 .into_raw()
                 .ok()
                 .and_then(|decoded_key| decode_table_id(&decoded_key).ok())
@@ -1331,9 +1329,9 @@ impl StreamDataCollector {
         data_file_info.set_max_ts(max_ts);
         data_file_info.set_file_format(FileFormat::Sst);
         let file = match &self.enc_manager {
-            Some(enm) => enm.open_file_for_read(&path),
+            Some(enm) => enm.open_file_for_read(path),
             None => DecrypterReader::new(
-                file_system::File::open(&path)?,
+                file_system::File::open(path)?,
                 EncryptionMethod::Plaintext,
                 &[],
                 encryption::Iv::Empty,
@@ -1479,7 +1477,7 @@ impl StreamDataCollector {
     ) -> Result<()> {
         // NOTE: Perhaps sort the slice and put all SST files at the end of it for
         // better performance.
-        let mut rem_files = &files[..];
+        let mut rem_files = files;
         while !rem_files.is_empty() {
             let batched = {
                 let mut batch_size = 0;
@@ -1906,9 +1904,9 @@ struct TaskRange {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsStr, io, mem::ManuallyDrop, time::Duration};
+    use std::{ffi::OsStr, io, time::Duration};
 
-    use engine_rocks::{RocksEngine, RocksSstReader, RocksSstWriter, RocksSstWriterBuilder};
+    use engine_rocks::{RocksSstReader, RocksSstWriterBuilder};
     use engine_traits::{
         IterOptions, Iterator, RefIterable, SstReader, SstWriter, SstWriterBuilder,
     };
@@ -1919,12 +1917,11 @@ mod tests {
         import_sstpb::Range,
     };
     use online_config::{ConfigManager, OnlineConfig};
-    use rand::{Rng, RngCore};
+    use rand::Rng;
     use tempfile::TempDir;
     use tikv_util::{
         codec::number::NumberEncoder,
         config::ReadableDuration,
-        defer,
         worker::{dummy_scheduler, ReceiverWrapper},
     };
     use txn_types::{Write, WriteType};
@@ -2271,7 +2268,7 @@ mod tests {
             let mut value = vec![0u8; 64];
             rand::thread_rng().fill(&mut value[..]);
 
-            sst.put(&key.as_encoded(), &value).unwrap();
+            sst.put(key.as_encoded(), &value).unwrap();
         }
 
         sst.finish().unwrap();

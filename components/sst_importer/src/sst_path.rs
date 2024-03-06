@@ -2,13 +2,8 @@
 
 use std::{
     any::Any,
-    cell::LazyCell,
-    ffi::OsStr,
-    io::Write,
-    panic::UnwindSafe,
     path::PathBuf,
-    process::Command,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
 };
 
 use encryption::DataKeyManager;
@@ -28,38 +23,17 @@ impl<E: engine_traits::KvEngine> SstPath for SstImporter<E> {
         self.dir.join_for_read(meta).map(|x| x.save).ok()
     }
     fn encryption(&self) -> Option<&DataKeyManager> {
-        dbg!(self.key_manager.is_some());
         self.key_manager.as_deref()
     }
 }
 
-fn system(cmd: &str, args: impl IntoIterator<Item = impl AsRef<OsStr>> + UnwindSafe) {
-    let exec = || {
-        let child = Command::new(cmd).args(args).spawn().unwrap();
-        println!("====={child:?}=====");
-        let exit = child.wait_with_output().unwrap();
-        std::io::copy(
-            &mut std::io::Cursor::new(exit.stdout),
-            &mut std::io::stdout(),
-        )
-        .unwrap();
-        std::io::copy(
-            &mut std::io::Cursor::new(exit.stderr),
-            &mut std::io::stdout(),
-        )
-        .unwrap();
-        std::io::stdout().flush().unwrap();
-    };
-    println!("====={:?}=====", std::panic::catch_unwind(exec));
-}
-
 impl<T: SstPath> SstPath for Arc<T> {
     fn sst_path(&self, meta: &SstMeta) -> Option<PathBuf> {
-        T::sst_path(&self, meta)
+        T::sst_path(self, meta)
     }
 
     fn encryption(&self) -> Option<&DataKeyManager> {
-        T::encryption(&self)
+        T::encryption(self)
     }
 }
 
@@ -80,11 +54,11 @@ impl<T: SstPath, L: SstPath> SstPath for Either<T, L> {
 
 impl<T: SstPath, F: FnOnce() -> T + 'static> SstPath for LazyLock<T, F> {
     fn sst_path(&self, meta: &SstMeta) -> Option<PathBuf> {
-        T::sst_path(&*self, meta)
+        T::sst_path(self, meta)
     }
 
     fn encryption(&self) -> Option<&DataKeyManager> {
-        T::encryption(&*self)
+        T::encryption(self)
     }
 }
 

@@ -9,7 +9,6 @@ mod suite;
 
 mod all {
     use std::{
-        env::temp_dir,
         time::{Duration, Instant},
     };
 
@@ -479,7 +478,7 @@ mod all {
         test_util::init_log_for_test();
         let master_key_space = TempDir::new().unwrap();
         let mp = master_key_space.path().join("key.bin").to_owned();
-        let mut suite = SuiteBuilder::new_named("with_enc_ingest")
+        let suite = SuiteBuilder::new_named("with_enc_ingest")
             .nodes(1)
             .cluster_cfg(move |cfg| {
                 let enc = &mut cfg.security.encryption;

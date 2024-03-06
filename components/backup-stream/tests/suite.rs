@@ -1,18 +1,17 @@
 // Copyright 2022 TiKV Project Authors. Licensed under Apache-2.0.
+
+#![allow(unused_attributes)]
 #![feature(lazy_cell)]
 
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock},
     time::Duration,
 };
 
-use ::sst_importer::{
-    sst_path::{ImportDir, PanicSstPath},
-    SstImporter,
-};
+use ::sst_importer::SstImporter;
 use async_compression::futures::write::ZstdDecoder;
 use backup_stream::{
     errors::Result,
@@ -28,16 +27,14 @@ use backup_stream::{
 };
 use engine_rocks::{RocksEngine, RocksSstReader};
 use engine_test::kv::KvTestEngine as EK;
-use error_code::sst_importer;
-use futures::{executor::block_on, sink::SinkExt, AsyncWriteExt, Future, Stream, StreamExt};
-use grpcio::{ChannelBuilder, Server, ServerBuilder, WriteFlags};
+use futures::{executor::block_on, AsyncWriteExt, Future, Stream, StreamExt};
+use grpcio::{ChannelBuilder, Server, ServerBuilder};
 use kvproto::{
     brpb::{CompressionType, FileFormat, Local, Metadata, StorageBackend},
-    import_sstpb::{ImportSstClient, IngestRequest, SstMeta, WriteBatch, WriteRequest},
+    import_sstpb::ImportSstClient,
     kvrpcpb::*,
     logbackuppb::{SubscribeFlushEventRequest, SubscribeFlushEventResponse},
     logbackuppb_grpc::{create_log_backup, LogBackupClient},
-    raft_cmdpb::IngestSstRequest,
     tikvpb::*,
 };
 use pd_client::PdClient;
@@ -55,12 +52,10 @@ use tikv_util::{
     },
     debug, info,
     worker::LazyWorker,
-    Either, HandyRwLock,
+    HandyRwLock,
 };
 use txn_types::{Key, TimeStamp, WriteRef};
 use walkdir::WalkDir;
-
-type TestSstPath = LazyLock<Arc<SstImporter<EK>>>;
 
 #[derive(Debug)]
 pub struct FileSegments {

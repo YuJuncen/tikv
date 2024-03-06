@@ -9,7 +9,6 @@ use std::{
     vec::IntoIter,
 };
 
-use encryption::DataKeyManager;
 use engine_traits::{CfName, SstMetaInfo};
 use kvproto::{
     metapb::Region,

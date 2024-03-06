@@ -1345,7 +1345,7 @@ fn handle_batch_commands_request<E: Engine, L: LockManager, F: KvFormat>(
                         .map_err(|_| GRPC_MSG_FAIL_COUNTER.$metric_name.inc());
                     response_batch_commands_request(id, resp, tx.clone(), begin_instant, GrpcTypeKind::$metric_name, source,resource_group_priority);
                 })*
-                Some(batch_commands_request::request::Cmd::Import(_))| Some(BatchCommandsRequest_Request_oneof_cmd::BufferBatchGet(_))|Some(kvproto::tikvpb::BatchCommandsRequest_Request_oneof_cmd::Flush(_)) => unimplemented!(),
+                Some(batch_commands_request::request::Cmd::Import(_)) => unimplemented!(),
             }
         }
     }

@@ -10,7 +10,7 @@ use engine_traits::KvEngine;
 use kvproto::metapb::Region;
 use raft::StateRole;
 use raftstore::coprocessor::*;
-use sst_importer::sst_path::{PanicSstPath, SstPath};
+use sst_importer::sst_path::SstPath;
 use tikv_util::{warn, worker::Scheduler, HandyRwLock};
 use uuid::Uuid;
 
@@ -63,6 +63,8 @@ impl BackupStreamObserver {
 
     #[cfg(test)]
     pub fn for_test(scheduler: Scheduler<Task>) -> Self {
+        use sst_importer::sst_path::PanicSstPath;
+
         Self::new(scheduler, Arc::new(PanicSstPath))
     }
 
@@ -130,7 +132,7 @@ impl QueryObserver for BackupStreamObserver {
         _: &RegionState,
         ssts: &mut ApplyCtxInfo<'_>,
     ) -> bool {
-        for sst in ssts.pending_handle_ssts.iter().flat_map(|sst| sst) {
+        for sst in ssts.pending_handle_ssts.iter().flatten() {
             let handle = || {
                 let path = self
                     .shared
@@ -266,7 +268,7 @@ impl RegionChangeObserver for BackupStreamObserver {
 #[cfg(test)]
 
 mod tests {
-    use std::{assert_matches::assert_matches, collections::HashMap, time::Duration};
+    use std::{assert_matches::assert_matches, time::Duration};
 
     use engine_panic::PanicEngine;
     use kvproto::metapb::Region;
@@ -298,7 +300,12 @@ mod tests {
         // Prepare: assuming a task wants the range of [0001, 0010].
         let o = BackupStreamObserver::for_test(sched);
         let subs = SubscriptionTracer::default();
-        assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
+        assert!(
+            o.shared
+                .ranges
+                .wl()
+                .add((b"0001".to_vec(), b"0010".to_vec()))
+        );
 
         // Test regions can be registered.
         let r = fake_region(42, b"0008", b"0009");
@@ -323,7 +330,12 @@ mod tests {
         // Prepare: assuming a task wants the range of [0001, 0010].
         let o = BackupStreamObserver::for_test(sched);
         let subs = SubscriptionTracer::default();
-        assert!(o.ranges.wl().add((b"0001".to_vec(), b"0010".to_vec())));
+        assert!(
+            o.shared
+                .ranges
+                .wl()
+                .add((b"0001".to_vec(), b"0010".to_vec()))
+        );
 
         // Test regions can be registered.
         let r = fake_region(42, b"0008", b"0009");
