@@ -80,7 +80,33 @@ impl AwsKms {
     pub fn new(config: Config) -> Result<AwsKms> {
         let client = util::new_http_client();
         let creds = util::new_credentials_provider();
-        Self::new_with_creds_client(config, client, creds)
+        match config.aws.as_ref() {
+            Some(aws_config) => {
+                if let (Some(access_key), Some(secret_access_key)) = (
+                    aws_config.access_key.clone(),
+                    aws_config.secret_access_key.clone(),
+                ) {
+                    // Use provided AWS credentials
+                    let credentials = aws_credential_types::Credentials::new(
+                        access_key,
+                        secret_access_key,
+                        None, // session token
+                        None, // expiration
+                        "user-provided",
+                    );
+                    let static_provider =
+                        aws_credential_types::provider::SharedCredentialsProvider::new(credentials);
+                    Self::new_with_creds_client(config, client, static_provider)
+                } else {
+                    // Fall back to default credentials provider
+                    Self::new_with_creds_client(config, client, creds)
+                }
+            }
+            None => {
+                // No AWS config provided, use default credentials provider
+                Self::new_with_creds_client(config, client, creds)
+            }
+        }
     }
 }
 
@@ -208,6 +234,7 @@ mod tests {
             },
             azure: None,
             gcp: None,
+            aws: None,
         };
 
         let resp = format!(
@@ -285,6 +312,7 @@ mod tests {
             },
             azure: None,
             gcp: None,
+            aws: None,
         };
 
         let enc_key = EncryptedKey::new(b"invalid".to_vec()).unwrap();

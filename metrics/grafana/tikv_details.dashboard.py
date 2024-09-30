@@ -315,6 +315,13 @@ def Cluster() -> RowPanel:
                         ),
                         legend_format=r"{{instance}}-read",
                     ),
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_flow",
+                            label_selectors=['type=~"bytes_read|iter_bytes_read"'],
+                        ),
+                        legend_format=r"{{instance}}-in-memory-engine-read",
+                    ),
                 ],
             ),
         ]
@@ -406,7 +413,7 @@ def Cluster() -> RowPanel:
             graph_panel(
                 title="Uptime",
                 description="TiKV uptime since the last restart",
-                yaxes=yaxes(left_format=UNITS.SECONDS),
+                yaxes=yaxes(left_format=UNITS.SECONDS, log_base=2),
                 targets=[
                     target(
                         expr=expr_operator(
@@ -725,6 +732,18 @@ def Server() -> RowPanel:
                         legend_format="{{instance}}",
                     ),
                 ],
+            ),
+        ]
+    )
+    layout.row(
+        [
+            graph_panel_histogram_quantiles(
+                title="Clear overlap region duration",
+                description="Bucketed histogram of clear overlap region duration.",
+                yaxes=yaxes(left_format=UNITS.SECONDS),
+                metric="tikv_raftstore_clear_overlap_region_duration_seconds",
+                by_labels=["type"],
+                hide_count=True,
             ),
         ]
     )
@@ -1077,7 +1096,7 @@ def gRPC() -> RowPanel:
             graph_panel(
                 title="gRPC request sources duration",
                 description="The duration of different sources of gRPC request",
-                yaxes=yaxes(left_format=UNITS.SECONDS),
+                yaxes=yaxes(left_format=UNITS.MICRO_SECONDS),
                 lines=False,
                 stack=True,
                 targets=[
@@ -1422,6 +1441,56 @@ def ThreadCPU() -> RowPanel:
                     ),
                 ],
                 thresholds=[GraphThreshold(value=7.2)],
+            ),
+        ]
+    )
+    layout.row(
+        [
+            graph_panel(
+                title="IME CPU",
+                description="The CPU utilization of IME threads",
+                yaxes=yaxes(left_format=UNITS.PERCENT_UNIT),
+                targets=[
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_thread_cpu_seconds_total",
+                            label_selectors=['name=~"ime.*"'],
+                            by_labels=["instance"],
+                        ),
+                        legend_format="{{instance}}",
+                    ),
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_thread_cpu_seconds_total",
+                            label_selectors=['name=~"ime.*"'],
+                            by_labels=["instance", "name"],
+                        ),
+                        legend_format="{{instance}}-{{name}}",
+                        hide=True,
+                    ),
+                ],
+            ),
+        ]
+    )
+    layout.row(
+        [
+            graph_panel(
+                title="Busy Threads (>80%)",
+                yaxes=yaxes(left_format=UNITS.PERCENT_UNIT),
+                targets=[
+                    target(
+                        expr=expr_topk(
+                            20,
+                            "%s"
+                            % expr_sum_rate(
+                                "tikv_thread_cpu_seconds_total",
+                                label_selectors=['name!~"rocksdb.*"'],
+                                by_labels=["instance", "name"],
+                            ).extra(extra_expr="> 0.8"),
+                        ),
+                        legend_format="{{name}}-{{instance}}",
+                    ),
+                ],
             ),
         ]
     )
@@ -2176,7 +2245,7 @@ def RaftProcess() -> RowPanel:
     layout.row(
         [
             graph_panel(
-                title="Enable apply unpersisted log regoin count",
+                title="Enable apply unpersisted log region count",
                 description="The number of regions that enable apply unpersisted raft log",
                 yaxes=yaxes(left_format=UNITS.SHORT),
                 targets=[
@@ -2269,6 +2338,7 @@ def RaftMessage() -> RowPanel:
                     target(
                         expr=expr_sum_rate(
                             "tikv_raftstore_raft_sent_message_total",
+                            label_selectors=['status="accept"'],
                             by_labels=["type"],
                         ),
                     ),
@@ -2299,6 +2369,13 @@ def RaftMessage() -> RowPanel:
                     target(
                         expr=expr_sum_rate(
                             "tikv_raftstore_raft_dropped_message_total",
+                            by_labels=["type"],
+                        ),
+                    ),
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_raftstore_raft_sent_message_total",
+                            label_selectors=['status="drop"'],
                             by_labels=["type"],
                         ),
                     ),
@@ -2646,18 +2723,32 @@ def LocalReader() -> RowPanel:
 
 
 def UnifiedReadPool() -> RowPanel:
-    layout = Layout(title="Unified Read Pool")
+    return YatpPool(
+        title="Unified Read Pool",
+        pool_name_prefix="unified-read",
+        running_task_metric="tikv_unified_read_pool_running_tasks",
+        running_task_metric_label="priority",
+    )
+
+
+def YatpPool(
+    title: str,
+    pool_name_prefix: str,
+    running_task_metric: str,
+    running_task_metric_label: str,
+) -> RowPanel:
+    layout = Layout(title)
     layout.row(
         [
             graph_panel(
                 title="Time used by level",
-                description="The time used by each level in the unified read pool per second. Level 0 refers to small queries.",
+                description="The time used by each level in the yatp thread pool per second. Level 0 refers to small queries.",
                 yaxes=yaxes(left_format=UNITS.MICRO_SECONDS),
                 targets=[
                     target(
                         expr=expr_sum_rate(
                             "tikv_multilevel_level_elapsed",
-                            label_selectors=['name="unified-read-pool"'],
+                            label_selectors=[f'name=~"{pool_name_prefix}.*"'],
                             by_labels=["level"],
                         ),
                     ),
@@ -2665,15 +2756,15 @@ def UnifiedReadPool() -> RowPanel:
             ),
             graph_panel(
                 title="Level 0 chance",
-                description="The chance that level 0 (small) tasks are scheduled in the unified read pool.",
+                description="The chance that level 0 (small) tasks are scheduled in the yatp thread pool.",
                 yaxes=yaxes(left_format=UNITS.PERCENT_UNIT),
                 targets=[
                     target(
                         expr=expr_simple(
                             "tikv_multilevel_level0_chance",
-                            label_selectors=['name="unified-read-pool"'],
+                            label_selectors=[f'name=~"{pool_name_prefix}.*"'],
                         ),
-                        legend_format="{{type}}",
+                        legend_format="{{instance}}",
                     ),
                 ],
             ),
@@ -2683,24 +2774,23 @@ def UnifiedReadPool() -> RowPanel:
         [
             graph_panel(
                 title="Running tasks",
-                description="The number of concurrently running tasks in the unified read pool.",
+                description="The number of concurrently running tasks in the yatp thread pool.",
                 targets=[
                     target(
                         expr=expr_sum_aggr_over_time(
-                            "tikv_unified_read_pool_running_tasks",
+                            running_task_metric,
                             "avg",
                             "1m",
-                            by_labels=["priority"],
+                            by_labels=[running_task_metric_label],
                         ),
-                        legend_format="{{priority}}",
                     ),
                 ],
             ),
             heatmap_panel(
-                title="Unified Read Pool Wait Duration",
+                title="Wait Duration",
                 yaxis=yaxis(format=UNITS.SECONDS),
                 metric="tikv_yatp_pool_schedule_wait_duration_bucket",
-                label_selectors=['name=~"unified-read.*"'],
+                label_selectors=[f'name=~"{pool_name_prefix}.*"'],
             ),
         ]
     )
@@ -2708,16 +2798,18 @@ def UnifiedReadPool() -> RowPanel:
         [
             graph_panel_histogram_quantiles(
                 title="Duration of One Time Slice",
-                description="Unified read pool task execution time during one schedule.",
+                description="Task execution time during one schedule.",
                 yaxes=yaxes(left_format=UNITS.SECONDS, log_base=2),
                 metric="tikv_yatp_task_poll_duration",
+                label_selectors=[f'name=~"{pool_name_prefix}.*"'],
                 hide_count=True,
             ),
             graph_panel_histogram_quantiles(
                 title="Task Execute Duration",
-                description="Unified read pool task total execution duration.",
+                description="Task total execution duration.",
                 yaxes=yaxes(left_format=UNITS.SECONDS, log_base=2),
                 metric="tikv_yatp_task_exec_duration",
+                label_selectors=[f'name=~"{pool_name_prefix}.*"'],
                 hide_count=True,
             ),
         ]
@@ -2729,6 +2821,7 @@ def UnifiedReadPool() -> RowPanel:
                 description="Task schedule number of times.",
                 yaxes=yaxes(left_format=UNITS.NONE_FORMAT, log_base=2),
                 metric="tikv_yatp_task_execute_times",
+                label_selectors=[f'name=~"{pool_name_prefix}.*"'],
                 hide_count=True,
             ),
         ]
@@ -3326,6 +3419,15 @@ def Scheduler() -> RowPanel:
     return layout.row_panel
 
 
+def SchedulerWorkerPool() -> RowPanel:
+    return YatpPool(
+        title="Scheduler Worker Pool",
+        pool_name_prefix="sched-worker",
+        running_task_metric="tikv_scheduler_running_commands",
+        running_task_metric_label="instance",
+    )
+
+
 def GC() -> RowPanel:
     layout = Layout(title="GC")
     layout.row(
@@ -3645,8 +3747,8 @@ def Snapshot() -> RowPanel:
     layout.row(
         [
             graph_panel(
-                title="99% Snapshot generation wait duration",
-                description="The time snapshot generation tasks waited to be scheduled. ",
+                title="99% Snapshot generation/apply wait duration",
+                description="The time snapshot generation/apply tasks spent waiting to be executed.",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
                 targets=[
                     target(
@@ -3655,7 +3757,15 @@ def Snapshot() -> RowPanel:
                             "tikv_raftstore_snapshot_generation_wait_duration_seconds",
                             by_labels=["instance"],
                         ),
-                        legend_format="{{instance}}",
+                        legend_format="{{instance}}-generate",
+                    ),
+                    target(
+                        expr=expr_histogram_quantile(
+                            0.99,
+                            "tikv_raftstore_snapshot_apply_wait_duration_seconds",
+                            by_labels=["instance"],
+                        ),
+                        legend_format="{{instance}}-apply",
                     ),
                 ],
             ),
@@ -3762,6 +3872,23 @@ def Snapshot() -> RowPanel:
                             "tikv_snapshot_limit_generate_bytes",
                         ),
                         legend_format="{{instance}}-generate",
+                    ),
+                ],
+            ),
+        ]
+    )
+    layout.row(
+        [
+            graph_panel(
+                title="Snapshot pending applies",
+                description="The number of snapshots waiting to be applied",
+                yaxes=yaxes(left_format=UNITS.SHORT),
+                targets=[
+                    target(
+                        expr=expr_simple(
+                            "tikv_raftstore_snapshot_pending_applies",
+                        ),
+                        legend_format="{{instance}}",
                     ),
                 ],
             ),
@@ -3927,6 +4054,23 @@ def CoprocessorOverview() -> RowPanel:
             ),
         ]
     )
+    layout.row(
+        [
+            graph_panel(
+                title="Memory Quota",
+                description="Total bytes of memory used by coprocessor requests",
+                yaxes=yaxes(left_format=UNITS.BYTES_IEC),
+                targets=[
+                    target(
+                        expr=expr_sum(
+                            "tikv_coprocessor_memory_quota",
+                            by_labels=["instance", "type"],
+                        ),
+                    ),
+                ],
+            )
+        ]
+    )
     return layout.row_panel
 
 
@@ -4015,7 +4159,9 @@ def CoprocessorDetail() -> RowPanel:
                     target(
                         expr=expr_sum_rate(
                             "tikv_coprocessor_scan_details",
-                            label_selectors=['req="select"'],
+                            label_selectors=[
+                                'req=~"select|select_by_in_memory_engine"'
+                            ],
                             by_labels=["tag"],
                         ),
                     ),
@@ -4028,7 +4174,7 @@ def CoprocessorDetail() -> RowPanel:
                     target(
                         expr=expr_sum_rate(
                             "tikv_coprocessor_scan_details",
-                            label_selectors=['req="index"'],
+                            label_selectors=['req=~"index|index_by_region_cache"'],
                             by_labels=["tag"],
                         ),
                     ),
@@ -4045,7 +4191,9 @@ def CoprocessorDetail() -> RowPanel:
                     target(
                         expr=expr_sum_rate(
                             "tikv_coprocessor_scan_details",
-                            label_selectors=['req="select"'],
+                            label_selectors=[
+                                'req=~"select|select_by_in_memory_engine"'
+                            ],
                             by_labels=["cf", "tag"],
                         ),
                     ),
@@ -4058,7 +4206,7 @@ def CoprocessorDetail() -> RowPanel:
                     target(
                         expr=expr_sum_rate(
                             "tikv_coprocessor_scan_details",
-                            label_selectors=['req="index"'],
+                            label_selectors=['req=~"index|index_by_region_cache"'],
                             by_labels=["cf", "tag"],
                         ),
                     ),
@@ -4079,8 +4227,8 @@ def CoprocessorDetail() -> RowPanel:
     return layout.row_panel
 
 
-def RangeCacheMemoryEngine() -> RowPanel:
-    layout = Layout(title="Range Cache Memory Engine")
+def InMemoryEngine() -> RowPanel:
+    layout = Layout(title="In Memory Engine")
     layout.row(
         [
             graph_panel(
@@ -4102,10 +4250,23 @@ def RangeCacheMemoryEngine() -> RowPanel:
                 targets=[
                     target(
                         expr=expr_sum_rate(
-                            "tikv_range_cache_snapshot_acquire_failed_reason_count",
+                            "tikv_in_memory_engine_snapshot_acquire_failed_reason_count",
                             by_labels=["type"],
                         ),
                         legend_format="{{type}}",
+                    ),
+                ],
+            ),
+            graph_panel(
+                title="Region Count",
+                description="The count of different types of region",
+                targets=[
+                    target(
+                        expr=expr_avg(
+                            "tikv_in_memory_engine_cache_count",
+                            by_labels=["instance", "type"],
+                        ),
+                        legend_format="{{instance}}--{{type}}",
                     ),
                 ],
             ),
@@ -4115,12 +4276,12 @@ def RangeCacheMemoryEngine() -> RowPanel:
         [
             graph_panel(
                 title="Memory Usage",
-                description="The memory usage of the range cache memory engine",
+                description="The memory usage of the in-memory engine",
                 yaxes=yaxes(left_format=UNITS.BYTES_IEC),
                 targets=[
                     target(
                         expr=expr_avg(
-                            "tikv_range_cache_memory_usage_bytes",
+                            "tikv_in_memory_engine_memory_usage_bytes",
                             by_labels=["instance"],
                         ),
                     ),
@@ -4132,7 +4293,61 @@ def RangeCacheMemoryEngine() -> RowPanel:
                 targets=[
                     target(
                         expr=expr_sum_rate(
-                            "tikv_range_cache_memory_engine_gc_filtered",
+                            "tikv_in_memory_engine_gc_filtered",
+                            by_labels=["type"],
+                        ),
+                        legend_format="{{type}}",
+                    ),
+                ],
+            ),
+            heatmap_panel(
+                title="Region GC Duration",
+                description="The handle duration of region gc",
+                yaxis=yaxis(format=UNITS.SECONDS),
+                metric="tikv_in_memory_engine_gc_duration_secs_bucket",
+            ),
+        ]
+    )
+    layout.row(
+        [
+            heatmap_panel(
+                title="Region Load Duration",
+                description="The handle duration of region load",
+                yaxis=yaxis(format=UNITS.SECONDS),
+                metric="tikv_in_memory_engine_load_duration_secs_bucket",
+            ),
+            graph_panel(
+                title="Region Load Count",
+                description="The count of region loading per seconds",
+                yaxes=yaxes(left_format=UNITS.OPS_PER_SEC),
+                targets=[
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_load_duration_secs_count",
+                            by_labels=["instance"],
+                        ),
+                        legend_format="{{instance}}",
+                    ),
+                ],
+            ),
+        ]
+    )
+    layout.row(
+        [
+            heatmap_panel(
+                title="Region Eviction Duration",
+                description="The handle duration of region eviction",
+                yaxis=yaxis(format=UNITS.SECONDS),
+                metric="tikv_in_memory_engine_eviction_duration_secs_bucket",
+            ),
+            graph_panel(
+                title="Region Eviction Count",
+                description="The count of region eviction per seconds",
+                yaxes=yaxes(left_format=UNITS.OPS_PER_SEC),
+                targets=[
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_eviction_duration_secs_count",
                             by_labels=["type"],
                         ),
                         legend_format="{{type}}",
@@ -4142,32 +4357,134 @@ def RangeCacheMemoryEngine() -> RowPanel:
         ]
     )
     layout.row(
-        [
-            heatmap_panel(
-                title="Range load duration",
-                description="The handle duration of range load",
-                yaxis=yaxis(format=UNITS.SECONDS),
-                metric="tikv_range_load_duration_secs_bucket",
-            ),
-            heatmap_panel(
-                title="Range gc duration",
-                description="The handle duration of range gc",
-                yaxis=yaxis(format=UNITS.SECONDS),
-                metric="tikv_range_gc_duration_secs_bucket",
-            ),
-        ]
-    )
-    layout.row(
         heatmap_panel_graph_panel_histogram_quantile_pairs(
             heatmap_title="Write duration",
-            heatmap_description="The time consumed of write in range cache engine",
-            graph_title="99% Range cache engine write duration per server",
-            graph_description="The time consumed of write in range cache engine per TiKV instance",
+            heatmap_description="The time consumed of write in region cache engine",
+            graph_title="99% In-memory engine write duration per server",
+            graph_description="The time consumed of write in region cache engine per TiKV instance",
             graph_by_labels=["instance"],
             graph_hides=["count", "avg"],
             yaxis_format=UNITS.SECONDS,
-            metric="tikv_range_cache_engine_write_duration_seconds",
+            metric="tikv_in_memory_engine_write_duration_seconds",
         )
+    )
+    layout.row(
+        heatmap_panel_graph_panel_histogram_quantile_pairs(
+            heatmap_title="Prepare for write duration",
+            heatmap_description="The time consumed of prepare for write in the in-memory engine",
+            graph_title="99% In-memory engine prepare for write duration per server",
+            graph_description="The time consumed of prepare for write in the in-memory engine per TiKV instance",
+            graph_by_labels=["instance"],
+            graph_hides=["count", "avg"],
+            yaxis_format=UNITS.SECONDS,
+            metric="tikv_in_memory_engine_prepare_for_write_duration_seconds",
+        )
+    )
+    layout.row(
+        [
+            graph_panel(
+                title="Iterator operations",
+                description="The count of different type of iteration operations",
+                yaxes=yaxes(left_format=UNITS.OPS_PER_SEC),
+                targets=[
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_locate",
+                            label_selectors=[
+                                'type="number_db_seek"',
+                            ],
+                            by_labels=[],  # override default by instance.
+                        ),
+                        legend_format="seek",
+                    ),
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_locate",
+                            label_selectors=[
+                                'type="number_db_seek_found"',
+                            ],
+                            by_labels=[],  # override default by instance.
+                        ),
+                        legend_format="seek_found",
+                    ),
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_locate",
+                            label_selectors=[
+                                'type="number_db_next"',
+                            ],
+                            by_labels=[],  # override default by instance.
+                        ),
+                        legend_format="next",
+                    ),
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_locate",
+                            label_selectors=[
+                                'type="number_db_next_found"',
+                            ],
+                            by_labels=[],  # override default by instance.
+                        ),
+                        legend_format="next_found",
+                    ),
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_locate",
+                            label_selectors=[
+                                'type="number_db_prev"',
+                            ],
+                            by_labels=[],  # override default by instance.
+                        ),
+                        legend_format="prev",
+                    ),
+                    target(
+                        expr=expr_sum_rate(
+                            "tikv_in_memory_engine_locate",
+                            label_selectors=[
+                                'type="number_db_prev_found"',
+                            ],
+                            by_labels=[],  # override default by instance.
+                        ),
+                        legend_format="prev_found",
+                    ),
+                ],
+            ),
+            graph_panel(
+                title="Seek duration",
+                description="The time consumed when executing seek operation",
+                yaxes=yaxes(left_format=UNITS.SECONDS, log_base=2),
+                targets=[
+                    target(
+                        expr=expr_histogram_quantile(
+                            1,
+                            "tikv_in_memory_engine_seek_duration",
+                        ),
+                        legend_format="max",
+                    ),
+                    target(
+                        expr=expr_histogram_quantile(
+                            0.99,
+                            "tikv_in_memory_engine_seek_duration",
+                        ),
+                        legend_format="99%",
+                    ),
+                    target(
+                        expr=expr_histogram_quantile(
+                            0.95,
+                            "tikv_in_memory_engine_seek_duration",
+                        ),
+                        legend_format="95%",
+                    ),
+                    target(
+                        expr=expr_histogram_avg(
+                            "tikv_in_memory_engine_seek_duration",
+                            by_labels=["type"],
+                        ),
+                        legend_format="avg",
+                    ),
+                ],
+            ),
+        ]
     )
     return layout.row_panel
 
@@ -4816,7 +5133,7 @@ def RocksDB() -> RowPanel:
                             "tikv_engine_num_files_in_single_compaction",
                             label_selectors=[
                                 'db="$db"',
-                                'type="compaction_job_size_max"',
+                                'type="num_files_in_single_compaction_max"',
                             ],
                             by_labels=[],  # override default by instance.
                         ),
@@ -4827,7 +5144,7 @@ def RocksDB() -> RowPanel:
                             "tikv_engine_num_files_in_single_compaction",
                             label_selectors=[
                                 'db="$db"',
-                                'type="compaction_job_size_percentile99"',
+                                'type="num_files_in_single_compaction_percentile99"',
                             ],
                             by_labels=[],  # override default by instance.
                         ),
@@ -4838,7 +5155,7 @@ def RocksDB() -> RowPanel:
                             "tikv_engine_num_files_in_single_compaction",
                             label_selectors=[
                                 'db="$db"',
-                                'type="compaction_job_size_percentile95"',
+                                'type="num_files_in_single_compaction_percentile95"',
                             ],
                             by_labels=[],  # override default by instance.
                         ),
@@ -4849,7 +5166,7 @@ def RocksDB() -> RowPanel:
                             "tikv_engine_num_files_in_single_compaction",
                             label_selectors=[
                                 'db="$db"',
-                                'type="compaction_job_size_average"',
+                                'type="num_files_in_single_compaction_average"',
                             ],
                             by_labels=[],  # override default by instance.
                         ),
@@ -5688,26 +6005,19 @@ def RocksDB() -> RowPanel:
     )
     layout.row(
         [
-            graph_panel(
-                title="Stall conditions changed of each CF",
-                description="Stall conditions changed of each column family",
-                yaxes=yaxes(left_format=UNITS.SHORT),
-                targets=[
-                    target(
-                        expr=expr_simple(
-                            "tikv_engine_stall_conditions_changed",
-                            label_selectors=['db="$db"'],
-                        ),
-                        legend_format="{{instance}}-{{cf}}-{{type}}",
-                    ),
-                ],
+            heatmap_panel(
+                title="Ingestion picked level",
+                description="The level that the external file ingests into",
+                yaxis=yaxis(format=UNITS.SHORT),
+                metric="tikv_engine_ingestion_picked_level_bucket",
+                label_selectors=['db="$db"'],
             ),
             graph_panel_histogram_quantiles(
                 title="Ingest SST duration seconds",
-                description="The time consumed when ingesting SST files",
+                description="Bucketed histogram of ingest external SST files duration.",
                 yaxes=yaxes(left_format=UNITS.SECONDS),
-                metric="tikv_snapshot_ingest_sst_duration_seconds",
-                label_selectors=['db="$db"'],
+                metric="tikv_storage_ingest_external_file_duration_secs",
+                by_labels=["cf", "type"],
                 hide_count=True,
             ),
         ]
@@ -5777,12 +6087,19 @@ def RocksDB() -> RowPanel:
     )
     layout.row(
         [
-            heatmap_panel(
-                title="Ingestion picked level",
-                description="The level that the external file ingests into",
-                yaxis=yaxis(format=UNITS.SHORT),
-                metric="tikv_engine_ingestion_picked_level_bucket",
-                label_selectors=['db="$db"'],
+            graph_panel(
+                title="Stall conditions changed of each CF",
+                description="Stall conditions changed of each column family",
+                yaxes=yaxes(left_format=UNITS.SHORT),
+                targets=[
+                    target(
+                        expr=expr_simple(
+                            "tikv_engine_stall_conditions_changed",
+                            label_selectors=['db="$db"'],
+                        ),
+                        legend_format="{{instance}}-{{cf}}-{{type}}",
+                    ),
+                ],
             ),
             graph_panel(
                 title="Memtable size",
@@ -6006,6 +6323,12 @@ def RaftEngine() -> RowPanel:
                         ),
                     ),
                 ],
+            ),
+            graph_panel_histogram_quantiles(
+                title="Write Compression Ratio",
+                description="The compression ratio per write",
+                yaxes=yaxes(left_format=UNITS.NONE_FORMAT),
+                metric="raft_engine_write_compression_ratio",
             ),
         ]
     )
@@ -8622,7 +8945,7 @@ def BackupLog() -> RowPanel:
                 targets=[
                     target(
                         expr=expr_sum_rate(
-                            "tikv_log_backup_interal_actor_acting_duration_sec_count",
+                            "tikv_log_backup_internal_actor_acting_duration_sec_count",
                             by_labels=["message"],
                         ),
                     )
@@ -8636,7 +8959,7 @@ def BackupLog() -> RowPanel:
                     target(
                         expr=expr_histogram_quantile(
                             0.99,
-                            "tikv_log_backup_interal_actor_acting_duration_sec",
+                            "tikv_log_backup_internal_actor_acting_duration_sec",
                             by_labels=["message"],
                         ),
                         legend_format="{{message}}",
@@ -8651,7 +8974,7 @@ def BackupLog() -> RowPanel:
                     target(
                         expr=expr_histogram_quantile(
                             0.9,
-                            "tikv_log_backup_interal_actor_acting_duration_sec",
+                            "tikv_log_backup_internal_actor_acting_duration_sec",
                             by_labels=["message"],
                         ),
                         legend_format="{{message}}",
@@ -8702,6 +9025,18 @@ def BackupLog() -> RowPanel:
                         expr=expr_sum_rate(
                             "tikv_log_backup_initial_scan_reason",
                             by_labels=["reason"],
+                        ),
+                    )
+                ],
+            ),
+            graph_panel(
+                title="Initial Scanning Task Status",
+                description="The task status of initial scanning.",
+                targets=[
+                    target(
+                        expr=expr_sum(
+                            "tikv_log_backup_pending_initial_scan",
+                            by_labels=["stage"],
                         ),
                     )
                 ],
@@ -8988,10 +9323,11 @@ dashboard = Dashboard(
         RaftEngine(),
         RocksDB(),
         Titan(),
-        RangeCacheMemoryEngine(),
+        InMemoryEngine(),
         # Scheduler and Read Pools
         FlowControl(),
         Scheduler(),
+        SchedulerWorkerPool(),
         SchedulerCommands(),
         CoprocessorOverview(),
         CoprocessorDetail(),

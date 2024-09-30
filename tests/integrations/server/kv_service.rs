@@ -11,7 +11,6 @@ use std::{
 
 use api_version::{ApiV1, ApiV1Ttl, ApiV2, KvFormat};
 use concurrency_manager::ConcurrencyManager;
-use engine_rocks::RocksEngine;
 use engine_traits::{
     MiscExt, Peekable, RaftEngine, RaftEngineReadOnly, RaftLogBatch, SyncMutable, CF_DEFAULT,
     CF_LOCK, CF_RAFT, CF_WRITE,
@@ -1385,8 +1384,7 @@ fn test_double_run_node() {
     let mut sim = cluster.sim.wl();
     let node = sim.get_node(id).unwrap();
     let pd_worker = LazyWorker::new("test-pd-worker");
-    let simulate_trans =
-        SimulateTransport::<_, RocksEngine>::new(ChannelTransport::<RocksEngine>::new());
+    let simulate_trans = SimulateTransport::new(ChannelTransport::new());
     let tmp = Builder::new().prefix("test_cluster").tempdir().unwrap();
     let snap_mgr = SnapManager::new(tmp.path().to_str().unwrap());
     let coprocessor_host = CoprocessorHost::new(router, raftstore::coprocessor::Config::default());
@@ -1762,7 +1760,10 @@ fn test_batch_commands() {
 #[test_case(test_raftstore::must_new_cluster_and_kv_client)]
 #[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
 fn test_health_feedback() {
-    let (_cluster, client, _ctx) = new_cluster();
+    let (cluster, client, _ctx) = new_cluster();
+    let store_id = *cluster.store_metas.iter().next().unwrap().0;
+    assert_ne!(store_id, 0);
+
     let (mut sender, mut receiver) = client.batch_commands().unwrap();
 
     let mut batch_req = BatchCommandsRequest::default();
@@ -1772,6 +1773,7 @@ fn test_health_feedback() {
     block_on(sender.send((batch_req.clone(), WriteFlags::default()))).unwrap();
     let resp = block_on(receiver.next()).unwrap().unwrap();
     assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
 
     block_on(sender.send((batch_req.clone(), WriteFlags::default()))).unwrap();
     let resp = block_on(receiver.next()).unwrap().unwrap();
@@ -1781,9 +1783,78 @@ fn test_health_feedback() {
     block_on(sender.send((batch_req, WriteFlags::default()))).unwrap();
     let resp = block_on(receiver.next()).unwrap().unwrap();
     assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
 
     block_on(sender.close()).unwrap();
     block_on(receiver.for_each(|_| future::ready(())));
+}
+
+#[test_case(test_raftstore::must_new_cluster_and_kv_client)]
+#[test_case(test_raftstore_v2::must_new_cluster_and_kv_client)]
+fn test_explicit_get_health_feedback() {
+    let (cluster, client, _ctx) = new_cluster();
+    let store_id = *cluster.store_metas.iter().next().unwrap().0;
+    assert_ne!(store_id, 0);
+
+    let (mut sender, mut receiver) = client.batch_commands().unwrap();
+
+    let mut batch_req = BatchCommandsRequest::default();
+    batch_req.mut_request_ids().push(1);
+    {
+        let mut req = BatchCommandsRequestRequest::default();
+        req.cmd = Some(BatchCommandsRequest_Request_oneof_cmd::GetHealthFeedback(
+            Default::default(),
+        ));
+        batch_req.mut_requests().push(req);
+    }
+
+    block_on(sender.send((batch_req.clone(), WriteFlags::default()))).unwrap();
+    let resp = block_on(receiver.next()).unwrap().unwrap();
+    assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
+    assert_eq!(resp.request_ids[0], 1);
+    assert!(
+        resp.get_responses()[0]
+            .get_get_health_feedback()
+            .has_health_feedback()
+    );
+    assert_eq!(
+        resp.get_responses()[0]
+            .get_get_health_feedback()
+            .get_health_feedback(),
+        resp.get_health_feedback()
+    );
+    let first_feedback_seq = resp.get_health_feedback().get_feedback_seq_no();
+
+    batch_req.mut_request_ids()[0] = 2;
+    block_on(sender.send((batch_req.clone(), WriteFlags::default()))).unwrap();
+    let resp = block_on(receiver.next()).unwrap().unwrap();
+    assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
+    assert_eq!(resp.request_ids[0], 2);
+    assert!(
+        resp.get_responses()[0]
+            .get_get_health_feedback()
+            .has_health_feedback()
+    );
+    assert_eq!(
+        resp.get_responses()[0]
+            .get_get_health_feedback()
+            .get_health_feedback(),
+        resp.get_health_feedback()
+    );
+    assert_eq!(
+        resp.get_health_feedback().get_feedback_seq_no(),
+        first_feedback_seq + 1
+    );
+
+    block_on(sender.close()).unwrap();
+    block_on(receiver.for_each(|_| future::ready(())));
+
+    // Non-batched API
+    let resp = client.get_health_feedback(&Default::default()).unwrap();
+    assert!(resp.has_health_feedback());
+    assert_eq!(resp.get_health_feedback().get_store_id(), store_id);
 }
 
 #[test_case(test_raftstore::must_new_cluster_and_kv_client)]
