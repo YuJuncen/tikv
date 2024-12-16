@@ -13,6 +13,7 @@ use engine_rocks::RocksEngine;
 use external_storage::ExternalStorage;
 use futures::{future::FutureExt, stream::TryStreamExt};
 use kvproto::brpb::StorageBackend;
+use tikv_util::config::ReadableSize;
 use tokio::sync::mpsc::Sender;
 
 use super::{Execution, ExecutionConfig};
@@ -70,6 +71,7 @@ pub fn create_compaction(st: StorageBackend) -> Execution {
             until_ts: u64::MAX,
             compression: engine_traits::SstCompressionType::Lz4,
             compression_level: None,
+            minimal_compact_size: ReadableSize::mb(8),
         },
         max_concurrent_subcompaction: 3,
         external_storage: st,

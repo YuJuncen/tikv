@@ -56,6 +56,10 @@ pub struct ExecutionConfig {
     ///
     /// If `None`, we will use the default level of the selected algorithm.
     pub compression_level: Option<i32>,
+    /// The minimal physical size to generate an SST.
+    /// If the original content of the log didn't reach this size, they won't be
+    /// compacted.
+    pub minimal_compact_size: ReadableSize,
 }
 
 impl slog::KV for ExecutionConfig {
