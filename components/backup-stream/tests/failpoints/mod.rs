@@ -538,4 +538,32 @@ mod all {
             safepoints
         );
     }
+
+    #[test]
+    fn test_abort_task() {
+        test_util::init_log_for_test();
+        let mut suite = SuiteBuilder::new_named("test_abort_task").nodes(1).build();
+        suite.must_register_task(1, "task1");
+        suite.sync();
+
+        fail::cfg("log_backup_eternal_sleep_on_flush", "1*return").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        fail::cfg_callback("delay_on_flush", move || {
+            let _ = tx.send(());
+        })
+        .unwrap();
+
+        run_async_test(suite.write_records(0, 1, 1));
+        suite.force_flush_files("task1");
+
+        // Make sure the flush is triggered...
+        rx.recv().unwrap();
+
+        suite.must_remove_task("task1");
+        suite.must_register_task(1, "task2");
+        let put = run_async_test(suite.write_records(2, 1, 1));
+        suite.force_flush_files("task2");
+        suite.wait_for_flush();
+        suite.check_for_write_records(suite.flushed_files.path(), put.iter().map(|v| v.as_slice()));
+    }
 }

@@ -179,7 +179,7 @@ impl GetCheckpointResult {
 }
 
 impl CheckpointManager {
-    pub fn spawn_subscription_mgr(&mut self) -> future![()] {
+    pub fn run_main_loop(&mut self) -> future![()] {
         let (tx, rx) = async_mpsc::channel(1024);
         let sub = SubscriptionManager {
             subscribers: Default::default(),
@@ -733,7 +733,7 @@ pub mod tests {
             .build()
             .unwrap();
         let mut mgr = super::CheckpointManager::default();
-        rt.spawn(mgr.spawn_subscription_mgr());
+        rt.spawn(mgr.run_main_loop());
 
         let trivial_sink = MockSink::trivial();
         rt.block_on(mgr.add_subscriber(trivial_sink.clone()))
@@ -752,7 +752,7 @@ pub mod tests {
             .build()
             .unwrap();
         let mut mgr = super::CheckpointManager::default();
-        rt.spawn(mgr.spawn_subscription_mgr());
+        rt.spawn(mgr.run_main_loop());
 
         let error_sink = MockSink::with_fail_once(RpcStatusCode::INTERNAL);
         rt.block_on(mgr.add_subscriber(error_sink.clone())).unwrap();

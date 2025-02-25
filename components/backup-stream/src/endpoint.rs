@@ -4,6 +4,7 @@ use std::{
     any::Any,
     collections::HashSet,
     fmt,
+    future::Future,
     marker::PhantomData,
     mem::ManuallyDrop,
     sync::{Arc, Mutex},
@@ -46,6 +47,7 @@ use tokio::{
     io::Result as TokioResult,
     runtime::{Handle, Runtime},
     sync::{mpsc::Sender, Semaphore},
+    task::JoinHandle,
 };
 use tokio_stream::StreamExt;
 use tracing::instrument;
@@ -77,6 +79,43 @@ const SLOW_EVENT_THRESHOLD: f64 = 120.0;
 /// task has fatal error.
 const CHECKPOINT_SAFEPOINT_TTL_IF_ERROR: u64 = 24;
 
+#[derive(Debug)]
+pub struct BackgroundTask {
+    name: String,
+    belongs_to_task: Option<String>,
+    handle: JoinHandle<()>,
+}
+
+impl BackgroundTask {
+    fn spawn_global_on(
+        pool: &Handle,
+        name: impl ToString,
+        async_task: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        let handle =
+            pool.spawn(root!("global_background_task"; async_task; "name" = name.to_string()));
+        Self {
+            name: name.to_string(),
+            handle,
+            belongs_to_task: None,
+        }
+    }
+
+    fn spawn_for_task_on(
+        pool: &Handle,
+        name: impl ToString,
+        belongs_to_task: String,
+        async_task: impl Future<Output = ()> + Send + 'static,
+    ) -> Self {
+        let handle = pool.spawn(root!("task_scope_background_task"; async_task; "task" = belongs_to_task, "name" = name.to_string()));
+        Self {
+            name: name.to_string(),
+            handle,
+            belongs_to_task: Some(belongs_to_task),
+        }
+    }
+}
+
 pub struct Endpoint<S, R, E: KvEngine, PDC> {
     // Note: those fields are more like a shared context between components.
     // For now, we copied them everywhere, maybe we'd better extract them into a
@@ -105,6 +144,7 @@ pub struct Endpoint<S, R, E: KvEngine, PDC> {
     /// Each time we spawn a task, once time goes by, we abort that task.
     pub abort_last_storage_save: Option<AbortHandle>,
     pub initial_scan_semaphore: Arc<Semaphore>,
+    bg_tasks: Vec<BackgroundTask>,
 }
 
 impl<S, R, E: KvEngine, PDC> Drop for Endpoint<S, R, E, PDC> {
@@ -147,15 +187,25 @@ where
         // spawn a worker to watch task changes from etcd periodically.
         let meta_client_clone = meta_client.clone();
         let scheduler_clone = scheduler.clone();
+        let mut bg_tasks = vec![];
         // TODO build a error handle mechanism #error 2
-        pool.spawn(root!("flush_ticker"; Self::starts_flush_ticks(range_router.clone())));
-        pool.spawn(root!("start_watch_tasks"; async {
-            if let Err(err) = Self::start_and_watch_tasks(meta_client_clone, scheduler_clone).await
-            {
-                err.report("failed to start watch tasks");
-            }
-            info!("started task watcher!");
-        }));
+        bg_tasks.push(BackgroundTask::spawn_global_on(
+            pool.handle(),
+            "flush_ticker",
+            Self::starts_flush_ticks(range_router.clone()),
+        ));
+        bg_tasks.push(BackgroundTask::spawn_global_on(
+            pool.handle(),
+            "start_watch_tasks",
+            async {
+                if let Err(err) =
+                    Self::start_and_watch_tasks(meta_client_clone, scheduler_clone).await
+                {
+                    err.report("failed to start watch tasks");
+                }
+                info!("started task watcher!");
+            },
+        ));
 
         let initial_scan_memory_quota = Arc::new(MemoryQuota::new(
             config.initial_scan_pending_memory_quota.0 as _,
@@ -189,10 +239,18 @@ where
             resolver,
             resolved_ts_config.advance_ts_interval.0,
         );
-        pool.spawn(root!(op_loop));
+        bg_tasks.push(BackgroundTask::spawn_global_on(
+            pool.handle(),
+            "op_loop",
+            op_loop,
+        ));
         let mut checkpoint_mgr = CheckpointManager::default();
-        pool.spawn(root!(checkpoint_mgr.spawn_subscription_mgr()));
-        let ep = Endpoint {
+        bg_tasks.push(BackgroundTask::spawn_global_on(
+            pool.handle(),
+            "checkpoint_subscription_manager",
+            checkpoint_mgr.run_main_loop(),
+        ));
+        let mut ep = Endpoint {
             initial_scan_semaphore,
             meta_client,
             range_router,
@@ -210,8 +268,9 @@ where
             config,
             checkpoint_mgr,
             abort_last_storage_save: None,
+            bg_tasks,
         };
-        ep.pool.spawn(root!(ep.min_ts_worker()));
+        ep.spawn_global("min_ts_worker", ep.min_ts_worker());
         ep
     }
 }
@@ -223,6 +282,44 @@ where
     E: KvEngine,
     PDC: PdClient + 'static,
 {
+    fn spawn_global(
+        &mut self,
+        name: impl ToString,
+        task: impl Future<Output = ()> + Send + 'static,
+    ) {
+        self.bg_tasks.push(BackgroundTask::spawn_global_on(
+            self.pool.handle(),
+            name,
+            task,
+        ));
+    }
+
+    fn spawn_for_task(
+        &mut self,
+        name: impl ToString,
+        task: &str,
+        async_task: impl Future<Output = ()> + Send + 'static,
+    ) {
+        self.bg_tasks.push(BackgroundTask::spawn_for_task_on(
+            self.pool.handle(),
+            name,
+            task.to_owned(),
+            async_task,
+        ));
+    }
+
+    fn abort_background_tasks_of(&mut self, log_task: &str) {
+        self.bg_tasks.retain(|task| {
+            if task.belongs_to_task.as_deref() == Some(log_task) {
+                info!("Aborting a background task for deading log backup task."; "name" => &task.name, "log_task" => log_task);
+                task.handle.abort();
+                false
+            } else {
+                true
+            }
+        })
+    }
+
     fn get_meta_client(&self) -> MetadataClient<S> {
         self.meta_client.clone()
     }
@@ -295,7 +392,7 @@ where
         tracing_active_tree::frame!("on_fatal_error_of_task"; f; %err, %task)
     }
 
-    fn on_fatal_error(&self, select: TaskSelector, err: Box<Error>) {
+    fn on_fatal_error(&mut self, select: TaskSelector, err: Box<Error>) {
         err.report_fatal();
         let tasks = self.range_router.select_task(select.reference());
         warn!("fatal error reporting"; "selector" => ?select, "selected" => ?tasks, "err" => %err);
@@ -576,7 +673,7 @@ where
         }; from_idx, to_idx, region, current_term = term));
     }
 
-    pub fn handle_watch_task(&self, op: TaskOp) {
+    pub fn handle_watch_task(&mut self, op: TaskOp) {
         match op {
             TaskOp::AddTask(task) => {
                 self.on_register(task);
@@ -776,7 +873,7 @@ where
         ReadableDuration::hours(CHECKPOINT_SAFEPOINT_TTL_IF_ERROR).0
     }
 
-    pub fn on_pause(&self, task: &str) {
+    pub fn on_pause(&mut self, task: &str) {
         self.unload_task(task);
 
         metrics::update_task_status(TaskStatus::Paused, task);
@@ -802,7 +899,7 @@ where
         }
     }
 
-    pub fn on_unregister(&self, task_name: &str) -> Option<StreamBackupTaskInfo> {
+    pub fn on_unregister(&mut self, task_name: &str) -> Option<StreamBackupTaskInfo> {
         let info = self.unload_task(task_name);
         self.clean_pause_guard_id_for_task(task_name);
         self.remove_metrics_after_unregister(task_name);
@@ -823,13 +920,14 @@ where
 
     /// unload a task from memory: this would stop observe the changes required
     /// by the task temporarily.
-    fn unload_task(&self, task: &str) -> Option<StreamBackupTaskInfo> {
+    fn unload_task(&mut self, task: &str) -> Option<StreamBackupTaskInfo> {
         let router = self.range_router.clone();
 
         // for now, we support one concurrent task only.
         // so simply clear all info would be fine.
         self.observer.ranges.wl().clear();
         self.subs.clear();
+        self.abort_background_tasks_of(task);
         router.unregister_task(task)
     }
 
@@ -855,6 +953,13 @@ where
         async move {
             let mut new_rts = resolved.global_checkpoint();
             fail::fail_point!("delay_on_flush");
+            (|| {
+                fail::fail_point!("log_backup_eternal_sleep_on_flush", |_| {
+                    futures::future::pending().right_future()
+                });
+                futures::future::ready(()).left_future()
+            })()
+            .await;
             flush_ob.before(resolved.resolve_results().to_vec()).await;
             if let Some(rewritten_rts) = flush_ob.rewrite_resolved_ts(&task).await {
                 info!("rewriting resolved ts"; "old" => %new_rts, "new" => %rewritten_rts);
@@ -933,17 +1038,20 @@ where
     fn on_exec_flush(&mut self, task: String, resolved: ResolvedRegions, cb: Sender<FlushResult>) {
         self.checkpoint_mgr.freeze();
         let fut = self.do_flush(task.clone(), resolved);
-        self.pool.spawn(root!("flush"; async move {
+        self.spawn_for_task("flush", &task.clone(), async move {
             let res = fut.await;
             if let Err(ref err) = &res {
                 err.report("during updating flush status")
             }
             // If nobody waits us, it is no need to construct the result.
             if !cb.is_closed() {
-                let flush_res = FlushResult { task, error: res.err() };
+                let flush_res = FlushResult {
+                    task,
+                    error: res.err(),
+                };
                 let _ = cb.send(flush_res).await;
             }
-        }));
+        });
     }
 
     fn update_global_checkpoint(&self, task: String) -> future![()] {
@@ -1007,8 +1115,8 @@ where
         if let Some(handle) = self.abort_last_storage_save.take() {
             handle.abort();
         }
-        let (fut, handle) = futures::future::abortable(self.update_global_checkpoint(task));
-        self.pool.spawn(root!("update_global_checkpoint"; fut));
+        let (fut, handle) = futures::future::abortable(self.update_global_checkpoint(task.clone()));
+        self.spawn_for_task("upload_global_task", &task, fut.map(|_| ()));
         self.abort_last_storage_save = Some(handle);
     }
 
@@ -1021,7 +1129,7 @@ where
              "concurrency_diff" => concurrency_diff,
         );
         self.range_router.update_config(&cfg);
-        self.update_semaphore_capacity(&self.initial_scan_semaphore, concurrency_diff);
+        self.update_semaphore_capacity(&self.initial_scan_semaphore.clone(), concurrency_diff);
 
         self.config = cfg;
     }
@@ -1040,16 +1148,18 @@ where
             .report_if_err("during on_modify_observe");
     }
 
-    fn update_semaphore_capacity(&self, sema: &Arc<Semaphore>, diff: isize) {
+    fn update_semaphore_capacity(&mut self, sema: &Arc<Semaphore>, diff: isize) {
         use std::cmp::Ordering::*;
         match diff.cmp(&0) {
             Less => {
-                self.pool.spawn(root!(
+                self.spawn_global(
+                    "consuming_memory_quota",
                     Arc::clone(sema)
                     .acquire_many_owned(-diff as _)
                     // It is OK to trivially ignore the Error case (semaphore has been closed, we are shutting down the server.)
                     .map_ok(|p| p.forget())
-                ));
+                    .map(|_| ()),
+                );
             }
             Equal => {}
             Greater => {
@@ -1081,10 +1191,10 @@ where
                     cb()
                 } else {
                     let sched = self.scheduler.clone();
-                    self.pool.spawn(root!(async move {
+                    self.spawn_global("sync_backoff", async move {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                         sched.schedule(Task::Sync(cb, cond)).unwrap();
-                    }));
+                    });
                 }
             }
             Task::MarkFailover(t) => self.failover_time = Some(t),
@@ -1140,11 +1250,11 @@ where
             }
             RegionCheckpointOperation::Subscribe(sub) => {
                 let fut = self.checkpoint_mgr.add_subscriber(sub);
-                self.pool.spawn(root!(async move {
+                self.spawn_global("add_subscription", async move {
                     if let Err(err) = fut.await {
                         err.report("adding subscription");
                     }
-                }));
+                });
             }
             RegionCheckpointOperation::PrepareMinTsForResolve => {
                 if self.observer.is_hibernating() {

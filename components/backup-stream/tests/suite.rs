@@ -448,6 +448,12 @@ impl Suite {
         self.wait_with_router(move |r| r.get_task_handler(&name).is_ok())
     }
 
+    #[allow(dead_code)]
+    pub fn must_remove_task(&self, name: &str) {
+        let cli = self.get_meta_cli();
+        run_async_test(cli.remove_task(name)).unwrap()
+    }
+
     /// This function tries to calculate the global checkpoint from the flush
     /// status of nodes.
     ///
