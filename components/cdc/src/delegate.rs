@@ -362,6 +362,7 @@ impl Delegate {
     fn push_lock(&mut self, key: Key, start_ts: MiniLock) -> Result<isize> {
         let bytes = key.approximate_heap_size();
         let mut lock_count_modify = 0;
+        warn!("CDCDBG: `push_lock`"; "key" => ?key, "mini_lock" => ?start_ts, "region" => self.region_id);
         match &mut self.lock_tracker {
             LockTracker::Pending => unreachable!(),
             LockTracker::Preparing(locks) => {
@@ -388,6 +389,7 @@ impl Delegate {
 
     fn pop_lock(&mut self, key: Key, start_ts: TimeStamp) -> Result<isize> {
         let mut lock_count_modify = 0;
+        warn!("CDCDBG: `pop_lock`"; "key" => ?key, "start_ts" => ?start_ts, "region" => self.region_id);
         match &mut self.lock_tracker {
             LockTracker::Pending => unreachable!(),
             LockTracker::Preparing(locks) => {
@@ -662,6 +664,7 @@ impl Delegate {
             } else {
                 advance.blocked_on_locks += 1;
             }
+            warn!("CDCDBG: `handle_downstream`"; "downstream" => ?downstream.id, "advanced_to" => ?advanced_to, "region_id" => %self.region_id);
             Some(downstream.advanced_to)
         };
 
@@ -953,7 +956,10 @@ impl Delegate {
 
                 if *lock_count_modify != 0 && downstream.lock_heap.is_some() {
                     let lock_heap = downstream.lock_heap.as_mut().unwrap();
-                    match lock_heap.entry(v.start_ts.into()) {
+                    let ent = lock_heap.entry(v.start_ts.into());
+                    warn!("CDCDBG: updating txn state for downstream"; "downstream" => ?downstream.id, "entry" => ?ent, 
+                        "lock_count_mod" => %lock_count_modify, "start_ts" => %v.start_ts, "region_id" => self.region_id);
+                    match ent {
                         BTreeMapEntry::Vacant(x) => {
                             x.insert(*lock_count_modify);
                         }
