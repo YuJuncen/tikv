@@ -21,6 +21,9 @@ mod tempfiles;
 // Perhaps we'd better move some of then into `tikv_util`.
 pub mod utils;
 
+// Add this line to expose the bin module
+pub mod bin;
+
 pub use checkpoint_manager::GetCheckpointResult;
 pub use endpoint::{
     BackupStreamResolver, Endpoint, ObserveOp, RegionCheckpointOperation, RegionSet, Task,
