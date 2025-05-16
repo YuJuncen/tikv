@@ -44,6 +44,10 @@ enum Command {
         /// Number of times to repeat the test for collecting statistics
         #[structopt(long, default_value = "1")]
         repeat: usize,
+
+        /// The account name for Azure Blob Storage
+        #[structopt(long)]
+        account_name: Option<String>,
     },
 }
 
@@ -61,6 +65,7 @@ fn main() {
             cache_quota,
             storage_type,
             repeat,
+            account_name,
         } => {
             // Create tokio runtime for async operations
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -72,6 +77,7 @@ fn main() {
                 cache_quota,
                 &storage_type,
                 repeat,
+                account_name.as_deref(),
             )) {
                 eprintln!("Error during IO test: {}", e);
                 std::process::exit(1);

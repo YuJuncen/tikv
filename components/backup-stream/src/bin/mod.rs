@@ -26,6 +26,7 @@ pub mod io_testing {
         cache_quota: usize,
         storage_type: &str,
         repeat: usize,
+        account_name: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         println!("Starting upload test with parameters:");
         println!("  Bucket: {}", bucket);
@@ -81,6 +82,11 @@ pub mod io_testing {
                 let mut input_config = kvproto::brpb::AzureBlobStorage::default();
                 input_config.set_bucket(bucket.to_string());
                 input_config.set_prefix(prefix.to_string());
+                // Set account name if provided
+                if let Some(name) = account_name {
+                    input_config.set_account_name(name.to_string());
+                    println!("Using Azure account name: {}", name);
+                }
                 // We're assuming the Azure credentials are in environment variables
 
                 println!(
