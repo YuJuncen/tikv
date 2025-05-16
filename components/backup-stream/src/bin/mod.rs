@@ -26,7 +26,9 @@ pub mod io_testing {
         cache_quota: usize,
         storage_type: &str,
         repeat: usize,
-        account_name: Option<&str>,
+        sas_token: Option<&str>,
+        file_count: usize,
+        round_robin: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         println!("Starting upload test with parameters:");
         println!("  Bucket: {}", bucket);
@@ -36,6 +38,8 @@ pub mod io_testing {
         println!("  Cache quota: {} bytes", cache_quota);
         println!("  Storage type: {}", storage_type);
         println!("  Repeat count: {}", repeat);
+        println!("  File count: {}", file_count);
+        println!("  Round-robin mode: {}", round_robin);
 
         // Create a temporary directory for our tempfile pool
         let temp_dir = TempDir::new()?;
@@ -83,8 +87,8 @@ pub mod io_testing {
                 input_config.set_bucket(bucket.to_string());
                 input_config.set_prefix(prefix.to_string());
                 // Set account name if provided
-                if let Some(name) = account_name {
-                    input_config.set_account_name(name.to_string());
+                if let Some(name) = sas_token {
+                    input_config.set_access_sig(name.to_string());
                     println!("Using Azure account name: {}", name);
                 }
                 // We're assuming the Azure credentials are in environment variables
@@ -114,15 +118,27 @@ pub mod io_testing {
             // Generate random data and write to files
             let mut rng = rand::thread_rng();
             let mut total_bytes_written = 0;
-            let mut file_index = 0;
             let mut files = Vec::new();
+
+            // Pre-create all files in round-robin mode
+            for i in 0..file_count {
+                let file_path = format!("file_{}.dat", i);
+                // Just open and close to create the files
+                let file = pool.open_for_write(Path::new(&file_path))?;
+                files.push(file);
+            }
+            println!("Created {} files for round-robin writing", file_count);
 
             println!("Starting to write files...");
 
+            let mut current_file_idx = 0;
             while total_bytes_written < limit_size {
-                let file_path = format!("file_{}.dat", file_index);
-                let mut file = pool.open_for_write(Path::new(&file_path))?;
-                files.push(file_path.clone());
+                current_file_idx = if round_robin {
+                    (current_file_idx + 1) % file_count
+                } else {
+                    rand::random::<usize>() % file_count
+                };
+                let file = &mut files[current_file_idx];
 
                 // Write random data of specified size
                 let data: String = (&mut rng)
@@ -132,14 +148,14 @@ pub mod io_testing {
                     .collect();
 
                 file.write_all(data.as_bytes()).await?;
-                file.done().await?;
 
                 total_bytes_written += write_size;
-                file_index += 1;
 
                 println!(
-                    "Written file {} ({} bytes), total: {} bytes",
-                    file_path, write_size, total_bytes_written
+                    "Written to file {} ({} bytes), total: {} bytes",
+                    file.path().display(),
+                    write_size,
+                    total_bytes_written
                 );
 
                 // If we've reached the limit, break
@@ -149,17 +165,25 @@ pub mod io_testing {
             }
 
             println!(
-                "Finished writing {} files, total {} bytes",
-                file_index, total_bytes_written
+                "Finished writing to {} files, total {} bytes",
+                files.len(),
+                total_bytes_written
             );
+
+            let mut file_names = vec![];
+            for mut file in files {
+                file.flush().await?;
+                file.done().await?;
+                file_names.push(file.path().to_owned());
+            }
 
             // Now concatenate and upload
             println!("Starting upload to external storage...");
             let start_time = Instant::now();
 
             let mut readers = Vec::new();
-            for file_name in &files {
-                let reader = pool.open_raw_for_read(Path::new(file_name))?;
+            for file_name in &file_names {
+                let reader = pool.open_raw_for_read(file_name)?;
                 readers.push(reader);
             }
 
@@ -189,11 +213,6 @@ pub mod io_testing {
 
             println!("Upload completed successfully in {:.2?}", duration);
             println!("Upload speed: {:.2} MB/s", upload_speed);
-
-            // Clean up by removing temporary files
-            for file_name in files {
-                pool.remove(Path::new(&file_name));
-            }
         }
 
         // Calculate and display statistics across runs

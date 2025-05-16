@@ -1,5 +1,4 @@
 use backup_stream::{self};
-use slog_global::info;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -48,6 +47,14 @@ enum Command {
         /// The account name for Azure Blob Storage
         #[structopt(long)]
         account_name: Option<String>,
+
+        /// Total number of files to create during the test
+        #[structopt(long, default_value = "1")]
+        file_count: usize,
+
+        /// Enable round-robin writing to the specified number of files
+        #[structopt(long)]
+        round_robin: bool,
     },
 }
 
@@ -66,6 +73,8 @@ fn main() {
             storage_type,
             repeat,
             account_name,
+            file_count,
+            round_robin,
         } => {
             // Create tokio runtime for async operations
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -78,6 +87,8 @@ fn main() {
                 &storage_type,
                 repeat,
                 account_name.as_deref(),
+                file_count,
+                round_robin,
             )) {
                 eprintln!("Error during IO test: {}", e);
                 std::process::exit(1);
