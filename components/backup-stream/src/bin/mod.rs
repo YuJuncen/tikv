@@ -86,10 +86,8 @@ pub mod io_testing {
                 let mut input_config = kvproto::brpb::AzureBlobStorage::default();
                 input_config.set_bucket(bucket.to_string());
                 input_config.set_prefix(prefix.to_string());
-                // Set account name if provided
                 if let Some(name) = sas_token {
                     input_config.set_access_sig(name.to_string());
-                    println!("Using Azure account name: {}", name);
                 }
                 // We're assuming the Azure credentials are in environment variables
 

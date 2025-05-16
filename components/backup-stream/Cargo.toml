@@ -36,6 +36,7 @@ async-trait = { version = "0.1" }
 bytes = "1"
 cfg-if = "1"
 chrono = "0.4"
+cloud = { path = "../cloud" }
 concurrency_manager = { workspace = true }
 crossbeam = "0.8"
 crossbeam-channel = "0.5"
@@ -76,6 +77,7 @@ slog = { workspace = true }
 slog-global = { workspace = true }
 structopt = "0.3"
 tempfile = "3.2"
+test_util = { workspace = true }
 thiserror = "1"
 tidb_query_datatype = { workspace = true }
 tikv = { workspace = true }
@@ -89,8 +91,6 @@ tonic = { version = "0.8", optional = true }
 txn_types = { workspace = true }
 uuid = "0.8"
 yatp = { workspace = true }
-test_util = { workspace = true }
-cloud = { path = "../cloud" }
 
 [dev-dependencies]
 async-trait = "0.1"
