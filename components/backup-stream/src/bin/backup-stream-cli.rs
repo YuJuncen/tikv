@@ -46,7 +46,7 @@ enum Command {
 
         /// The STS Token used to authroziation.
         #[structopt(long)]
-        sts_account: Option<String>,
+        sts_token: Option<String>,
 
         /// Total number of files to create during the test
         #[structopt(long, default_value = "1")]
@@ -72,7 +72,7 @@ fn main() {
             cache_quota,
             storage_type,
             repeat,
-            sts_account: account_name,
+            sts_token,
             file_count,
             round_robin,
         } => {
@@ -86,7 +86,7 @@ fn main() {
                 cache_quota,
                 &storage_type,
                 repeat,
-                account_name.as_deref(),
+                sts_token.as_deref(),
                 file_count,
                 round_robin,
             )) {
