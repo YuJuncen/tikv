@@ -44,9 +44,9 @@ enum Command {
         #[structopt(long, default_value = "1")]
         repeat: usize,
 
-        /// The account name for Azure Blob Storage
+        /// The STS Token used to authroziation.
         #[structopt(long)]
-        account_name: Option<String>,
+        sts_account: Option<String>,
 
         /// Total number of files to create during the test
         #[structopt(long, default_value = "1")]
@@ -72,7 +72,7 @@ fn main() {
             cache_quota,
             storage_type,
             repeat,
-            account_name,
+            sts_account: account_name,
             file_count,
             round_robin,
         } => {
