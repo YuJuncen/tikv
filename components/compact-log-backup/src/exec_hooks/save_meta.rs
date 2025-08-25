@@ -1,7 +1,7 @@
 // Copyright 2024 TiKV Project Authors. Licensed under Apache-2.0.
 use chrono::Local;
 pub use engine_traits::SstCompressionType;
-use external_storage::UnpinReader;
+use external_storage::{ExternalStorage, NoopStorage, UnpinReader};
 use futures::{future::TryFutureExt, io::Cursor};
 use kvproto::brpb;
 use tikv_util::{
@@ -47,6 +47,7 @@ pub struct SaveMeta {
     collector: CompactionRunInfoBuilder,
     stats: CollectStatistic,
     begin: chrono::DateTime<Local>,
+    dry_run: bool,
 }
 
 impl Default for SaveMeta {
@@ -55,6 +56,7 @@ impl Default for SaveMeta {
             collector: Default::default(),
             stats: Default::default(),
             begin: Local::now(),
+            dry_run: false,
         }
     }
 }
@@ -95,6 +97,8 @@ impl ExecHooks for SaveMeta {
         run_info
             .mut_meta()
             .set_generated_files(format!("{}/{}", cx.this.out_prefix, SST_OUT_REL));
+
+        self.dry_run = cx.this.cfg.debug_dry_run;
         Ok(())
     }
 
@@ -139,15 +143,17 @@ impl ExecHooks for SaveMeta {
         let mut metas = brpb::LogFileSubcompactions::new();
         metas.mut_subcompactions().push(cx.result.meta.clone());
         let meta_bytes = metas.write_to_bytes()?;
-        retry(|| async {
-            let reader = UnpinReader(Box::new(Cursor::new(&meta_bytes)));
-            cx.external_storage
-                .write(&meta_name, reader, meta_bytes.len() as _)
-                .map_err(JustRetry)
-                .await
-        })
-        .await
-        .map_err(|err| err.0)?;
+        if !self.dry_run {
+            retry(|| async {
+                let reader = UnpinReader(Box::new(Cursor::new(&meta_bytes)));
+                cx.external_storage
+                    .write(&meta_name, reader, meta_bytes.len() as _)
+                    .map_err(JustRetry)
+                    .await
+            })
+            .await
+            .map_err(|err| err.0)?;
+        }
         Result::Ok(())
     }
 
@@ -158,6 +164,11 @@ impl ExecHooks for SaveMeta {
         }
         let comments = self.comments();
         self.collector.mut_meta().set_comments(comments);
-        self.collector.write_migration(cx.storage).await
+        if self.dry_run {
+            let storage = NoopStorage::default();
+            self.collector.write_migration(&storage).await
+        } else {
+            self.collector.write_migration(cx.storage).await
+        }
     }
 }
