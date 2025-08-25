@@ -406,6 +406,7 @@ fn main() {
             name,
             force_regenerate,
             minimal_compaction_size,
+            debug_dry_run,
         } => {
             let tmp_engine =
                 TemporaryRocks::new(&cfg).expect("failed to create temp engine for writing SSTs.");
@@ -434,6 +435,7 @@ fn main() {
                 until_ts,
                 compression,
                 compression_level,
+                debug_dry_run,
             };
             let exec = compact_log::Execution {
                 out_prefix: ccfg.recommended_prefix(&name),

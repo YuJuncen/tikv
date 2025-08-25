@@ -57,6 +57,7 @@ pub struct ExecutionConfig {
     ///
     /// If `None`, we will use the default level of the selected algorithm.
     pub compression_level: Option<i32>,
+    pub debug_dry_run: bool,
 }
 
 impl slog::KV for ExecutionConfig {
@@ -223,7 +224,12 @@ impl Execution {
             ext.compression = self.cfg.compression;
             ext.compression_level = self.cfg.compression_level;
 
+            let dry_run = self.cfg.debug_dry_run;
             let compact_work = async move {
+                if dry_run {
+                    return Ok((SubcompactionResult::of(c), cid));
+                }
+
                 let res = compact_worker.run(c, ext).await.trace_err()?;
                 res.verify_checksum()
                     .annotate(format_args!("the compaction is {:?}", res.origin))?;

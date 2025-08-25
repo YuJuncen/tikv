@@ -705,6 +705,9 @@ pub enum Cmd {
             )
         )]
         minimal_compaction_size: ReadableSize,
+
+        #[structopt(long)]
+        debug_dry_run: bool,
     },
     /// Get the state of a region's RegionReadProgress.
     GetRegionReadProgress {

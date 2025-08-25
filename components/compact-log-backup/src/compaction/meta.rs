@@ -2,11 +2,13 @@
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
+    time::Instant,
 };
 
 use external_storage::ExternalStorage;
 use futures::stream::TryStreamExt;
 use kvproto::brpb::{self, DeleteSpansOfFile};
+use tikv_util::{time::InstantExt, yatp_pool::metrics};
 
 use super::{
     EpochHint, Subcompaction, SubcompactionCollectKey, SubcompactionResult, UnformedSubcompaction,
@@ -14,6 +16,7 @@ use super::{
 };
 use crate::{
     errors::Result,
+    statistic,
     storage::{
         LoadFromExt, LogFile, LogFileId, MetaFile, MigrationStorageWrapper, PhysicalLogFile,
         StreamMetaStorage,
@@ -289,10 +292,13 @@ impl CompactionRunInfoBuilder {
 
         let mut result = vec![];
         while let Some(item) = storage.try_next().await? {
+            let begin = Instant::now();
             let exp = self.expiring(&item);
             if !exp.is_empty() {
                 result.push(exp);
             }
+            statistic::prom::COLLECT_DELETED_FILE_DURATION
+                .observe(begin.saturating_elapsed().as_secs_f64());
         }
         Ok(result)
     }

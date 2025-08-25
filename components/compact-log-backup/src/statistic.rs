@@ -194,6 +194,12 @@ pub mod prom {
             exponential_buckets(0.001, 2.0, 13).unwrap()
         ).unwrap();
 
+        pub static ref COLLECT_DELETED_FILE_DURATION: Histogram = register_histogram!(
+            "collect_deleted_file_duration",
+            "The duration of collecting deleted files.",
+            exponential_buckets(0.001, 2.0, 10).unwrap()
+        ).unwrap();
+
         // ==== The following metrics will be collected in the hooks.
         pub static ref COMPACT_LOG_BACKUP_LOAD_DURATION: Histogram = register_histogram!(
             "compact_log_backup_load_duration",

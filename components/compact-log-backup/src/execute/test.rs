@@ -71,6 +71,7 @@ pub fn create_compaction(st: StorageBackend) -> Execution {
             until_ts: u64::MAX,
             compression: engine_traits::SstCompressionType::Lz4,
             compression_level: None,
+            debug_dry_run: false,
         },
         max_concurrent_subcompaction: 3,
         external_storage: st,
