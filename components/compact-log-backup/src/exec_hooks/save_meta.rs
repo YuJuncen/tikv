@@ -171,7 +171,7 @@ impl ExecHooks for SaveMeta {
         self.collector
             .write_migration(cx.storage, self.dry_run)
             .await?;
-        info!("Migration written."; "duration" => ?begin.saturating_elapsed());
+        info!("Migration written."; "duration" => ?begin.elapsed());
         Ok(())
     }
 }
