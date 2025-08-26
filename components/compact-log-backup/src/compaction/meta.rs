@@ -8,7 +8,7 @@ use std::{
 use external_storage::ExternalStorage;
 use futures::stream::TryStreamExt;
 use kvproto::brpb::{self, DeleteSpansOfFile};
-use tikv_util::{time::InstantExt, yatp_pool::metrics};
+use tikv_util::{info, time::InstantExt, yatp_pool::metrics};
 
 use super::{
     EpochHint, Subcompaction, SubcompactionCollectKey, SubcompactionResult, UnformedSubcompaction,
@@ -257,10 +257,13 @@ impl CompactionRunInfoBuilder {
         &mut self.compaction
     }
 
-    pub async fn write_migration(&self, s: &dyn ExternalStorage) -> Result<()> {
-        let migration = self.migration_of(self.find_expiring_files(s).await?);
-        let wrapped_storage = MigrationStorageWrapper::new(s);
-        wrapped_storage.write(migration.into()).await?;
+    pub async fn write_migration(&self, s: &dyn ExternalStorage, dry_run: bool) -> Result<()> {
+        let expiring = self.find_expiring_files(s).await?;
+        let migration = self.migration_of(expiring);
+        if !dry_run {
+            let wrapped_storage = MigrationStorageWrapper::new(s);
+            wrapped_storage.write(migration.into()).await?;
+        }
         Ok(())
     }
 
