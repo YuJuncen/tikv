@@ -28,6 +28,7 @@ use tikv_util::{
     time::Instant,
     warn,
 };
+use tokio::sync::mpsc::Sender;
 use tokio_stream::Stream;
 use tracing::{Span, span::Entered};
 use tracing_active_tree::frame;
@@ -53,13 +54,13 @@ pub struct MetaFile {
 }
 
 impl From<brpb::Metadata> for MetaFile {
-    fn from(value: brpb::Metadata) -> Self {
-        Self::from_file(Arc::from(":memory:"), value)
+    fn from(mut value: brpb::Metadata) -> Self {
+        Self::from_file(Arc::from(":memory:"), &mut value)
     }
 }
 
 impl MetaFile {
-    pub fn from_file(name: Arc<str>, mut meta_file: brpb::Metadata) -> Self {
+    pub fn from_file(name: Arc<str>, meta_file: &mut brpb::Metadata) -> Self {
         let mut log_files = vec![];
         let min_ts = meta_file.min_ts;
         let max_ts = meta_file.max_ts;
@@ -236,9 +237,16 @@ pub struct StreamMetaStorage<'a> {
     // generate the same compactions.
     prefetch: VecDeque<
         Prefetch<
-            Pin<Box<dyn Future<Output = Result<(MetaFile, LoadMetaStatistic)>> + Send + 'static>>,
+            Pin<
+                Box<
+                    dyn Future<Output = Result<(MetaFile, LoadMetaStatistic, MemForRead)>>
+                        + Send
+                        + 'static,
+                >,
+            >,
         >,
     >,
+    mems: VecDeque<MemForRead>,
     ext_storage: Arc<dyn ExternalStorage>,
     ext: LoadFromExt<'a>,
     stat: LoadMetaStatistic,
@@ -356,7 +364,12 @@ impl<'a> StreamMetaStorage<'a> {
                     }
 
                     let storage = Arc::clone(&self.ext_storage);
-                    let handle = tokio::spawn(MetaFile::load_from_owned(storage, load));
+                    let mut mem_for_read = self.mems.pop_front().unwrap_or_default();
+                    let handle = tokio::spawn(async move {
+                        let (meta, stat) =
+                            MetaFile::load_from_owned(storage, load, &mut mem_for_read).await?;
+                        Ok((meta, stat, mem_for_read))
+                    });
                     let mut fut = Prefetch::new(async move { handle.await.unwrap() }.boxed());
                     // start the execution of this future.
                     let poll = fut.poll_unpin(cx);
@@ -382,10 +395,11 @@ impl<'a> StreamMetaStorage<'a> {
         if self.prefetch[0].is_terminated() {
             let file = self.prefetch.pop_front().unwrap().must_fetch();
             match file {
-                Ok((file, stat)) => {
+                Ok((file, stat, mem)) => {
                     self.stat += stat;
                     self.stat.meta_files_in += 1;
                     self.stat.prefetch_task_finished += 1;
+                    self.mems.push_back(mem);
                     Ok(file).into()
                 }
                 Err(err) => Err(err.attach_current_frame()).into(),
@@ -420,6 +434,7 @@ impl<'a> StreamMetaStorage<'a> {
             files,
             ext_storage: Arc::clone(s),
             ext,
+            mems: Default::default(),
             stat: LoadMetaStatistic::default(),
             skip_map,
         })
@@ -437,18 +452,26 @@ impl<'a> StreamMetaStorage<'a> {
     }
 }
 
+#[derive(Default)]
+struct MemForRead {
+    read_buf: Vec<u8>,
+    obj: brpb::Metadata,
+}
+
 impl MetaFile {
     async fn load_from_owned(
         s: Arc<dyn ExternalStorage>,
         blob: BlobObject,
+        mem_for_read: &mut MemForRead,
     ) -> Result<(Self, LoadMetaStatistic)> {
-        Self::load_from(s.as_ref(), blob).await
+        Self::load_from(s.as_ref(), blob, mem_for_read).await
     }
 
     #[tracing::instrument(skip_all, fields(blob=%blob))]
     async fn load_from(
         s: &dyn ExternalStorage,
         blob: BlobObject,
+        mem_for_read: &mut MemForRead,
     ) -> Result<(Self, LoadMetaStatistic)> {
         use protobuf::Message;
 
@@ -463,24 +486,30 @@ impl MetaFile {
             error_cnt.inc_by(1);
         });
 
-        let loading_file = tikv_util::stream::retry_all_ext(
-            || async {
-                let mut content = vec![];
-                let n = s.read(&blob.key).read_to_end(&mut content).await?;
-                std::io::Result::Ok((n, content))
+        let loading_file = retry_expr!(
+            async {
+                let read_buf = &mut mem_for_read.read_buf;
+                read_buf.clear();
+                let n = s
+                    .read(&blob.key)
+                    .read_to_end(read_buf)
+                    .await
+                    .map_err(JustRetry)?;
+                std::io::Result::Ok(n).map_err(JustRetry)
             },
-            ext,
+            ext
         );
-        let (n, content) = frame!(loading_file)
+        let n = frame!(loading_file)
             .await
-            .map_err(|err| Error::from(err).message(format_args!("reading {}", blob.key)))?;
+            .map_err(|err| Error::from(err.0).message(format_args!("reading {}", blob.key)))?;
         stat.physical_bytes_loaded += n as u64;
         stat.error_during_downloading += error_cnt2.get();
 
-        let mut meta_file = kvproto::brpb::Metadata::new();
-        meta_file.merge_from_bytes(&content)?;
+        use protobuf::Clear;
+        mem_for_read.obj.clear();
+        mem_for_read.obj.merge_from_bytes(&mem_for_read.read_buf)?;
         let name = Arc::from(blob.key.into_boxed_str());
-        let result = Self::from_file(name, meta_file);
+        let result = Self::from_file(name, &mut mem_for_read.obj);
 
         stat.physical_data_files_in += result.physical_files.len() as u64;
         stat.logical_data_files_in += result

@@ -558,7 +558,7 @@ impl TmpStorage {
             )
             .await
             .unwrap();
-        MetaFile::from_file(Arc::from(meta_path), result)
+        MetaFile::from_file(Arc::from(meta_path), &mut result)
     }
 
     pub async fn load_migrations(&self) -> crate::Result<Vec<(u64, brpb::Migration)>> {
