@@ -26,6 +26,7 @@ use tikv_util::{
     info, retry_expr,
     stream::{JustRetry, RetryExt},
     time::Instant,
+    warn,
 };
 use tokio_stream::Stream;
 use tracing::{Span, span::Entered};
@@ -206,6 +207,7 @@ pub struct LoadFromExt<'a> {
     /// The prefix of metadata in the external storage.
     /// By default it is `v1/backupmeta`.
     pub meta_prefix: &'a str,
+    pub hacky_skip_load_skipmap: bool,
 }
 
 impl LoadFromExt<'_> {
@@ -220,6 +222,7 @@ impl Default for LoadFromExt<'_> {
             max_concurrent_fetch: 16,
             loading_content_span: None,
             meta_prefix: METADATA_PREFIX,
+            hacky_skip_load_skipmap: false,
         }
     }
 }
@@ -399,7 +402,12 @@ impl<'a> StreamMetaStorage<'a> {
     pub async fn load_from_ext(s: &'a dyn ExternalStorage, ext: LoadFromExt<'a>) -> Result<Self> {
         let files = s.iter_prefix(ext.meta_prefix).fuse();
         let mig_ext = MigrationStorageWrapper::new(s);
-        let skip_map = MetaEditFilters::from_migrations(mig_ext.load().await?);
+        let skip_map = if ext.hacky_skip_load_skipmap {
+            warn!("compact_log_backup_skip_load_skipmap set, will skip loading skipmap.");
+            MetaEditFilters::default()
+        } else {
+            MetaEditFilters::from_migrations(mig_ext.load().await?)
+        };
         Ok(Self {
             prefetch: VecDeque::new(),
             files,
@@ -577,7 +585,7 @@ impl Default for VersionedMigration {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct MetaEditFilters(HashMap<String, MetaEditFilter>);
 
 impl MetaEditFilters {

@@ -8,7 +8,7 @@ use std::{
 use external_storage::ExternalStorage;
 use futures::stream::TryStreamExt;
 use kvproto::brpb::{self, DeleteSpansOfFile};
-use tikv_util::{info, time::InstantExt, yatp_pool::metrics};
+use tikv_util::{info, time::InstantExt, warn, yatp_pool::metrics};
 
 use super::{
     EpochHint, Subcompaction, SubcompactionCollectKey, SubcompactionResult, UnformedSubcompaction,
@@ -290,7 +290,11 @@ impl CompactionRunInfoBuilder {
         &self,
         s: &dyn ExternalStorage,
     ) -> Result<Vec<ExpiringFilesOfMeta>> {
-        let ext = LoadFromExt::default();
+        let mut ext = LoadFromExt::default();
+        if std::env::var("compact_log_backup_skip_load_skipmap").is_ok() {
+            warn!("compact_log_backup_skip_load_skipmap set");
+            ext.hacky_skip_load_skipmap = true;
+        }
         let mut storage = StreamMetaStorage::load_from_ext(s, ext).await?;
 
         let mut result = vec![];
