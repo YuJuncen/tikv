@@ -8,7 +8,7 @@ use std::{
 use external_storage::ExternalStorage;
 use futures::stream::TryStreamExt;
 use kvproto::brpb::{self, DeleteSpansOfFile};
-use tikv_util::{info, time::InstantExt, warn, yatp_pool::metrics};
+use tikv_util::{time::InstantExt, warn};
 
 use super::{
     EpochHint, Subcompaction, SubcompactionCollectKey, SubcompactionResult, UnformedSubcompaction,
@@ -257,11 +257,11 @@ impl CompactionRunInfoBuilder {
         &mut self.compaction
     }
 
-    pub async fn write_migration(&self, s: &dyn ExternalStorage, dry_run: bool) -> Result<()> {
-        let expiring = self.find_expiring_files(s).await?;
+    pub async fn write_migration(&self, s: Arc<dyn ExternalStorage>, dry_run: bool) -> Result<()> {
+        let expiring = self.find_expiring_files(Arc::clone(&s)).await?;
         let migration = self.migration_of(expiring);
         if !dry_run {
-            let wrapped_storage = MigrationStorageWrapper::new(s);
+            let wrapped_storage = MigrationStorageWrapper::new(s.as_ref());
             wrapped_storage.write(migration.into()).await?;
         }
         Ok(())
@@ -288,14 +288,14 @@ impl CompactionRunInfoBuilder {
 
     async fn find_expiring_files(
         &self,
-        s: &dyn ExternalStorage,
+        s: Arc<dyn ExternalStorage>,
     ) -> Result<Vec<ExpiringFilesOfMeta>> {
         let mut ext = LoadFromExt::default();
         if std::env::var("compact_log_backup_skip_load_skipmap").is_ok() {
             warn!("compact_log_backup_skip_load_skipmap set");
             ext.hacky_skip_load_skipmap = true;
         }
-        let mut storage = StreamMetaStorage::load_from_ext(s, ext).await?;
+        let mut storage = StreamMetaStorage::load_from_ext(&s, ext).await?;
 
         let mut result = vec![];
         while let Some(item) = storage.try_next().await? {
@@ -380,6 +380,8 @@ impl EpochHint {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use external_storage::ExternalStorage;
     use kvproto::brpb;
 
@@ -390,7 +392,7 @@ mod test {
     };
 
     impl CompactionRunInfoBuilder {
-        async fn mig(&self, s: &dyn ExternalStorage) -> crate::Result<brpb::Migration> {
+        async fn mig(&self, s: Arc<dyn ExternalStorage>) -> crate::Result<brpb::Migration> {
             Ok(self.migration_of(self.find_expiring_files(s).await?))
         }
     }
@@ -412,14 +414,14 @@ mod test {
         let subc = Subcompaction::singleton(m.physical_files[0].files[0].clone());
         let res = cr.run(subc, Default::default()).await.unwrap();
         coll.add_subcompaction(&res);
-        let mig = coll.mig(st.storage().as_ref()).await.unwrap();
+        let mig = coll.mig(st.storage().clone()).await.unwrap();
         assert_eq!(mig.edit_meta.len(), 1);
         assert!(!mig.edit_meta[0].destruct_self);
 
         let mut coll = CompactionRunInfoBuilder::default();
         let subc = Subcompaction::of_many(m.physical_files[0].files.iter().cloned());
         coll.add_subcompaction(&SubcompactionResult::of(subc));
-        let mig = coll.mig(st.storage().as_ref()).await.unwrap();
+        let mig = coll.mig(st.storage().clone()).await.unwrap();
         assert_eq!(mig.edit_meta.len(), 1);
         assert!(mig.edit_meta[0].destruct_self);
 
@@ -478,7 +480,7 @@ mod test {
         coll.add_subcompaction(&SubcompactionResult::of(subc1));
         coll.add_subcompaction(&SubcompactionResult::of(subc2));
         coll.add_subcompaction(&SubcompactionResult::of(subc3));
-        let mig = coll.mig(st.storage().as_ref()).await.unwrap();
+        let mig = coll.mig(st.storage().clone()).await.unwrap();
         assert_eq!(mig.edit_meta.len(), 2);
         let check = |me: &brpb::MetaEdit| match me.get_path() {
             "v1/backupmeta/1.meta" => {
