@@ -172,6 +172,22 @@ where
                 "result" => ?res, "peer" => %peer);
         });
     }
+
+    fn feature_gate(
+        &mut self,
+        ctx: grpcio::RpcContext,
+        _req: FeatureGateRequest,
+        sink: grpcio::UnarySink<FeatureGateResponse>,
+    ) {
+        ctx.spawn(
+            sink.success({
+                let mut response = FeatureGateResponse::default();
+                response.set_supports_backup_custom_path(true);
+                response
+            })
+            .unwrap_or_else(|e| error!("feature_gate failed"; "error" => ?e)),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -300,5 +316,13 @@ mod tests {
         assert!(task.has_canceled());
         // A stopped remote must not cause panic.
         endpoint.handle_backup_task(task);
+    }
+
+    #[test]
+    fn test_feature_gate() {
+        let (_server, client, _rx) = new_rpc_suite();
+
+        let resp = client.feature_gate(&FeatureGateRequest::default()).unwrap();
+        assert!(resp.get_supports_backup_custom_path());
     }
 }

@@ -296,6 +296,18 @@ impl TestSuite {
         backup_ts: TimeStamp,
         path: &Path,
     ) -> future_mpsc::UnboundedReceiver<BackupResponse> {
+        self.backup_with_file_prefix(start_key, end_key, begin_ts, backup_ts, path, "")
+    }
+
+    pub fn backup_with_file_prefix(
+        &self,
+        start_key: Vec<u8>,
+        end_key: Vec<u8>,
+        begin_ts: TimeStamp,
+        backup_ts: TimeStamp,
+        path: &Path,
+        file_prefix: &str,
+    ) -> future_mpsc::UnboundedReceiver<BackupResponse> {
         let mut req = BackupRequest::default();
         req.set_start_key(start_key);
         req.set_end_key(end_key);
@@ -303,6 +315,7 @@ impl TestSuite {
         req.end_version = backup_ts.into_inner();
         req.set_storage_backend(make_local_backend(path));
         req.set_is_raw_kv(false);
+        req.set_file_prefix(file_prefix.to_owned());
         let (tx, rx) = future_mpsc::unbounded();
         for end in self.endpoints.values() {
             let (task, _) = Task::new(req.clone(), tx.clone()).unwrap();

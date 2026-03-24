@@ -165,6 +165,35 @@ fn test_backup_and_import() {
 }
 
 #[test]
+fn test_backup_with_custom_file_prefix() {
+    let mut suite = TestSuite::new(3, 144 * 1024 * 1024, ApiVersion::V1);
+    suite.must_kv_put(10, 1);
+
+    let tmp = Builder::new().tempdir().unwrap();
+    let backup_ts = suite.alloc_ts();
+    let storage_path = make_unique_dir(tmp.path());
+    let rx = suite.backup_with_file_prefix(
+        vec![],
+        vec![],
+        0.into(),
+        backup_ts,
+        &storage_path,
+        "custom/subdir",
+    );
+    let resps = block_on(rx.collect::<Vec<_>>());
+
+    assert_eq!(resps.len(), 1);
+    let files = resps[0].get_files();
+    assert!(!files.is_empty());
+    for file in files {
+        assert!(file.get_name().starts_with("custom/subdir/"), "{file:?}");
+        assert!(storage_path.join(file.get_name()).exists(), "{file:?}");
+    }
+
+    suite.stop();
+}
+
+#[test]
 fn test_backup_huge_range_and_import() {
     let mut suite = TestSuite::new(3, 100, ApiVersion::V1);
     // 3 version for each key.

@@ -27,6 +27,11 @@ portable = ["tikv/portable"]
 sse = ["tikv/sse"]
 mem-profiling = ["tikv/mem-profiling"]
 failpoints = ["tikv/failpoints"]
+openssl-vendored = [
+  "tikv/openssl-vendored",
+  "grpcio/openssl-vendored",
+  "encryption/sm4",
+]
 
 [dependencies]
 api_version = { workspace = true }

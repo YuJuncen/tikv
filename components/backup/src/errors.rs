@@ -118,6 +118,8 @@ pub enum Error {
     ClusterId { current: u64, request: u64 },
     #[error("Invalid cf {cf}")]
     InvalidCf { cf: String },
+    #[error("Invalid file prefix {file_prefix}")]
+    InvalidFilePrefix { file_prefix: String },
     #[error("Failed to acquire the semaphore {0}")]
     Semaphore(#[from] AcquireError),
     #[error("Channel is closed")]

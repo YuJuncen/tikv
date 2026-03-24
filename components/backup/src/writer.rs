@@ -165,6 +165,7 @@ pub struct BackupWriterBuilder<EK: KvEngine> {
     rate_limiter: Limiter,
     region: Region,
     db: EK,
+    file_prefix: String,
     compression_type: Option<SstCompressionType>,
     compression_level: i32,
     sst_max_size: u64,
@@ -177,6 +178,7 @@ impl<EK: KvEngine> BackupWriterBuilder<EK> {
         rate_limiter: Limiter,
         region: Region,
         db: EK,
+        file_prefix: String,
         compression_type: Option<SstCompressionType>,
         compression_level: i32,
         sst_max_size: u64,
@@ -187,6 +189,7 @@ impl<EK: KvEngine> BackupWriterBuilder<EK> {
             rate_limiter,
             region,
             db,
+            file_prefix,
             compression_type,
             compression_level,
             sst_max_size,
@@ -197,7 +200,7 @@ impl<EK: KvEngine> BackupWriterBuilder<EK> {
     pub fn build(&self, start_key: Vec<u8>, storage_name: &str) -> Result<BackupWriter<EK>> {
         let key = file_system::sha256(&start_key).ok().map(hex::encode);
         let store_id = self.store_id;
-        let name = backup_file_name(store_id, &self.region, key, storage_name);
+        let name = backup_file_name(store_id, &self.region, key, storage_name, &self.file_prefix);
         BackupWriter::new(
             self.db.clone(),
             &name,

@@ -4,6 +4,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     fmt,
+    path::{Component, Path},
     sync::{Arc, Mutex, RwLock, atomic::*, mpsc},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -80,6 +81,7 @@ struct Request {
     compression_level: i32,
     cipher: CipherInfo,
     replica_read: bool,
+    file_prefix: String,
     resource_group_name: String,
     source_tag: String,
     bypass_locks: Vec<u64>,
@@ -118,6 +120,9 @@ impl Task {
         resp: UnboundedSender<BackupResponse>,
     ) -> Result<(Task, Arc<AtomicBool>)> {
         let cancel = Arc::new(AtomicBool::new(false));
+        let raw_file_prefix = req.get_file_prefix();
+        validate_file_prefix(raw_file_prefix)?;
+        let file_prefix = raw_file_prefix.trim_matches('/').to_owned();
 
         let rate_limit = req.get_rate_limit();
         let rate_limiter = Limiter::new(if rate_limit > 0 {
@@ -149,6 +154,7 @@ impl Task {
                 compression_type: req.get_compression_type(),
                 compression_level: req.get_compression_level(),
                 replica_read: req.get_replica_read(),
+                file_prefix,
                 resource_group_name: req
                     .get_context()
                     .get_resource_control_context()
@@ -172,6 +178,23 @@ impl Task {
     pub fn has_canceled(&self) -> bool {
         self.request.cancel.load(Ordering::SeqCst)
     }
+}
+
+fn validate_file_prefix(file_prefix: &str) -> Result<()> {
+    let path = Path::new(file_prefix);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(Error::InvalidFilePrefix {
+            file_prefix: file_prefix.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1017,7 +1040,13 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                         let input = brange.codec.decode_backup_key(Some(k)).unwrap_or_default();
                         file_system::sha256(&input).ok().map(hex::encode)
                     });
-                    let name = backup_file_name(store_id, &brange.region, key, _backend.name());
+                    let name = backup_file_name(
+                        store_id,
+                        &brange.region,
+                        key,
+                        _backend.name(),
+                        &request.file_prefix,
+                    );
                     let ct = to_sst_compression_type(request.compression_type);
                     let db = match tablets.get(brange.region.id) {
                         Some(t) => t,
@@ -1047,6 +1076,7 @@ impl<E: Engine, R: RegionInfoProvider + Clone + 'static> Endpoint<E, R> {
                             request.rate_limiter.clone(),
                             brange.region.clone(),
                             db.into_owned(),
+                            request.file_prefix.clone(),
                             ct,
                             request.compression_level,
                             sst_max_size,
@@ -1271,13 +1301,14 @@ pub fn backup_file_name(
     region: &Region,
     key: Option<String>,
     storage_name: &str,
+    file_prefix: &str,
 ) -> String {
     let start = SystemTime::now();
     let since_the_epoch = start
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards");
 
-    match (key, storage_name) {
+    let file_name = match (key, storage_name) {
         // See https://github.com/pingcap/tidb/issues/30087
         // To avoid 503 Slow Down error, if the backup storage is s3,
         // organize the backup files by store_id (use slash (/) as delimiter).
@@ -1318,6 +1349,12 @@ pub fn backup_file_name(
                 region.get_region_epoch().get_version()
             )
         }
+    };
+
+    if file_prefix.is_empty() {
+        file_name
+    } else {
+        format!("{file_prefix}/{file_name}")
     }
 }
 
@@ -1658,6 +1695,7 @@ pub mod tests {
                         compression_level: 0,
                         cipher: CipherInfo::default(),
                         replica_read: false,
+                        file_prefix: String::new(),
                         resource_group_name: "".into(),
                         source_tag: "br".into(),
                         bypass_locks: vec![],
@@ -1771,6 +1809,7 @@ pub mod tests {
                 compression_level: 0,
                 cipher: CipherInfo::default(),
                 replica_read: false,
+                file_prefix: String::new(),
                 resource_group_name: "".into(),
                 source_tag: "br".into(),
                 bypass_locks: vec![],
@@ -1804,6 +1843,7 @@ pub mod tests {
                 compression_level: 0,
                 cipher: CipherInfo::default(),
                 replica_read: true,
+                file_prefix: String::new(),
                 resource_group_name: "".into(),
                 source_tag: "br".into(),
                 bypass_locks: vec![],
@@ -1916,6 +1956,7 @@ pub mod tests {
                         compression_level: 0,
                         cipher: CipherInfo::default(),
                         replica_read: false,
+                        file_prefix: String::new(),
                         resource_group_name: "".into(),
                         source_tag: "br".into(),
                         bypass_locks: vec![],
@@ -2790,7 +2831,7 @@ pub mod tests {
         let delimiter = "_";
         for (storage_name, target) in test_cases.iter().zip(test_target.iter()) {
             let key = Some(String::from("000"));
-            let filename = backup_file_name(store_id, &region, key, storage_name);
+            let filename = backup_file_name(store_id, &region, key, storage_name, "");
 
             let mut prefix_arr: Vec<&str> = filename.split(delimiter).collect();
             prefix_arr.remove(prefix_arr.len() - 1);
@@ -2801,8 +2842,32 @@ pub mod tests {
         let test_target = ["1/0_0", "1/0_0", "1_0_0", "1_0_0", "1_0_0"];
         for (storage_name, target) in test_cases.iter().zip(test_target.iter()) {
             let key = None;
-            let filename = backup_file_name(store_id, &region, key, storage_name);
+            let filename = backup_file_name(store_id, &region, key, storage_name, "");
             assert_eq!(target.to_string(), filename);
+        }
+
+        let filename = backup_file_name(
+            store_id,
+            &region,
+            Some(String::from("000")),
+            "local",
+            "foo/bar",
+        );
+        assert!(filename.starts_with("foo/bar/1/0_0_000_"), "{filename}");
+
+        let filename = backup_file_name(store_id, &region, None, "gcs", "foo/bar");
+        assert_eq!("foo/bar/1_0_0", filename);
+    }
+
+    #[test]
+    fn test_invalid_file_prefix() {
+        for file_prefix in ["../escape", "/escape"] {
+            let (tx, _rx) = unbounded();
+            let mut req = BackupRequest::default();
+            req.set_file_prefix(file_prefix.to_owned());
+
+            let err = Task::new(req, tx).unwrap_err();
+            assert!(matches!(err, Error::InvalidFilePrefix { .. }), "{err:?}");
         }
     }
 
